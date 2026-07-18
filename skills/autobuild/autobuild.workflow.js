@@ -488,8 +488,8 @@ async function runJudge(seat, judgePrompt, schema, label, phase, effort = 'high'
   log(`no judge lane available for ${label} — all judgment models cooling.`)
   return null
 }
-// Claude quota probe — LIVE subscription utilisation via ~/.claude/skills/autobuild/quota.py (the undocumented
-// /api/oauth/usage endpoint the client itself uses). Soft signal, NON-FATAL: no probe => proceed.
+// Claude quota probe — OPTIONAL local script (not bundled): ~/.claude/skills/autobuild/quota.py, expected to
+// print ONE JSON line of subscription-limit utilisation. Soft signal, NON-FATAL: script absent => no signal => proceed.
 async function readClaudeQuota() {
   return agent(
     `Mechanical Claude-quota probe. Run (POSIX bash, foreground, ~ = home dir): python ~/.claude/skills/autobuild/quota.py --json — it prints ONE JSON line of Claude subscription limit utilisation and NEVER emits any token. Return {ok:true, json:"<that exact line>"} on success; {ok:false} if the script is missing or errors. No commentary.`,

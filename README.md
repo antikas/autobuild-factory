@@ -6,7 +6,7 @@ Autobuild is a pair of Claude Code skills that run a project's backlog for you, 
 
 ## What is in the box
 
-- **`skills/autobuild/`** runs the backlog. It holds the skill contract ([SKILL.md](skills/autobuild/SKILL.md)), the orchestration engine ([autobuild.workflow.js](skills/autobuild/autobuild.workflow.js)), the safety rules every agent must obey ([GUARDRAILS.md](skills/autobuild/GUARDRAILS.md)), and a small probe that reads your live Claude subscription usage ([quota.py](skills/autobuild/quota.py)).
+- **`skills/autobuild/`** runs the backlog. It holds the skill contract ([SKILL.md](skills/autobuild/SKILL.md)), the orchestration engine ([autobuild.workflow.js](skills/autobuild/autobuild.workflow.js)), and the safety rules every agent must obey ([GUARDRAILS.md](skills/autobuild/GUARDRAILS.md)).
 - **`skills/autobuild-plan/`** prepares the backlog. It turns a one-line ask ("make X buildable end to end") into a researched plan, has four independent reviewers attack that plan, folds their findings in, registers the resulting queue on the tracker, and stops one command short of launching the run ([SKILL.md](skills/autobuild-plan/SKILL.md)).
 - **A tracker (yours, optional):** every cycle writes its status back to a tracker, so the run leaves a replayable trail. Autobuild pairs naturally with [pinax](https://github.com/antikas/pinax-tracker), a git-native build tracker published separately; a plain `BACKLOG.md` ready set works too.
 
@@ -45,7 +45,7 @@ Every control is a plain value you pass when you invoke the workflow, and you ca
 - **What counts as validation** for this repo (`validatorCmd`), written once into your own config table and reused.
 - **Which items the run may never pick**: deploys, publishes, and anything else you gate stay blocked on the tracker by name.
 - **How hard to push**: items per run (`maxItems`), fix rounds per item (`maxFolds`), whether an empty queue triggers proposals (`proposeWhenDry`), and whether any proposal may auto-promote (`promotePolicy`).
-- **When to stop for quota**: unsupervised runs stop cleanly at a weekly Claude usage ceiling (88% by default, `weeklyCeilingPercent`) so they never eat the window you wanted for your own sessions.
+- **When to stop for quota**: if you supply a small local usage-probe script (see the SKILL), unsupervised runs stop cleanly at a weekly Claude usage ceiling (88% by default, `weeklyCeilingPercent`) so they never eat the window you wanted for your own sessions. Without a probe they simply run.
 
 ## Building on two subscriptions at once
 
@@ -68,7 +68,7 @@ The checks do the trusting. No agent's self-report is taken on faith, including 
 - It does not deploy, publish, or touch production. Those steps are registered on the tracker as blocked and wait for you.
 - It does not attempt novel architecture. An item with no precedent to follow gets parked with the decision it needs.
 - It is not for single items. If you already know the one thing you want built, brief a builder directly.
-- The quota probe reads an undocumented endpoint that the Claude client itself uses. It can stop working at any time, so it is wired as a soft signal only.
+- The quota ceiling needs a small local probe script that is not bundled. Runs without one proceed with no quota signal, and the probe is wired as a soft signal either way.
 - The dual-subscription mode needs your own ChatGPT subscription with the `codex` CLI signed in, and is off by default.
 
 ## For engineers
@@ -81,7 +81,6 @@ skills/
     SKILL.md            contract: seats, lanes, invocation, recovery
     autobuild.workflow.js   the engine (runs under Claude Code's Workflow tool)
     GUARDRAILS.md       the rules injected into every agent prompt
-    quota.py            live subscription-usage probe (optional, soft signal)
   autobuild-plan/       the planning skill
     SKILL.md            contract: research, plan shape, blind review, registration
 ```
