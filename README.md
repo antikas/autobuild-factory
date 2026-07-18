@@ -8,7 +8,7 @@ Autobuild is a pair of Claude Code skills that run a project's backlog for you, 
 
 - **`skills/autobuild/`** runs the backlog. It holds the skill contract ([SKILL.md](skills/autobuild/SKILL.md)), the orchestration engine ([autobuild.workflow.js](skills/autobuild/autobuild.workflow.js)), the safety rules every agent must obey ([GUARDRAILS.md](skills/autobuild/GUARDRAILS.md)), and a small probe that reads your live Claude subscription usage ([quota.py](skills/autobuild/quota.py)).
 - **`skills/autobuild-plan/`** prepares the backlog. It turns a one-line ask ("make X buildable end to end") into a researched plan, has four independent reviewers attack that plan, folds their findings in, registers the resulting queue on the tracker, and stops one command short of launching the run ([SKILL.md](skills/autobuild-plan/SKILL.md)).
-- **A tracker (yours, optional):** every cycle writes its status back to a tracker, so the run leaves a replayable trail. Autobuild pairs naturally with [pinax](https://github.com/antikas/pinax), a git-native build tracker published separately; a plain `BACKLOG.md` ready set works too.
+- **A tracker (yours, optional):** every cycle writes its status back to a tracker, so the run leaves a replayable trail. Autobuild pairs naturally with [pinax](https://github.com/antikas/pinax-tracker), a git-native build tracker published separately; a plain `BACKLOG.md` ready set works too.
 
 The two compose: `/autobuild-plan` produces the queue, you review it and pull the trigger, `/autobuild` executes it.
 
@@ -86,7 +86,7 @@ skills/
     SKILL.md            contract: research, plan shape, blind review, registration
 ```
 
-Install: copy both skill folders into `~/.claude/skills/` (so the workflow lands at `~/.claude/skills/autobuild/autobuild.workflow.js`, the path the skill invokes). Requirements: Claude Code with subagents and the Workflow tool, and a repo with a tracker. The tracker is either [pinax](https://github.com/antikas/pinax) (a git-native build tracker; autobuild reads `pinax next` and writes `pinax done` / `pinax block` events) or a plain `BACKLOG.md` with a ready set.
+Install: copy both skill folders into `~/.claude/skills/` (so the workflow lands at `~/.claude/skills/autobuild/autobuild.workflow.js`, the path the skill invokes). Requirements: Claude Code with subagents and the Workflow tool, and a repo with a tracker. The tracker is either [pinax](https://github.com/antikas/pinax-tracker) (a git-native build tracker; autobuild reads `pinax next` and writes `pinax done` / `pinax block` events) or a plain `BACKLOG.md` with a ready set.
 
 First run: do one supervised single-item run end to end before any unattended use, and read [GUARDRAILS.md](skills/autobuild/GUARDRAILS.md) first; it is the SSOT the skills point at. Details, the full config reference, and recovery procedure live in [skills/autobuild/SKILL.md](skills/autobuild/SKILL.md).
 

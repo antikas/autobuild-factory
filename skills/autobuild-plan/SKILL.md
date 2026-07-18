@@ -14,7 +14,7 @@ Produces the *deliverable plan* that `/autobuild` later executes. The owner type
 
 1. **Memory before files:** the ask is usually not new. If a memory/recall tool is available, query it for the prior spec/plan/decisions; the hit set names the scope SSOT. Otherwise search prior plans and decision docs directly. Harness/dispatch canon is read directly, never via recall.
 2. **Read the scope SSOT yourself** (the prior spec, the decision registers it points at). Note its date — a spec older than the repo is a hypothesis about the repo, not a fact.
-3. Read the tracker state in every repo the ask touches with one call per repo (`pinax status --json` on a [pinax](https://github.com/antikas/pinax) repo; else the backlog file) — work-state by one call, never file archaeology. Confirm the ask is genuinely unexecuted; find queued items the plan must sequence against.
+3. Read the tracker state in every repo the ask touches with one call per repo (`pinax status --json` on a [pinax](https://github.com/antikas/pinax-tracker) repo; else the backlog file) — work-state by one call, never file archaeology. Confirm the ask is genuinely unexecuted; find queued items the plan must sequence against.
 
 ## Phase 1 — ground-truth scouts (sonnet, parallel, Workflow)
 

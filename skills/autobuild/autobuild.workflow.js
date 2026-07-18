@@ -58,7 +58,7 @@ const PROTECTED = Array.isArray(cfg.protectedItems) ? cfg.protectedItems : []
 
 // Tracker abstraction — how we READ the next item and WRITE status back.
 // kind: 'pinax' (append to .ergon event log via pinax) | 'backlog' (edit BACKLOG.md).
-// Pinax (https://github.com/antikas/pinax) reads with `pinax next` and writes
+// Pinax (https://github.com/antikas/pinax-tracker) reads with `pinax next` and writes
 // events back to the .ergon log. A repo not on Pinax uses BACKLOG.md.
 const tracker = {
   kind: cfg.trackerKind || (String(NEXT_CMD).includes('pinax') ? 'pinax' : 'backlog'),
