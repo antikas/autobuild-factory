@@ -8,6 +8,7 @@ Autobuild is a pair of Claude Code skills that run a project's backlog for you, 
 
 - **`skills/autobuild/`** runs the backlog. It holds the skill contract ([SKILL.md](skills/autobuild/SKILL.md)), the orchestration engine ([autobuild.workflow.js](skills/autobuild/autobuild.workflow.js)), the safety rules every agent must obey ([GUARDRAILS.md](skills/autobuild/GUARDRAILS.md)), and a small probe that reads your live Claude subscription usage ([quota.py](skills/autobuild/quota.py)).
 - **`skills/autobuild-plan/`** prepares the backlog. It turns a one-line ask ("make X buildable end to end") into a researched plan, has four independent reviewers attack that plan, folds their findings in, registers the resulting queue on the tracker, and stops one command short of launching the run ([SKILL.md](skills/autobuild-plan/SKILL.md)).
+- **A tracker (yours, optional):** every cycle writes its status back to a tracker, so the run leaves a replayable trail. Autobuild pairs naturally with [pinax](https://github.com/antikas/pinax), a git-native build tracker published separately; a plain `BACKLOG.md` ready set works too.
 
 The two compose: `/autobuild-plan` produces the queue, you review it and pull the trigger, `/autobuild` executes it.
 
