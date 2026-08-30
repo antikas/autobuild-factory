@@ -6,12 +6,12 @@ AutoBuild changes Git and tracker state. A run can create commits, merge a branc
 
 This guide starts with a new repository setup. The [architecture guide](architecture.md) explains the internal design and extension points.
 
-## The parts involved
+## Project inputs
 
 You provide these project facts:
 
 - a Git repository with a writable `origin` remote
-- an approved work queue in Pinax or `BACKLOG.md`
+- an approved work queue in [Pinax](https://github.com/antikas/pinax-tracker) or `BACKLOG.md`
 - one written brief for each runnable item
 - one validator command that decides whether the change works
 - an installed and authenticated coding assistant
@@ -21,7 +21,7 @@ AutoBuild provides the campaign sequence, isolated Git worktree, fresh builder a
 
 The coding assistant is called a harness in configuration. Version 0.2.0 includes harness adapters for Claude Code, Codex, and GitHub Copilot CLI.
 
-## What happens during a run
+## Campaign sequence
 
 For each ready item, AutoBuild follows this sequence:
 
@@ -38,7 +38,26 @@ For each ready item, AutoBuild follows this sequence:
 
 The reviewer does not receive the builder transcript. Accepted work must still match the diff that passed validation and review.
 
-## Before you install AutoBuild
+## Use the bundled skills
+
+AutoBuild includes two optional skill descriptions for coding assistants that support `SKILL.md` files. The source archive and repository checkout contain both skills. The Python wheel installs the `autobuild` command only and does not change a coding assistant's personal skill directory.
+
+`autobuild-plan` prepares work that is not ready to execute. Give it a build request such as "create a plan to autobuild the account dashboard."
+
+The skill researches the current system, writes the end-to-end plan, and checks it through four independent review lenses. It registers the approved queue in Pinax or `BACKLOG.md`, then stops before launch.
+
+`autobuild` runs an approved queue. Give it a request such as "run the backlog" or "autobuild this project." The skill reads the project configuration and launches the released Python command. The campaign sequence remains in the application.
+
+Planning and execution stay separate:
+
+1. Install each skill folder through the coding assistant's normal skill installation method, or use the `SKILL.md` file directly from a checkout.
+2. Invoke `autobuild-plan` when the request still needs a reviewed plan and registered queue.
+3. Review the resulting plan and queue.
+4. Invoke `autobuild` only after the owner gives the launch instruction.
+
+You can also use the `autobuild` command directly without installing either skill. The command needs the same repository, tracker, profile and delivery permission described in this guide.
+
+## Prerequisites
 
 You need:
 
@@ -459,7 +478,7 @@ autobuild run \
 
 Run `autobuild run --help` for the complete option list.
 
-## Read the result
+## Campaign result
 
 The command prints `autobuild.campaign-result.v1` JSON. It includes:
 
@@ -494,7 +513,7 @@ The scratch root contains `runs/<run-id>/`. Each run directory contains:
 
 Command output, harness output, and diff patches live under their own scratch subdirectories. Events point to those files. The brief, validator result, diff, review verdict, and commit identities form the acceptance record.
 
-## What accepted and parked outcomes change
+## Changes made by accepted and parked outcomes
 
 An accepted item creates separate commits for product files and tracker state. AutoBuild merges the item branch into the default branch with a merge commit, pushes the default branch, and checks that the remote points at that commit.
 
@@ -546,7 +565,7 @@ fog_ledger = "/path/to/fog-ledger.md"
 
 The command must answer `--version`, and the fog ledger must already exist. Public users without that adapter should leave `fog` empty.
 
-## If a run is interrupted
+## Recover an interrupted run
 
 Normal failures park the claimed item and release the isolated worktree. A killed process or machine restart can leave a claimed item, an AutoBuild branch, or a worktree under the scratch root.
 

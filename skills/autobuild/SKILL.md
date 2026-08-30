@@ -1,14 +1,14 @@
 ---
 name: autobuild
-description: Run a repository's ready Pinax or BACKLOG.md queue through the released portable AutoBuild workflow. Use for “run the backlog”, “burn down the backlog”, or “autobuild this project”. The skill configures and launches the Python command; it does not contain a second build sequence.
+description: Run a repository's ready Pinax or BACKLOG.md queue through the released portable AutoBuild workflow. Use for requests such as "run the backlog", "burn down the backlog", or "autobuild this project". The skill configures and launches the Python command. The application owns the build sequence.
 user-invocable: true
 ---
 
 # AutoBuild
 
-Use the released Python application for the complete campaign. This file is only an invocation shim.
+This skill collects the project settings and launches the released Python application. The application owns the complete campaign.
 
-Use the repository passed by the user. A bare invocation means the current repository only. Read its instructions and identify the operational tracker once. Use `pinax status --json` when `.ergon/` exists and Pinax is available. Otherwise check the supported `BACKLOG.md` or `docs/BACKLOG.md` table described in `docs/running-autobuild.md`. The application selects and takes the next item.
+Use the repository passed by the user. A bare invocation means the current repository only. Read its instructions and identify the operational tracker once. Use `pinax status --json` when `.ergon/` exists and [Pinax](https://github.com/antikas/pinax-tracker) is available. Otherwise check the supported `BACKLOG.md` or `docs/BACKLOG.md` table described in `docs/running-autobuild.md`. The application selects and takes the next item.
 
 Build the run configuration from approved project facts. Prefer a committed `.autobuild.toml`. When it is absent, create a temporary profile from the repository's declared validator and the models available in the current harness. Ask only if those facts are ambiguous. Keep the temporary profile in the caller's permitted temporary area. Do not add it to the project.
 

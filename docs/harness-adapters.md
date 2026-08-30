@@ -4,7 +4,7 @@ Coding assistants expose different commands, permission controls, output formats
 
 AutoBuild sends the same typed seat request to every coding assistant. A small adapter translates that request into one command and converts the result back into the same builder or reviewer record. The build sequence does not know which command handled the work.
 
-## What you can watch it do
+## Adapter sequence
 
 1. AutoBuild creates a fresh builder request for one tracked item and its isolated workspace.
 2. The selected adapter starts its command with the approved model, tools, paths and timeout.
@@ -12,7 +12,7 @@ AutoBuild sends the same typed seat request to every coding assistant. A small a
 4. AutoBuild creates a fresh reviewer request containing the brief, diff and validator evidence. It does not include the builder transcript.
 5. The adapter returns the same typed verdict and usage record whichever command ran the seat.
 
-## How one item moves through an adapter
+## Request and result flow
 
 The operator approves the item, model classes and tool policy before the campaign starts. The policy is readable in the runtime profile and can be changed before a run. AutoBuild freezes the selected adapters after their executable, version and authentication probes pass.
 
@@ -24,7 +24,7 @@ The host command adapter starts the process and captures both output streams und
 
 The command must return one of two small JSON contracts. A builder returns a summary. A reviewer returns a disposition and concrete findings. AutoBuild writes a normalised JSON record and keeps the raw command output as diagnostic evidence.
 
-## What keeps it honest
+## Seat safeguards
 
 - Every seat receives a new session identifier and cannot resume a previous conversation.
 - Review seats receive read-only tools and a read-only sandbox where the command supports one.
@@ -36,13 +36,13 @@ The command must return one of two small JSON contracts. A builder returns a sum
 
 AutoBuild accepts a seat only when these checks pass. A command name or a successful exit code is not enough.
 
-## What this is not
+## Responsibility boundaries
 
 The adapters do not choose work, decide acceptance, run validators, merge branches or update the tracker. Those responsibilities remain in the shared workflow and the other ports.
 
 An adapter reports unavailable when its executable or authentication probe fails.
 
-## For engineers
+## Implementation details
 
 ### Shared result contracts
 
