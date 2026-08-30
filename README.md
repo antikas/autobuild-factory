@@ -26,7 +26,7 @@ The workflow is harness-neutral. Claude Code, Codex and GitHub Copilot sit behin
 
 The [setup and run guide](docs/running-autobuild.md) explains installation, harness authentication, item briefs, Pinax and `BACKLOG.md`, the project profile, campaign results, refill and failure handling from a standing start.
 
-Use `autobuild-plan` when the work still needs research, an executable plan, adversarial review and tracker registration. Use `autobuild` when the approved queue is ready to run. [The guide explains both bundled skills](docs/running-autobuild.md#use-the-bundled-skills) and the boundary between planning and execution.
+AutoBuild has two stages. Use `autobuild-plan` for research, planning, independent review and tracker registration. After the owner approves that result, use `autobuild` to run the queue. [The operating guide starts with the planning stage](docs/running-autobuild.md#stage-1-plan-and-register-the-work).
 
 Release 0.2.0 is available as a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild/releases/tag/v0.2.0). The guide also has a [macOS setup path](docs/running-autobuild.md#set-up-autobuild-on-macos) and [GitHub Copilot setup](docs/running-autobuild.md#github-copilot-cli).
 
