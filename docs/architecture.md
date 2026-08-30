@@ -43,17 +43,27 @@ The bootstrap package is the composition root. It is the only part that selects 
 | `src/autobuild/adapters/` | Git, tracker, harness, process, record, and knowledge mechanisms |
 | `src/autobuild/bootstrap/` | Profile loading, discovery, adapter selection, and composition |
 | `src/autobuild/cli.py` | Thin command-line entry point |
+| `skills/autobuild-plan/` | Optional planning entry that researches, reviews and registers a queue, then stops before execution |
+| `skills/autobuild/` | Optional execution entry that configures and launches the Python command |
 | `tests/architecture/` | Dependency and entry-shim tripwires |
 | `tests/contract/` | Shared adapter registration and result contracts |
 | `tests/unit/` | Workflow and policy decisions against fakes |
 | `tests/integration/` | Real processes, Git repositories, trackers, and delivery paths |
+
+## Entry skills and executable
+
+The Python application is the sequencing source. The `autobuild` skill supplies project facts to the command and launches it. The skill does not implement a second campaign or item workflow.
+
+The `autobuild-plan` skill sits before execution. It researches the requested outcome, writes and reviews an end-to-end plan, and registers the resulting queue. It stops before launch unless the owner has already authorised execution.
+
+The repository and source archive contain both skills. The wheel contains the Python application and its `autobuild` command. Skill installation remains with the coding assistant because each host owns its skill directory and loading rules.
 
 ## Runtime composition
 
 The CLI loads `.autobuild.toml` and applies explicit command-line overrides. Bootstrap then performs these steps:
 
 1. Choose the Windows or POSIX command adapter from the current Python host.
-2. Select Pinax or the Markdown backlog adapter from `[tracker]` and startup probes.
+2. Select [Pinax](https://github.com/antikas/pinax-tracker) or the Markdown backlog adapter from `[tracker]` and startup probes.
 3. Configure the Git workspace adapter with the selected tracker's paths.
 4. Resolve the selected harness through the adapter registry.
 5. Choose the no-refill or Koine knowledge adapter from the refill plan.
@@ -251,7 +261,7 @@ Implement `CommandPort` with argument-vector execution, captured output, timeout
 
 Implement `KnowledgePort`. Keep operational queue state in the tracker. The knowledge adapter handles durable context and unresolved directions only.
 
-## Tests that enforce the design
+## Architecture tests
 
 Architecture tests parse imports and fail when domain, ports, application, or enforcement point toward a forbidden outer layer. They also reject provider and host words in application logic.
 

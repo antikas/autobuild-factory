@@ -41,11 +41,22 @@ def public_markdown() -> tuple[Path, ...]:
     )
 
 
+def projected_markdown() -> tuple[Path, ...]:
+    candidates = public_markdown()
+    selected = public_paths()
+    if selected is None:
+        return candidates
+    return tuple(
+        path for path in candidates if path.relative_to(ROOT).as_posix() in selected
+    )
+
+
 def test_operator_guide_covers_the_complete_public_setup() -> None:
     guide = (ROOT / "docs" / "running-autobuild.md").read_text(encoding="utf-8")
 
     for heading in (
         "## Install AutoBuild",
+        "## Use the bundled skills",
         "## Set up AutoBuild on macOS",
         "## Install and authenticate one coding assistant",
         "### GitHub Copilot CLI",
@@ -54,9 +65,9 @@ def test_operator_guide_covers_the_complete_public_setup() -> None:
         "## Set up BACKLOG.md",
         "## Create the project profile",
         "## Run a campaign",
-        "## Read the result",
+        "## Campaign result",
         "## Supply proposal-only refill",
-        "## If a run is interrupted",
+        "## Recover an interrupted run",
         "## Common startup failures",
         "## Technical documentation",
     ):
@@ -64,7 +75,12 @@ def test_operator_guide_covers_the_complete_public_setup() -> None:
     assert "| Item | Title | Status | Brief |" in guide
     assert 'kind = "auto"' in guide
     assert "--allow-delivery" in guide
+    assert "`autobuild-plan`" in guide
+    assert "The Python wheel installs the `autobuild` command only" in guide
     assert "Platform and coding assistant are separate choices" in (
+        ROOT / "README.md"
+    ).read_text(encoding="utf-8")
+    assert "`skills/autobuild-plan/`" in (
         ROOT / "README.md"
     ).read_text(encoding="utf-8")
 
@@ -82,7 +98,7 @@ def test_architecture_guide_covers_boundaries_state_and_evidence() -> None:
         "## Git delivery model",
         "## Tracker adapters",
         "## Extension points",
-        "## Tests that enforce the design",
+        "## Architecture tests",
     ):
         assert heading in guide
     for port in (
@@ -94,6 +110,8 @@ def test_architecture_guide_covers_boundaries_state_and_evidence() -> None:
         "KnowledgePort",
     ):
         assert port in guide
+    assert "## Entry skills and executable" in guide
+    assert "`autobuild-plan`" in guide
 
 
 def test_public_markdown_links_resolve_and_private_paths_do_not_escape() -> None:
@@ -116,7 +134,28 @@ def test_public_markdown_links_resolve_and_private_paths_do_not_escape() -> None
 
 
 def test_public_documentation_uses_plain_ascii_punctuation() -> None:
-    for path in (ROOT / "README.md", *(ROOT / "docs").glob("*.md")):
+    for path in projected_markdown():
         content = path.read_text(encoding="utf-8")
         assert "\u2013" not in content
         assert "\u2014" not in content
+
+
+def test_public_documentation_uses_direct_headings() -> None:
+    for path in projected_markdown():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("#"):
+                assert re.match(r"^#{1,6} (What|How|For)\b", line) is None, (
+                    f"{path.relative_to(ROOT)} has a canned heading: {line}"
+                )
+
+
+def test_pinax_mentions_point_to_the_public_repository() -> None:
+    public_url = "https://github.com/antikas/pinax-tracker"
+    for path in (
+        ROOT / "README.md",
+        ROOT / "docs" / "architecture.md",
+        ROOT / "docs" / "running-autobuild.md",
+        ROOT / "skills" / "autobuild" / "SKILL.md",
+        ROOT / "skills" / "autobuild-plan" / "SKILL.md",
+    ):
+        assert public_url in path.read_text(encoding="utf-8"), path.relative_to(ROOT)
