@@ -1,0 +1,11 @@
+# LF everywhere; union merge on the tracker's event log.
+* text=auto eol=lf
+*.jsonl text eol=lf merge=union
+.ergon/** text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.json text eol=lf

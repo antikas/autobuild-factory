@@ -8,7 +8,7 @@ user-invocable: true
 
 Produces the *deliverable plan* that `/autobuild` later executes. The owner types the ask; everything else — research, plan, adversarial gate, registration — is this skill's job. It STOPS at a registered, dispatch-ready queue: launching the run is the owner's call (plan-then-execute discipline), unless the ask itself pre-authorised it ("once passed, start building").
 
-**SSOTs this skill points at, never restates:** the autobuild contract (`~/.claude/skills/autobuild/SKILL.md` — lanes, gates, validator table, recovery) and its guardrails (`~/.claude/skills/autobuild/GUARDRAILS.md`). If your environment carries its own dispatch canon (model-tier pinning rules, agent definitions), read that directly too.
+**SSOTs this skill points at, never restates:** the sibling AutoBuild skill (`../autobuild/SKILL.md`) for invocation and `../../docs/running-autobuild.md` for tracker, validator and refill configuration. If your environment carries its own dispatch rules or agent definitions, read those directly too.
 
 ## Phase 0 — ground the ask (memory first, canon direct)
 
@@ -16,10 +16,10 @@ Produces the *deliverable plan* that `/autobuild` later executes. The owner type
 2. **Read the scope SSOT yourself** (the prior spec, the decision registers it points at). Note its date — a spec older than the repo is a hypothesis about the repo, not a fact.
 3. Read the tracker state in every repo the ask touches with one call per repo (`pinax status --json` on a [pinax](https://github.com/antikas/pinax-tracker) repo; else the backlog file) — work-state by one call, never file archaeology. Confirm the ask is genuinely unexecuted; find queued items the plan must sequence against.
 
-## Phase 1 — ground-truth scouts (sonnet, parallel, Workflow)
+## Phase 1 — ground-truth scouts
 
-Fan out one scout per surface, pinned sonnet (never haiku), structured output with per-answer file evidence. Standard surfaces:
-- **the build repo(s):** the add/extend recipe as documented AND as last actually executed (the two differ — diff them); coupling tripwires (exhaustiveness tests, registries, typecheck witnesses); test lanes + the fleet validator row; deploy machinery + any repo-vs-server drift; pinned upstream data (schema versions) vs what the spec assumed.
+Use one capable scout per surface, in parallel when the host supports it, with structured output and per-answer file evidence. Pin the implementation-capable model tier available in the current host. Standard surfaces:
+- **the build repo(s):** the add/extend recipe as documented AND as last actually executed (the two differ — diff them); coupling tripwires (exhaustiveness tests, registries, typecheck witnesses); test lanes and the declared project validator; deploy machinery + any repo-vs-server drift; pinned upstream data (schema versions) vs what the spec assumed.
 - **every publication surface** the mandate's "end to end" implies: marketing site, docs, announcement channels — structure, what one new entry touches, its deploy posture.
 - **the programme docs:** open decisions and named gates touching the ask; what has been executed since the spec was written.
 
@@ -35,12 +35,12 @@ One plan folder — `plans/<date>-<slug>/plan.md` wherever you keep plans (a kno
 4. **Decision dispositions table** — every open decision the queue would otherwise stall on: precedent-determined + reversible → *proceed-and-log* with a named default, its precedent, and an explicit **override window**; genuinely open or irreversible → *owner-gated item registered blocked* (never omitted, never silently defaulted). Content needing a named human approver: DRAFT-and-tripwire where precedent exists, park otherwise — blocked, not shrunk.
 5. **The queue** — one section per item: scope (spec-pointer + deltas), lane class (standard/hard/trivial per the autobuild ladders), dependencies, and acceptance a builder + blind auditor can verify with **no human in the loop** (anything needing web/human/production mid-cycle carries a stated park path). End-to-end means the queue always carries: build phases → go-live enablement (build-side) → **production deploy (owner-gated, registered blocked)** → publication-surface update → **publish (owner-gated)**. Deploys never ride unattended runs.
 6. **Sequencing DAG** — including how the new queue coexists with the repo's standing queue.
-7. **Autobuild harness** — invocation, pinned lanes (lean routing: sonnet default, opus for hard, the premium tier for judgment only), validator from the fleet config row, gate typing, observability set, recovery pointer.
+7. **Autobuild harness** — invocation, explicitly selected builder and reviewer models, declared validator, gate typing and observability set.
 8. **Constraints** and **measurable success criteria** — end-to-end ones (live URL, published surface, zero silent deferrals, every autonomous decision logged with its window), verified not asserted.
 
-## Phase 3 — blind adversarial review (opus, refute-by-default)
+## Phase 3 — blind adversarial review (refute-by-default)
 
-Workflow: four parallel reviewers, **opus, high effort, fresh context**, given file paths only — the plan, its sources, the repos, the autobuild contract — never the author's narration. Lenses (adapt the premortem to the domain; keep four seats):
+Use four fresh, capable reviewer sessions, in parallel when supported, given file paths only — the plan, its sources, the repos, the autobuild contract — never the author's narration. Lenses (adapt the premortem to the domain; keep four seats):
 1. **Coverage + dependency** — whole mandate, nothing silently weakened, dependencies real and ordered.
 2. **Autobuildability** — items dispatchable unattended per the autobuild contract; gates typed so the filter never picks owner-gated items; validator/lanes right; M/L items survivable by the loop.
 3. **Architecture-fit + SSOT** — every repo-truth claim spot-checked at code level; no invented pattern where the repo has one; no SSOT violation introduced.
@@ -51,7 +51,7 @@ Verdict schema per seat: `PASS | PASS_WITH_FOLDS | FAIL` + blockers (file-level 
 ## Phase 4 — register and stop
 
 Only after PASS / PASS_WITH_FOLDS-with-folds-applied:
-1. Register the queue in each repo's tracker in dependency order (`pinax add` on a pinax repo; acceptance in the item text with the plan + spec as named brief SSOTs). Owner-gated items get their gate typed **at registration** (`pinax block <id> --gate decision`). Registration commits ride the default branch (register-before-branch invariant).
+1. Register the queue in each repo's tracker in dependency order. Use `pinax add` on a Pinax repo. Otherwise add rows to the supported `BACKLOG.md` table with a `Ready` status and a brief reference, following `../../docs/running-autobuild.md`. Acceptance belongs in the brief, with the plan and spec named as its sources. Owner-gated Pinax items get their gate typed **at registration** (`pinax block <id> --gate decision`); owner-gated backlog rows use `Blocked`, never `Ready`. Registration commits ride the default branch (register-before-branch invariant).
 2. Hygiene: index the plan folder wherever plans are indexed; log the day's delta; update memory if a durable lesson surfaced.
 3. **Report and stop.** The owner gets: the plain-English plan summary, the verdict, every decision taken with its override window, the surfaced gates, and the one command that launches the run. Do not launch it. Do not ask "shall I?" — state what's armed and hand over the trigger.
 
