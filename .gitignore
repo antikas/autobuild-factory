@@ -1,4 +1,30 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+.uv/
+
+# Runtime and scratch
+.autobuild-run/
+*.log
+/tmp/
+_norton_/
+
+# OS / editor
 .DS_Store
 Thumbs.db
+
+# Local tool settings
+.claude/settings.local.json
+.claude/*.lock
+.claude/worktrees/
