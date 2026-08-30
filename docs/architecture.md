@@ -237,7 +237,7 @@ After a claim, the item workflow tries to park any builder, validator, reviewer,
 
 Evidence type failures mark the item as a structural failure and stop the campaign after the park. Other parked outcomes allow the campaign result to report the item honestly.
 
-A hard process kill can interrupt cleanup. Version 0.2.0 preserves any remaining Git branch or worktree for inspection but does not attach a new campaign to it automatically.
+A hard process kill can interrupt cleanup. AutoBuild preserves any remaining Git branch or worktree for inspection but does not attach a new campaign to it automatically.
 
 ## Extension points
 

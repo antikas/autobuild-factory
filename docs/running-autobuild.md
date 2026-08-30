@@ -61,7 +61,7 @@ Stage 2 needs these project facts:
 
 AutoBuild provides the campaign sequence, isolated Git worktree, fresh builder and reviewer sessions, evidence checks, tracker updates, commits, merge, push, and run record.
 
-The coding assistant is called a harness in configuration. Version 0.2.0 includes harness adapters for Claude Code, Codex, and GitHub Copilot CLI.
+The coding assistant is called a harness in configuration. AutoBuild includes harness adapters for Claude Code, Codex, and GitHub Copilot CLI.
 
 ## Prerequisites
 
@@ -87,10 +87,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.2.0 provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild/releases/tag/v0.2.0). Install the released command directly from its tag:
+Release 0.2.1 provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild/releases/tag/v0.2.1). Install the released command directly from its tag:
 
 ```text
-uv tool install git+https://github.com/antikas/autobuild.git@v0.2.0
+uv tool install git+https://github.com/antikas/autobuild.git@v0.2.1
 ```
 
 Check the command:
@@ -122,7 +122,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install git+https://github.com/antikas/autobuild.git@v0.2.0
+uv tool install git+https://github.com/antikas/autobuild.git@v0.2.1
 autobuild --help
 ```
 
@@ -575,7 +575,7 @@ The command must answer `--version`, and the fog ledger must already exist. Publ
 
 Normal failures park the claimed item and release the isolated worktree. A killed process or machine restart can leave a claimed item, an AutoBuild branch, or a worktree under the scratch root.
 
-Version 0.2.0 does not attach a new campaign to an abandoned worktree automatically. Preserve the worktree until you have inspected it.
+AutoBuild does not attach a new campaign to an abandoned worktree automatically. Preserve the worktree until you have inspected it.
 
 Check the repository and tracker:
 
