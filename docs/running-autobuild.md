@@ -1,31 +1,37 @@
 # Set up and run AutoBuild
 
-AutoBuild takes approved work from a repository tracker and gives one item at a time to a coding assistant. It validates the change, asks a fresh reviewer to check it, updates the tracker, and pushes accepted work to the remote default branch.
+AutoBuild has two separate stages. The planning stage turns a build request into a reviewed plan and a registered work queue. The execution stage builds that approved queue one item at a time.
 
-AutoBuild changes Git and tracker state. A run can create commits, merge a branch, and push to `origin`. Read the queue and configuration before you pass `--allow-delivery`.
+The owner controls the boundary between them. Planning stops after queue registration. Execution starts only after the owner gives a separate launch instruction.
 
-This guide starts with a new repository setup. The [architecture guide](architecture.md) explains the internal design and extension points.
+This guide covers both stages and a new repository setup. The [architecture guide](architecture.md) explains the internal design and extension points.
 
-## Project inputs
+## Stage 1: plan and register the work
 
-You provide these project facts:
+Use [`autobuild-plan`](../skills/autobuild-plan/SKILL.md) when the request still needs research, decisions, an executable plan, or tracker registration. A typical request is "create a plan to autobuild the account dashboard."
 
-- a Git repository with a writable `origin` remote
-- an approved work queue in [Pinax](https://github.com/antikas/pinax-tracker) or `BACKLOG.md`
-- one written brief for each runnable item
-- one validator command that decides whether the change works
-- an installed and authenticated coding assistant
-- model names that the selected coding assistant can use
+The planning stage:
 
-AutoBuild provides the campaign sequence, isolated Git worktree, fresh builder and reviewer sessions, evidence checks, tracker updates, commits, merge, push, and run record.
+1. Finds the existing specifications, decisions, plans, and live tracker state.
+2. Inspects the code, tests, deployment path, documentation, and publication surfaces affected by the request.
+3. Writes an end-to-end plan with acceptance criteria, dependencies, owner gates, and the project validator.
+4. Runs four independent reviews covering scope, execution readiness, architecture, and failure risks.
+5. Applies accepted corrections and records the review result beside the plan.
+6. Registers ready items in [Pinax](https://github.com/antikas/pinax-tracker) or `BACKLOG.md`.
+7. Registers production deployment, publication, and unresolved owner decisions as blocked items.
+8. Reports the plan, queue, decisions, gates, and launch command, then stops.
 
-The coding assistant is called a harness in configuration. Version 0.2.0 includes harness adapters for Claude Code, Codex, and GitHub Copilot CLI.
+The owner reviews the plan and queue before execution. The planning stage can write planning documents and tracker records. It does not start a builder or change product code.
 
-## Campaign sequence
+If the repository already has an approved queue and complete briefs, start with stage 2. If the coding assistant cannot load `SKILL.md` files, follow the same planning steps manually and register the queue before execution.
+
+## Stage 2: execute the approved queue
+
+Use [`autobuild`](../skills/autobuild/SKILL.md) after the owner approves the plan and gives the launch instruction. Requests such as "run the backlog" or "autobuild this project" start this stage.
 
 For each ready item, AutoBuild follows this sequence:
 
-1. Check the harness, authentication, tracker, Git repository, validator policy, and temporary work area.
+1. Check the coding assistant, authentication, tracker, Git repository, validator policy, and temporary work area.
 2. Claim the next ready item and push that tracker change.
 3. Create an isolated Git worktree from the claimed revision.
 4. Start a fresh builder session with the approved brief and allowed tools.
@@ -38,24 +44,24 @@ For each ready item, AutoBuild follows this sequence:
 
 The reviewer does not receive the builder transcript. Accepted work must still match the diff that passed validation and review.
 
-## Use the bundled skills
+The `autobuild` skill reads the project configuration and launches the Python command. You can also call the command directly without installing either skill.
 
-AutoBuild includes two optional skill descriptions for coding assistants that support `SKILL.md` files. The source archive and repository checkout contain both skills. The Python wheel installs the `autobuild` command only and does not change a coding assistant's personal skill directory.
+The repository and source archive contain both skill folders. The Python wheel installs the `autobuild` command only. Install the skills through the coding assistant's normal skill method, or use their `SKILL.md` files from a checkout.
 
-`autobuild-plan` prepares work that is not ready to execute. Give it a build request such as "create a plan to autobuild the account dashboard."
+## Project inputs for execution
 
-The skill researches the current system, writes the end-to-end plan, and checks it through four independent review lenses. It registers the approved queue in Pinax or `BACKLOG.md`, then stops before launch.
+Stage 2 needs these project facts:
 
-`autobuild` runs an approved queue. Give it a request such as "run the backlog" or "autobuild this project." The skill reads the project configuration and launches the released Python command. The campaign sequence remains in the application.
+- a Git repository with a writable `origin` remote
+- an approved work queue in Pinax or `BACKLOG.md`
+- one written brief for each runnable item
+- one validator command that decides whether the change works
+- an installed and authenticated coding assistant
+- model names that the selected coding assistant can use
 
-Planning and execution stay separate:
+AutoBuild provides the campaign sequence, isolated Git worktree, fresh builder and reviewer sessions, evidence checks, tracker updates, commits, merge, push, and run record.
 
-1. Install each skill folder through the coding assistant's normal skill installation method, or use the `SKILL.md` file directly from a checkout.
-2. Invoke `autobuild-plan` when the request still needs a reviewed plan and registered queue.
-3. Review the resulting plan and queue.
-4. Invoke `autobuild` only after the owner gives the launch instruction.
-
-You can also use the `autobuild` command directly without installing either skill. The command needs the same repository, tracker, profile and delivery permission described in this guide.
+The coding assistant is called a harness in configuration. Version 0.2.0 includes harness adapters for Claude Code, Codex, and GitHub Copilot CLI.
 
 ## Prerequisites
 

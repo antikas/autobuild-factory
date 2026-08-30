@@ -56,7 +56,8 @@ def test_operator_guide_covers_the_complete_public_setup() -> None:
 
     for heading in (
         "## Install AutoBuild",
-        "## Use the bundled skills",
+        "## Stage 1: plan and register the work",
+        "## Stage 2: execute the approved queue",
         "## Set up AutoBuild on macOS",
         "## Install and authenticate one coding assistant",
         "### GitHub Copilot CLI",
@@ -77,6 +78,10 @@ def test_operator_guide_covers_the_complete_public_setup() -> None:
     assert "--allow-delivery" in guide
     assert "`autobuild-plan`" in guide
     assert "The Python wheel installs the `autobuild` command only" in guide
+    assert guide.index("## Stage 1: plan and register the work") < guide.index(
+        "## Stage 2: execute the approved queue"
+    )
+    assert "It does not start a builder or change product code." in guide
     assert "Platform and coding assistant are separate choices" in (
         ROOT / "README.md"
     ).read_text(encoding="utf-8")
