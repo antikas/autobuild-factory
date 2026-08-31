@@ -87,10 +87,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.2.2 provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild/releases/tag/v0.2.2). Install the released command directly from its tag:
+Release 0.2.2 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/v0.2.2). Install the released command from PyPI:
 
 ```text
-uv tool install git+https://github.com/antikas/autobuild.git@v0.2.2
+uv tool install autobuild-factory==0.2.2
 ```
 
 Check the command:
@@ -122,7 +122,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install git+https://github.com/antikas/autobuild.git@v0.2.2
+uv tool install autobuild-factory==0.2.2
 autobuild --help
 ```
 

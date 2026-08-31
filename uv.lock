@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.11"
 
 [[package]]
-name = "autobuild"
+name = "autobuild-factory"
 version = "0.2.2"
 source = { editable = "." }
 
