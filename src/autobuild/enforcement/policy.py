@@ -182,7 +182,9 @@ class EnforcedHarnessPort:
         }:
             raise PolicyViolation("review seats must remain read-only")
         for root in request.tool_policy.allowed_roots:
-            if not _is_within(root, (request.workspace.root,)):
+            if not _is_within(
+                root, (request.workspace.root, *self._config.allowed_roots)
+            ):
                 raise PolicyViolation(f"seat tool root escapes the workspace: {root}")
         for reference in request.context_refs:
             path = Path(reference).expanduser()
