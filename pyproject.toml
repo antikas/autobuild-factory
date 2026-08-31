@@ -1,5 +1,5 @@
 [project]
-name = "autobuild"
+name = "autobuild-factory"
 version = "0.2.2"
 description = "The software factory's build cycle, harness-neutral: logic once, mechanisms behind adapters."
 readme = "README.md"
@@ -9,8 +9,8 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/antikas/autobuild"
-Issues = "https://github.com/antikas/autobuild/issues"
+Repository = "https://github.com/antikas/autobuild-factory"
+Issues = "https://github.com/antikas/autobuild-factory/issues"
 
 [project.scripts]
 autobuild = "autobuild.cli:main"

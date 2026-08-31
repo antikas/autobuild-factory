@@ -21,7 +21,7 @@ autobuild run --repository <repo> --profile <profile> --harness <current-harness
 If `autobuild` is not installed, run version 0.2.2 from the public release:
 
 ```text
-uvx --from git+https://github.com/antikas/autobuild.git@v0.2.2 autobuild run ...
+uvx --from autobuild-factory==0.2.2 autobuild run ...
 ```
 
 Supply `--scratch-root` only when the caller or machine has provided one. With no override, AutoBuild uses the operating system's standard temporary directory.

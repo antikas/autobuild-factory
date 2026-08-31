@@ -1,0 +1,79 @@
+name: Publish release assets to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: GitHub release tag containing the reviewed package artifacts
+        required: true
+        default: autobuild-factory-0.2.2
+        type: string
+
+concurrency:
+  group: pypi-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/autobuild-factory/
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download the GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            autobuild-factory-[0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "release_tag must use the form autobuild-factory-X.Y.Z" >&2
+              exit 1
+              ;;
+          esac
+
+          mkdir -p release-assets dist
+          gh release download "$RELEASE_TAG" \
+            --repo "$REPOSITORY" \
+            --dir release-assets \
+            --pattern "autobuild_factory-*.whl" \
+            --pattern "autobuild_factory-*.tar.gz" \
+            --pattern "SHA256SUMS"
+
+      - name: Verify the release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+
+          test -f SHA256SUMS
+          mapfile -t packages < <(
+            find . -maxdepth 1 -type f \
+              \( -name "autobuild_factory-*.whl" -o -name "autobuild_factory-*.tar.gz" \) \
+              -printf "%f\n" | sort
+          )
+          test "${#packages[@]}" -eq 2
+          sha256sum --check --strict SHA256SUMS
+
+          cp -- "${packages[@]}" ../dist/
+
+      - name: Publish the verified distributions
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist
+          verify-metadata: true
+          skip-existing: false
+          attestations: true
+          print-hash: true
