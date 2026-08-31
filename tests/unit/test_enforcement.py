@@ -18,7 +18,10 @@ from autobuild.domain import (
     ReviewDecision,
     ReviewVerdict,
     Seat,
+    SeatOutcome,
     SeatRequest,
+    SeatResult,
+    SeatUsage,
     ToolPolicy,
     ValidationEvidence,
     WorkItem,
@@ -95,6 +98,67 @@ def test_harness_rejects_an_undeclared_tool_before_dispatch(tmp_path: Path) -> N
     port = PolicyGateway(policy(tmp_path)).harness(fake)
 
     with pytest.raises(PolicyViolation, match="undeclared tool"):
+        port.invoke(request)
+
+    assert fake.requests == []
+
+
+def test_harness_accepts_configured_external_roots(tmp_path: Path) -> None:
+    workspace = WorkspaceRef(tmp_path / "worktree", "autobuild/item", "base", "lease")
+    external = tmp_path.parent / f"{tmp_path.name}-shared-briefs"
+    external.mkdir()
+    request = SeatRequest(
+        "run",
+        "item",
+        Seat.BUILDER,
+        "builder",
+        workspace.root / "brief.md",
+        workspace,
+        ToolPolicy(frozenset({"python"}), (workspace.root, external)),
+        "Build the item",
+        "builder-report-v1",
+        60,
+    )
+    result = SeatResult(
+        "run-ref",
+        SeatOutcome.SUCCEEDED,
+        None,
+        "raw-output",
+        SeatUsage(source="fake"),
+        "start",
+        "end",
+    )
+    fake = FakeHarnessAdapter(identity("harness"), scripted_results=[result])
+    config = PolicyConfig(
+        allowed_roots=(workspace.root, external),
+        approved_validators=(ApprovedValidator("tests", ("python", "-m", "pytest")),),
+        allowed_tools=frozenset({"python"}),
+    )
+    port = PolicyGateway(config).harness(fake)
+
+    assert port.invoke(request) == result
+    assert fake.requests == [request]
+
+
+def test_harness_rejects_unconfigured_external_roots(tmp_path: Path) -> None:
+    workspace = WorkspaceRef(tmp_path / "worktree", "autobuild/item", "base", "lease")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-shared-briefs"
+    request = SeatRequest(
+        "run",
+        "item",
+        Seat.BUILDER,
+        "builder",
+        tmp_path / "brief.md",
+        workspace,
+        ToolPolicy(frozenset({"python"}), (workspace.root, outside)),
+        "Build the item",
+        "builder-report-v1",
+        60,
+    )
+    fake = FakeHarnessAdapter(identity("harness"))
+    port = PolicyGateway(policy(tmp_path)).harness(fake)
+
+    with pytest.raises(PolicyViolation, match="seat tool root escapes"):
         port.invoke(request)
 
     assert fake.requests == []
