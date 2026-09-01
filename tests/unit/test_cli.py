@@ -5,9 +5,9 @@ from pathlib import Path
 import pytest
 
 from autobuild.bootstrap.composition import run_campaign
-from autobuild.bootstrap.profile import ConfigurationError, load_settings
+from autobuild.bootstrap.profile import ConfigurationError, ProfileOverrides, load_settings
 from autobuild.cli import _overrides, _parser
-from autobuild.domain import FogRecord, Proposal, RefillPlan
+from autobuild.domain import DeliveryMode, FogRecord, Proposal, RefillPlan
 
 
 PROFILE = """
@@ -172,4 +172,38 @@ def test_delivery_gate_fails_before_adapter_preflight(tmp_path: Path) -> None:
     settings = load_settings(repository, args.profile, _overrides(args))
 
     with pytest.raises(ConfigurationError, match="--allow-delivery"):
-        run_campaign(settings, allow_delivery=False)
+        run_campaign(
+            settings,
+            allow_delivery=False,
+            delivery_mode=DeliveryMode.CURRENT_BRANCH_PR,
+        )
+
+
+def test_cli_exposes_the_two_delivery_modes_and_current_branch_options(tmp_path: Path) -> None:
+    args = arguments(
+        tmp_path,
+        "--delivery-mode",
+        "current-branch-pr",
+        "--push-current-branch",
+        "--allow-current-branch-default",
+    )
+
+    assert args.delivery_mode == DeliveryMode.CURRENT_BRANCH_PR.value
+    assert args.push_current_branch is True
+    assert args.allow_current_branch_default is True
+
+
+def test_current_branch_options_are_rejected_with_protected_delivery_before_preflight(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "project"
+    repository.mkdir()
+    (repository / ".autobuild.toml").write_text(PROFILE, encoding="utf-8")
+    settings = load_settings(repository, None, ProfileOverrides())
+
+    with pytest.raises(ConfigurationError, match="require --delivery-mode current-branch-pr"):
+        run_campaign(
+            settings,
+            allow_delivery=True,
+            push_current_branch=True,
+        )

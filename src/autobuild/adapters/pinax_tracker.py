@@ -26,10 +26,17 @@ from autobuild.domain import (
 
 
 class PinaxTrackerAdapter:
-    def __init__(self, repository: Path, proposal_prefix: str = "abp", remote: str = "origin") -> None:
+    def __init__(
+        self,
+        repository: Path,
+        proposal_prefix: str = "abp",
+        remote: str = "origin",
+        push_primary: bool = True,
+    ) -> None:
         self._repository = repository.resolve(strict=False)
         self._proposal_prefix = proposal_prefix
         self._remote = remote
+        self._push_primary = push_primary
 
     def probe(self) -> ProbeResult:
         executable = shutil.which("pinax")
@@ -227,6 +234,8 @@ class PinaxTrackerAdapter:
         self._git(self._repository, "add", "-A", "--", ".ergon")
         self._git(self._repository, "commit", "-m", message, "--", ".ergon")
         revision = self._git(self._repository, "rev-parse", "HEAD")
+        if not self._push_primary:
+            return revision
         self._git(self._repository, "push", self._remote, "HEAD")
         branch = self._git(self._repository, "branch", "--show-current")
         remote_line = self._git(

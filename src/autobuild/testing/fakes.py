@@ -102,7 +102,7 @@ class FakeWorkspaceAdapter(FakeAdapter):
     released: list[str] = field(default_factory=list)
 
     def identify(self, root: Path) -> RepositoryIdentity:
-        return RepositoryIdentity(root, "main", "origin", "base")
+        return RepositoryIdentity(root, "main", "feature", "origin", "base")
 
     def create_isolated(self, campaign: CampaignRef, item: WorkItem) -> WorkspaceRef:
         self.created.append(item.item_id)

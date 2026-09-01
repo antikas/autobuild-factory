@@ -6,7 +6,7 @@ on:
       release_tag:
         description: GitHub release tag containing the reviewed package artifacts
         required: true
-        default: autobuild-factory-0.2.2
+        default: autobuild-factory-0.3.0
         type: string
 
 concurrency:

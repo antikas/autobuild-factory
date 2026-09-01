@@ -7,6 +7,6 @@ from autobuild.domain import PortKind
 __all__ = ["PortKind"]
 
 try:
-    __version__ = version("autobuild")
+    __version__ = version("autobuild-factory")
 except PackageNotFoundError:
     __version__ = "development"

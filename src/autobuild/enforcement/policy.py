@@ -14,6 +14,7 @@ from autobuild.domain import (
     CampaignRef,
     CloseEvidence,
     CommandRequest,
+    DeliveryMode,
     DeliveryRequest,
     EvidenceError,
     FinaliseRequest,
@@ -55,6 +56,7 @@ class PolicyConfig:
     max_seat_timeout_seconds: float = 900.0
     allow_destructive: bool = False
     allow_publication: bool = False
+    allow_repository_mutation: bool = False
     allow_protected_merge: bool = False
 
     def __post_init__(self) -> None:
@@ -253,7 +255,12 @@ class EnforcedWorkspacePort:
 
     def deliver(self, workspace: WorkspaceRef, request: DeliveryRequest):
         _require_workspace(workspace, self._config)
-        if request.merge_to_default and not self._config.allow_protected_merge:
+        if not self._config.allow_repository_mutation:
+            raise PolicyViolation("repository delivery has no human gate")
+        if (
+            request.mode is DeliveryMode.PROTECTED_DEFAULT
+            and not self._config.allow_protected_merge
+        ):
             raise PolicyViolation("protected-branch delivery has no human gate")
         if not request.tracker_commit.strip():
             raise EvidenceError("delivery requires a tracker commit")
@@ -279,8 +286,8 @@ class EnforcedTrackerPort:
     def claim(self, item, actor: str):
         if not actor.strip():
             raise PolicyViolation("claim actor must not be empty")
-        if not self._config.allow_protected_merge:
-            raise PolicyViolation("durable tracker claim has no protected-branch gate")
+        if not self._config.allow_repository_mutation:
+            raise PolicyViolation("durable tracker claim has no repository-mutation gate")
         return self._port.claim(item, actor)
 
     def close(
@@ -303,15 +310,15 @@ class EnforcedTrackerPort:
             raise EvidenceError("park requires item, concrete reason, and actor")
         if workspace is not None:
             _require_workspace(workspace, self._config)
-        elif not self._config.allow_protected_merge:
-            raise PolicyViolation("primary tracker park has no protected-branch gate")
+        elif not self._config.allow_repository_mutation:
+            raise PolicyViolation("primary tracker park has no repository-mutation gate")
         self._port.park(item_id, reason, actor, workspace)
 
     def propose(self, proposal: Proposal, actor: str):
         if not actor.strip():
             raise PolicyViolation("proposal actor must not be empty")
-        if not self._config.allow_protected_merge:
-            raise PolicyViolation("durable tracker proposal has no protected-branch gate")
+        if not self._config.allow_repository_mutation:
+            raise PolicyViolation("durable tracker proposal has no repository-mutation gate")
         result = self._port.propose(proposal, actor)
         if result.runnable:
             raise PolicyViolation("workflow proposals must remain non-runnable")

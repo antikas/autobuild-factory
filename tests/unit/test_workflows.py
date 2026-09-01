@@ -13,6 +13,7 @@ from autobuild.domain import (
     CampaignStopReason,
     CommandResult,
     DiffEvidence,
+    DeliveryMode,
     FogRecord,
     ItemDisposition,
     ItemExecutionSpec,
@@ -104,6 +105,9 @@ def spec(work_item: WorkItem | None = None, max_corrections: int = 2) -> ItemExe
         "reviewer-class",
         "specialist-class",
         max_corrections=max_corrections,
+        delivery_mode=DeliveryMode.PROTECTED_DEFAULT,
+        delivery_target_branch="main",
+        delivery_target_revision="base",
     )
 
 

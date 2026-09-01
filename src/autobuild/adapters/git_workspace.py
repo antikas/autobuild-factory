@@ -17,6 +17,7 @@ from autobuild.domain import (
     CampaignRef,
     ChangedPath,
     ChangeKind,
+    DeliveryMode,
     DeliveryRequest,
     DiffEvidence,
     EvidenceError,
@@ -80,10 +81,13 @@ class GitWorkspaceAdapter:
         resolved = Path(self._git(root, "rev-parse", "--show-toplevel")).resolve(strict=True)
         revision = self._git(resolved, "rev-parse", "HEAD")
         default_branch = self._default_branch(resolved)
+        current_branch = self._git(resolved, "branch", "--show-current")
         remotes = self._git(resolved, "remote").splitlines()
         if self._remote not in remotes:
             raise AdapterError(f"required git remote is missing: {self._remote}")
-        return RepositoryIdentity(resolved, default_branch, self._remote, revision)
+        return RepositoryIdentity(
+            resolved, default_branch, current_branch, self._remote, revision
+        )
 
     def create_isolated(self, campaign: CampaignRef, item: WorkItem) -> WorkspaceRef:
         repository = self.identify(campaign.repository)
@@ -193,11 +197,12 @@ class GitWorkspaceAdapter:
                 raise EvidenceError("parked tracker commit is not based on the starting commit")
         elif parent != request.item_commit:
             raise EvidenceError("tracker commit is not immediately after the item commit")
-        if not request.merge_to_default:
-            return FinaliseResult(request.item_commit, request.tracker_commit, None, False)
+        if request.mode is DeliveryMode.CURRENT_BRANCH_PR:
+            return self._deliver_current_branch(lease, workspace, request)
+        if request.mode is not DeliveryMode.PROTECTED_DEFAULT:
+            raise EvidenceError(f"unsupported delivery mode: {request.mode}")
         primary = lease.repository.root
-        if self._git(primary, "status", "--porcelain", "--untracked-files=all"):
-            raise AdapterError("primary checkout must be clean before delivery")
+        self._require_clean_primary(primary, "before delivery")
         self._git(primary, "checkout", lease.repository.default_branch)
         self._git(primary, "merge", "--no-ff", "--no-edit", workspace.branch)
         merged_commit = self._git(primary, "rev-parse", "HEAD")
@@ -217,6 +222,71 @@ class GitWorkspaceAdapter:
             merged_commit,
             True,
             (f"remote {lease.repository.remote}/{lease.repository.default_branch} verified",),
+        )
+
+    def _deliver_current_branch(
+        self, lease: _Lease, workspace: WorkspaceRef, request: DeliveryRequest
+    ) -> FinaliseResult:
+        repository = lease.repository
+        if request.target_branch != repository.current_branch:
+            raise EvidenceError("current-branch delivery target differs from the invoking branch")
+        if (
+            request.target_branch == repository.default_branch
+            and not request.allow_current_branch_default
+        ):
+            raise AdapterError(
+                "current-branch-pr delivery refuses the detected default branch; "
+                "pass --allow-current-branch-default after human approval"
+            )
+        primary = repository.root
+        self._require_clean_primary(primary, "before delivery")
+        if self._git(primary, "branch", "--show-current") != request.target_branch:
+            raise AdapterError("primary checkout no longer has the captured target branch")
+        ancestry = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(primary),
+                "merge-base",
+                "--is-ancestor",
+                request.target_revision,
+                "HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if ancestry.returncode != 0:
+            raise AdapterError("captured target revision is no longer in the current branch history")
+        self._git(primary, "merge", "--no-ff", "--no-edit", workspace.branch)
+        merged_commit = self._git(primary, "rev-parse", "HEAD")
+        self._require_clean_primary(primary, "after delivery")
+        if not request.push_current_branch:
+            return FinaliseResult(
+                request.item_commit,
+                request.tracker_commit,
+                merged_commit,
+                False,
+                (f"local branch {request.target_branch} updated without push",),
+            )
+        self._git(primary, "push", repository.remote, request.target_branch)
+        remote_line = self._git(
+            primary,
+            "ls-remote",
+            repository.remote,
+            f"refs/heads/{request.target_branch}",
+        )
+        remote_revision = remote_line.split()[0] if remote_line.split() else ""
+        if remote_revision != merged_commit:
+            raise AdapterError("remote verification did not observe the delivered commit")
+        return FinaliseResult(
+            request.item_commit,
+            request.tracker_commit,
+            merged_commit,
+            True,
+            (f"remote {repository.remote}/{request.target_branch} verified",),
         )
 
     def release(self, workspace: WorkspaceRef) -> None:
@@ -304,6 +374,10 @@ class GitWorkspaceAdapter:
         lines = self._git(root, "status", "--porcelain", "--untracked-files=all").splitlines()
         return "\n".join(line for line in lines if self._is_product_path(line[3:]))
 
+    def _require_clean_primary(self, primary: Path, timing: str) -> None:
+        if self._git(primary, "status", "--porcelain", "--untracked-files=all"):
+            raise AdapterError(f"primary checkout must be clean {timing}")
+
     def _default_branch(self, root: Path) -> str:
         symbolic = self._git(
             root, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{self._remote}/HEAD", check=False
@@ -311,6 +385,13 @@ class GitWorkspaceAdapter:
         prefix = f"{self._remote}/"
         if symbolic.startswith(prefix):
             return symbolic[len(prefix) :]
+        remote_head = self._git(root, "ls-remote", "--symref", self._remote, "HEAD", check=False)
+        for line in remote_head.splitlines():
+            if not line.startswith("ref: refs/heads/"):
+                continue
+            reference, _, name = line.partition("\t")
+            if name == "HEAD":
+                return reference.removeprefix("ref: refs/heads/")
         current = self._git(root, "branch", "--show-current")
         if not current:
             raise AdapterError("cannot determine the repository default branch")

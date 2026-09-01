@@ -133,8 +133,7 @@ class ItemWorkflow:
                 workspace, spec.item.item_id, item_commit
             )
             finalise = self._ports.workspace.deliver(
-                workspace,
-                DeliveryRequest(spec.item.item_id, item_commit, tracker_commit),
+                workspace, self._delivery_request(spec, item_commit, tracker_commit)
             )
             machine.transition(ItemState.FINALISED)
             self._event(record, "item.finalised", spec.item.item_id, finalise.item_commit, tracker_commit)
@@ -326,8 +325,7 @@ class ItemWorkflow:
                 workspace, spec.item.item_id, item_commit=None
             )
             finalise = self._ports.workspace.deliver(
-                workspace,
-                DeliveryRequest(spec.item.item_id, item_commit=None, tracker_commit=tracker_commit),
+                workspace, self._delivery_request(spec, None, tracker_commit)
             )
             self._ports.workspace.release(workspace)
             machine.transition(ItemState.RELEASED)
@@ -346,4 +344,19 @@ class ItemWorkflow:
         self._ports.records.append(
             record,
             RunEvent(event_type=event_type, occurred_at="adapter-time", item_id=item_id, evidence_refs=tuple(refs)),
+        )
+
+    @staticmethod
+    def _delivery_request(
+        spec: ItemExecutionSpec, item_commit: str | None, tracker_commit: str
+    ) -> DeliveryRequest:
+        return DeliveryRequest(
+            spec.item.item_id,
+            item_commit,
+            tracker_commit,
+            spec.delivery_mode,
+            spec.delivery_target_branch,
+            spec.delivery_target_revision,
+            spec.push_current_branch,
+            spec.allow_current_branch_default,
         )
