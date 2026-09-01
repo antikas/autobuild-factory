@@ -32,14 +32,14 @@ Use [`autobuild`](../skills/autobuild/SKILL.md) after the owner approves the pla
 For each ready item, AutoBuild follows this sequence:
 
 1. Check the coding assistant, authentication, tracker, Git repository, validator policy, and temporary work area.
-2. Claim the next ready item and push that tracker change.
+2. Claim the next ready item and commit that tracker change. Protected delivery pushes it to the default branch; local PR delivery keeps it local until an optional current-branch push is authorised.
 3. Create an isolated Git worktree from the claimed revision.
 4. Start a fresh builder session with the approved brief and allowed tools.
 5. Calculate the changed files and run the declared validator.
 6. Start a fresh read-only reviewer with the brief, diff, and validator evidence.
 7. Correct a material finding, ask a specialist when the finding names a specialist boundary, or park the item.
 8. Create a product commit and a separate tracker commit for accepted work.
-9. Merge the item branch into the default branch, push it, and verify the remote revision.
+9. Deliver the item branch through the selected mode. Local PR delivery merges into the invoking branch and pushes only when separately authorised. Protected delivery merges into the default branch, pushes it, and verifies the remote revision.
 10. Continue until the queue is dry, the item limit is reached, or a structural evidence failure stops the campaign.
 
 The reviewer does not receive the builder transcript. Accepted work must still match the diff that passed validation and review.
@@ -52,14 +52,14 @@ The repository and source archive contain both skill folders. The Python wheel i
 
 Stage 2 needs these project facts:
 
-- a Git repository with a writable `origin` remote
+- a Git repository with an `origin` remote; it must be writable for protected delivery or `--push-current-branch`
 - an approved work queue in Pinax or `BACKLOG.md`
 - one written brief for each runnable item
 - one validator command that decides whether the change works
 - an installed and authenticated coding assistant
 - model names that the selected coding assistant can use
 
-AutoBuild provides the campaign sequence, isolated Git worktree, fresh builder and reviewer sessions, evidence checks, tracker updates, commits, merge, push, and run record.
+AutoBuild provides the campaign sequence, isolated Git worktree, fresh builder and reviewer sessions, evidence checks, tracker updates, commits, delivery through the selected mode, and a run record.
 
 The coding assistant is called a harness in configuration. AutoBuild includes harness adapters for Claude Code, Codex, and GitHub Copilot CLI.
 
@@ -73,7 +73,7 @@ You need:
 - a supported coding assistant command
 - Pinax only if you choose the Pinax tracker
 
-The target repository must have at least one commit, a current default branch, and a remote called `origin`. AutoBuild pushes tracker claims before it starts a builder, so the remote must be writable.
+The target repository must have at least one commit, a detectable default branch, and a remote called `origin`. Local PR delivery requires a named invoking branch. Protected delivery and an explicitly pushed current branch require a writable remote; local PR delivery without `--push-current-branch` commits tracker claims locally.
 
 Check the repository from its root:
 
@@ -87,10 +87,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.2.2 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/v0.2.2). Install the released command from PyPI:
+Release 0.3.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.3.0). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.2.2
+uv tool install autobuild-factory==0.3.0
 ```
 
 Check the command:
@@ -122,7 +122,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.2.2
+uv tool install autobuild-factory==0.3.0
 autobuild --help
 ```
 
@@ -347,10 +347,10 @@ kind = "backlog"
 path = "BACKLOG.md"
 ```
 
-For a one-run override, use:
+For a one-run local PR override, use:
 
 ```text
-autobuild run --repository . --tracker backlog --backlog docs/QUEUE.md --allow-delivery
+autobuild run --repository . --tracker backlog --backlog docs/QUEUE.md --delivery-mode current-branch-pr --allow-delivery
 ```
 
 ## Create the project profile
@@ -455,18 +455,28 @@ AutoBuild places worktrees, run records, command output, evidence, and package c
 
 ## Run a campaign
 
-Review the queue, briefs, profile, current branch, and remote. Then run:
+Review the queue, briefs, profile, current branch, and remote. Local PR delivery is the usual choice when a person will review the branch before it reaches the default branch:
 
 ```text
-autobuild run --repository . --allow-delivery
+autobuild run --repository . --delivery-mode current-branch-pr --allow-delivery
 ```
 
-`--allow-delivery` is the human gate for tracker claims, commits, merges, and pushes. AutoBuild stops before adapter preflight when the flag is absent.
+`--allow-delivery` is the human gate for repository changes. AutoBuild stops before adapter preflight when the flag is absent. It does not decide where the result is delivered.
+
+`current-branch-pr` captures the branch and revision of the checkout that starts the campaign. Accepted product and tracker commits merge into that branch. AutoBuild does not check out, merge into, or push the default branch. It also does not push the current branch unless you add `--push-current-branch`. The mode refuses a current branch that is the detected default branch unless you also pass `--allow-current-branch-default`.
+
+Use protected delivery only after a human has approved a merge and push to the default branch:
+
+```text
+autobuild run --repository . --delivery-mode protected-default --allow-delivery
+```
+
+`protected-default` remains the default when `--delivery-mode` is omitted. It merges accepted work into the detected default branch, pushes that branch, and verifies the remote revision. `--push-current-branch` and `--allow-current-branch-default` work only with `current-branch-pr`.
 
 Write the result to a file when another tool or person needs it:
 
 ```text
-autobuild run --repository . --allow-delivery --output autobuild-result.json
+autobuild run --repository . --delivery-mode current-branch-pr --allow-delivery --output autobuild-result.json
 ```
 
 Useful one-run overrides include:
@@ -479,6 +489,7 @@ autobuild run \
   --reviewer-model gpt-5.6-sol \
   --max-items 1 \
   --scratch-root /path/to/scratch \
+  --delivery-mode current-branch-pr \
   --allow-delivery
 ```
 
@@ -521,9 +532,11 @@ Command output, harness output, and diff patches live under their own scratch su
 
 ## Changes made by accepted and parked outcomes
 
-An accepted item creates separate commits for product files and tracker state. AutoBuild merges the item branch into the default branch with a merge commit, pushes the default branch, and checks that the remote points at that commit.
+An accepted item creates separate commits for product files and tracker state. In `current-branch-pr` mode, AutoBuild merges the item branch into the invoking branch and reports the resulting local commit with `pushed: false`. A human can inspect that branch and create a pull request. Add `--push-current-branch` only when the current branch should be pushed and verified.
 
-A parked item writes the reason to the selected tracker and pushes the tracker-only result. AutoBuild does not merge the unaccepted product changes. The isolated worktree is released after the park record is delivered.
+In `protected-default` mode, AutoBuild merges the item branch into the default branch with a merge commit, pushes the default branch, and checks that the remote points at that commit.
+
+A parked item writes the reason to the selected tracker and delivers that tracker-only result through the selected delivery mode. AutoBuild does not merge the unaccepted product changes. The isolated worktree is released after the park record is delivered.
 
 A preflight failure occurs before a tracker claim. The primary repository remains unchanged.
 

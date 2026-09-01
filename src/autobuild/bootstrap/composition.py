@@ -26,6 +26,7 @@ from autobuild.bootstrap.registry import AdapterRegistry, AdapterSelection
 from autobuild.bootstrap.runtime import RuntimeResolver
 from autobuild.domain import (
     CampaignRef,
+    DeliveryMode,
     ItemExecutionSpec,
     PortKind,
     ProbeResult,
@@ -72,14 +73,24 @@ def _harness(settings: RunSettings, command: object, scratch: Path):
     return binding.get(PortKind.HARNESS), binding.bindings[0].identity
 
 
-def _runtime(settings: RunSettings, scratch: Path):
+def _runtime(
+    settings: RunSettings,
+    scratch: Path,
+    delivery_mode: DeliveryMode,
+    push_current_branch: bool,
+):
     command = (
         WindowsCommandAdapter(scratch / "commands")
         if os.name == "nt"
         else PosixCommandAdapter(scratch / "commands")
     )
-    pinax = PinaxTrackerAdapter(settings.repository)
-    backlog = BacklogTrackerAdapter(settings.repository, settings.backlog_path)
+    push_primary = (
+        delivery_mode is DeliveryMode.PROTECTED_DEFAULT or push_current_branch
+    )
+    pinax = PinaxTrackerAdapter(settings.repository, push_primary=push_primary)
+    backlog = BacklogTrackerAdapter(
+        settings.repository, settings.backlog_path, push_primary=push_primary
+    )
     if settings.tracker_kind == "pinax":
         tracker = pinax
     elif settings.tracker_kind == "backlog":
@@ -126,8 +137,8 @@ def _runtime(settings: RunSettings, scratch: Path):
     records = LocalRunRecordAdapter(
         scratch / "runs", metadata=_runtime_metadata(settings, manifest)
     )
-    workspace.identify(settings.repository)
-    return tracker, workspace, harness, command, records, knowledge, manifest
+    repository = workspace.identify(settings.repository)
+    return tracker, workspace, harness, command, records, knowledge, manifest, repository
 
 
 def _runtime_metadata(
@@ -165,10 +176,32 @@ def _runtime_metadata(
     }
 
 
-def _ports(settings: RunSettings, scratch: Path):
-    tracker, workspace, harness, command, records, knowledge, manifest = _runtime(
-        settings, scratch
+def _ports(
+    settings: RunSettings,
+    scratch: Path,
+    delivery_mode: DeliveryMode,
+    push_current_branch: bool,
+    allow_current_branch_default: bool,
+):
+    tracker, workspace, harness, command, records, knowledge, manifest, repository = _runtime(
+        settings, scratch, delivery_mode, push_current_branch
     )
+    if (
+        delivery_mode is DeliveryMode.CURRENT_BRANCH_PR
+        and not repository.current_branch
+    ):
+        raise ConfigurationError(
+            "current-branch-pr delivery requires a named invoking branch"
+        )
+    if (
+        delivery_mode is DeliveryMode.CURRENT_BRANCH_PR
+        and repository.current_branch == repository.default_branch
+        and not allow_current_branch_default
+    ):
+        raise ConfigurationError(
+            "current-branch-pr delivery refuses the detected default branch; "
+            "pass --allow-current-branch-default after human approval"
+        )
     policy = PolicyGateway(
         PolicyConfig(
             allowed_roots=(settings.repository, scratch, *settings.allowed_roots),
@@ -179,7 +212,8 @@ def _ports(settings: RunSettings, scratch: Path):
             | frozenset({Path(settings.validator_argv[0]).name}),
             max_command_timeout_seconds=settings.command_timeout_seconds,
             max_seat_timeout_seconds=settings.seat_timeout_seconds,
-            allow_protected_merge=True,
+            allow_repository_mutation=True,
+            allow_protected_merge=delivery_mode is DeliveryMode.PROTECTED_DEFAULT,
         )
     )
     return (
@@ -192,10 +226,18 @@ def _ports(settings: RunSettings, scratch: Path):
             policy.knowledge(knowledge),
         ),
         manifest,
+        repository,
     )
 
 
-def _specification(settings: RunSettings):
+def _specification(
+    settings: RunSettings,
+    delivery_mode: DeliveryMode,
+    target_branch: str,
+    target_revision: str,
+    push_current_branch: bool,
+    allow_current_branch_default: bool,
+):
     def for_item(item) -> ItemExecutionSpec:
         return ItemExecutionSpec(
             item=item,
@@ -216,6 +258,11 @@ def _specification(settings: RunSettings):
             seat_timeout_seconds=settings.seat_timeout_seconds,
             command_timeout_seconds=settings.command_timeout_seconds,
             max_corrections=2,
+            delivery_mode=delivery_mode,
+            delivery_target_branch=target_branch,
+            delivery_target_revision=target_revision,
+            push_current_branch=push_current_branch,
+            allow_current_branch_default=allow_current_branch_default,
         )
 
     return for_item
@@ -226,13 +273,29 @@ def run_campaign(
     *,
     campaign_id: str | None = None,
     allow_delivery: bool,
+    delivery_mode: DeliveryMode = DeliveryMode.PROTECTED_DEFAULT,
+    push_current_branch: bool = False,
+    allow_current_branch_default: bool = False,
 ) -> dict[str, Any]:
     if not allow_delivery:
         raise ConfigurationError(
             "this workflow claims items and delivers accepted changes; pass --allow-delivery after human approval"
         )
+    if delivery_mode is DeliveryMode.PROTECTED_DEFAULT and (
+        push_current_branch or allow_current_branch_default
+    ):
+        raise ConfigurationError(
+            "--push-current-branch and --allow-current-branch-default require "
+            "--delivery-mode current-branch-pr"
+        )
     scratch = configure_scratch_environment(settings.scratch_root)
-    ports, manifest = _ports(settings, scratch)
+    ports, manifest, repository = _ports(
+        settings,
+        scratch,
+        delivery_mode,
+        push_current_branch,
+        allow_current_branch_default,
+    )
     effective_campaign_id = campaign_id or datetime.now(UTC).strftime(
         "autobuild-%Y%m%dT%H%M%SZ"
     )
@@ -243,7 +306,18 @@ def run_campaign(
         refill_enabled=settings.refill_plan is not None,
     )
     refill = settings.refill_plan or RefillPlan()
-    outcome = CampaignRunner(ports).run(campaign, _specification(settings), refill)
+    outcome = CampaignRunner(ports).run(
+        campaign,
+        _specification(
+            settings,
+            delivery_mode,
+            repository.current_branch or repository.default_branch,
+            repository.revision,
+            push_current_branch,
+            allow_current_branch_default,
+        ),
+        refill,
+    )
     return {
         "schema": "autobuild.campaign-result.v1",
         "version": __version__,

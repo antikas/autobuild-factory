@@ -59,6 +59,7 @@ class BacklogTrackerAdapter:
         backlog_path: Path | str = "BACKLOG.md",
         proposal_prefix: str = "ABP",
         remote: str = "origin",
+        push_primary: bool = True,
     ) -> None:
         self._repository = repository.resolve(strict=False)
         candidate = Path(backlog_path).expanduser()
@@ -73,6 +74,7 @@ class BacklogTrackerAdapter:
             raise AdapterError("BACKLOG.md must be inside the campaign repository") from exc
         self._proposal_prefix = proposal_prefix
         self._remote = remote
+        self._push_primary = push_primary
 
     @property
     def tracker_path(self) -> Path:
@@ -275,6 +277,8 @@ class BacklogTrackerAdapter:
         self._git(self._repository, "add", "-A", "--", relative)
         self._git(self._repository, "commit", "-m", message, "--", relative)
         revision = self._git(self._repository, "rev-parse", "HEAD")
+        if not self._push_primary:
+            return revision
         self._git(self._repository, "push", self._remote, "HEAD")
         branch = self._git(self._repository, "branch", "--show-current")
         remote_line = self._git(

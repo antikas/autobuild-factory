@@ -13,6 +13,7 @@ from autobuild.domain import (
     CampaignRef,
     CloseEvidence,
     CommandResult,
+    DeliveryMode,
     DeliveryRequest,
     FinaliseRequest,
     Proposal,
@@ -142,7 +143,10 @@ def test_pinax_claim_and_close_are_delivered_as_tracker_commits(tmp_path: Path) 
     tracker.close(evidence, item_commit, workspace, "coordinator@proof")
     tracker_commit = workspace_adapter.commit_tracker(workspace, item_id, item_commit)
     result = workspace_adapter.deliver(
-        workspace, DeliveryRequest(item_id, item_commit, tracker_commit)
+        workspace,
+        DeliveryRequest(
+            item_id, item_commit, tracker_commit, DeliveryMode.PROTECTED_DEFAULT, "main", git(repo, "rev-parse", "HEAD")
+        ),
     )
     workspace_adapter.release(workspace)
 

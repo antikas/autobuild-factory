@@ -71,6 +71,11 @@ class CampaignStopReason(str, Enum):
     STRUCTURAL_FAILURE = "structural_failure"
 
 
+class DeliveryMode(str, Enum):
+    PROTECTED_DEFAULT = "protected-default"
+    CURRENT_BRANCH_PR = "current-branch-pr"
+
+
 @dataclass(frozen=True, slots=True)
 class AdapterIdentity:
     name: str
@@ -146,6 +151,7 @@ class ClaimReceipt:
 class RepositoryIdentity:
     root: Path
     default_branch: str
+    current_branch: str
     remote: str
     revision: str
 
@@ -196,6 +202,11 @@ class ItemExecutionSpec:
     command_timeout_seconds: float = 600.0
     max_corrections: int = 2
     reviewer_tool_policy: ToolPolicy | None = None
+    delivery_mode: DeliveryMode = DeliveryMode.PROTECTED_DEFAULT
+    delivery_target_branch: str = ""
+    delivery_target_revision: str = ""
+    push_current_branch: bool = False
+    allow_current_branch_default: bool = False
 
     def __post_init__(self) -> None:
         if not self.validator_id.strip() or not self.validator_argv:
@@ -327,7 +338,19 @@ class DeliveryRequest:
     item_id: str
     item_commit: str | None
     tracker_commit: str
-    merge_to_default: bool = True
+    mode: DeliveryMode
+    target_branch: str
+    target_revision: str
+    push_current_branch: bool = False
+    allow_current_branch_default: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.item_id.strip() or not self.tracker_commit.strip():
+            raise ValueError("delivery requires an item and tracker commit")
+        if not self.target_branch.strip() or not self.target_revision.strip():
+            raise ValueError("delivery requires an explicit target branch and revision")
+        if self.mode is DeliveryMode.PROTECTED_DEFAULT and self.push_current_branch:
+            raise ValueError("current-branch push is only valid in current-branch-pr mode")
 
 
 @dataclass(frozen=True, slots=True)

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from autobuild.bootstrap.composition import run_campaign
 from autobuild.bootstrap.profile import ProfileOverrides, load_settings
-from autobuild.domain import ItemDisposition
+from autobuild.domain import DeliveryMode, ItemDisposition
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -37,6 +37,22 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--backlog")
     run.add_argument("--refill-plan")
     run.add_argument("--allow-delivery", action="store_true")
+    run.add_argument(
+        "--delivery-mode",
+        choices=tuple(mode.value for mode in DeliveryMode),
+        default=DeliveryMode.PROTECTED_DEFAULT.value,
+        help="Delivery target: protected default branch or the invoking PR branch.",
+    )
+    run.add_argument(
+        "--push-current-branch",
+        action="store_true",
+        help="Push and verify the invoking branch in current-branch-pr mode.",
+    )
+    run.add_argument(
+        "--allow-current-branch-default",
+        action="store_true",
+        help="Permit current-branch-pr mode when the invoking branch is the default branch.",
+    )
     run.add_argument("--output", type=Path)
     return parser
 
@@ -68,6 +84,9 @@ def main(argv: list[str] | None = None) -> int:
             settings,
             campaign_id=args.campaign_id,
             allow_delivery=args.allow_delivery,
+            delivery_mode=DeliveryMode(args.delivery_mode),
+            push_current_branch=args.push_current_branch,
+            allow_current_branch_default=args.allow_current_branch_default,
         )
     except Exception as exc:
         print(f"AutoBuild failed before completion: {exc}", file=sys.stderr)

@@ -11,6 +11,7 @@ from autobuild.domain import (
     CloseEvidence,
     CommandRequest,
     CommandResult,
+    DeliveryMode,
     DeliveryRequest,
     DiffEvidence,
     EvidenceError,
@@ -35,11 +36,17 @@ def identity(name: str) -> AdapterIdentity:
     return AdapterIdentity(name, "1", frozenset({"test"}))
 
 
-def policy(root: Path, *, allow_protected_merge: bool = False) -> PolicyConfig:
+def policy(
+    root: Path,
+    *,
+    allow_repository_mutation: bool = False,
+    allow_protected_merge: bool = False,
+) -> PolicyConfig:
     return PolicyConfig(
         allowed_roots=(root,),
         approved_validators=(ApprovedValidator("tests", ("python", "-m", "pytest")),),
         allowed_tools=frozenset({"python"}),
+        allow_repository_mutation=allow_repository_mutation,
         allow_protected_merge=allow_protected_merge,
     )
 
@@ -207,21 +214,61 @@ def test_tracker_rejects_incomplete_close_record(tmp_path: Path) -> None:
 def test_workspace_rejects_protected_delivery_without_human_gate(tmp_path: Path) -> None:
     workspace, _ = close_evidence(tmp_path)
     fake = FakeWorkspaceAdapter(identity("workspace"), workspace=workspace)
-    port = PolicyGateway(policy(tmp_path)).workspace(fake)
+    port = PolicyGateway(
+        policy(tmp_path, allow_repository_mutation=True)
+    ).workspace(fake)
 
     with pytest.raises(PolicyViolation, match="protected-branch delivery"):
-        port.deliver(workspace, DeliveryRequest("item", "item-commit", "tracker-commit"))
+        port.deliver(
+            workspace,
+            DeliveryRequest(
+                "item", "item-commit", "tracker-commit", DeliveryMode.PROTECTED_DEFAULT, "main", "base"
+            ),
+        )
+
+
+def test_workspace_accepts_current_branch_delivery_with_local_mutation_gate(tmp_path: Path) -> None:
+    workspace, _ = close_evidence(tmp_path)
+    fake = FakeWorkspaceAdapter(identity("workspace"), workspace=workspace)
+    port = PolicyGateway(
+        policy(tmp_path, allow_repository_mutation=True)
+    ).workspace(fake)
+
+    result = port.deliver(
+        workspace,
+        DeliveryRequest(
+            "item",
+            "item-commit",
+            "tracker-commit",
+            DeliveryMode.CURRENT_BRANCH_PR,
+            "feature/local-pr",
+            "base",
+        ),
+    )
+
+    assert result.pushed is True
 
 
 def test_valid_close_and_explicitly_gated_delivery_reach_adapters(tmp_path: Path) -> None:
     workspace, evidence = close_evidence(tmp_path)
     tracker_fake = FakeTrackerAdapter(identity("tracker"))
     workspace_fake = FakeWorkspaceAdapter(identity("workspace"), workspace=workspace)
-    gateway = PolicyGateway(policy(tmp_path, allow_protected_merge=True))
+    gateway = PolicyGateway(
+        PolicyConfig(
+            allowed_roots=(tmp_path,),
+            approved_validators=(ApprovedValidator("tests", ("python", "-m", "pytest")),),
+            allowed_tools=frozenset({"python"}),
+            allow_repository_mutation=True,
+            allow_protected_merge=True,
+        )
+    )
 
     gateway.tracker(tracker_fake).close(evidence, "item-commit", workspace, "coordinator")
     result = gateway.workspace(workspace_fake).deliver(
-        workspace, DeliveryRequest("item", "item-commit", "tracker-commit")
+        workspace,
+        DeliveryRequest(
+            "item", "item-commit", "tracker-commit", DeliveryMode.PROTECTED_DEFAULT, "main", "base"
+        ),
     )
 
     assert tracker_fake.closed == [evidence]
