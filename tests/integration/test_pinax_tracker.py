@@ -162,6 +162,16 @@ def test_pinax_claim_and_close_are_delivered_as_tracker_commits(tmp_path: Path) 
     assert git(repo, "rev-parse", "HEAD") == git(repo, "ls-remote", "origin", "refs/heads/main").split()[0]
 
 
+def test_pinax_ready_items_lists_ready_work_with_briefs(tmp_path: Path) -> None:
+    repo, item_id = pinax_repo(tmp_path)
+    tracker = PinaxTrackerAdapter(repo)
+
+    items = tracker.ready_items(CampaignRef("campaign", repo))
+
+    assert [item.item_id for item in items] == [item_id]
+    assert items[0].brief_ref == "docs/brief.md"
+
+
 def test_pinax_refuses_a_claim_before_mutating_a_dirty_primary_checkout(
     tmp_path: Path,
 ) -> None:
@@ -202,3 +212,20 @@ def test_pinax_rejects_machine_specific_proposal_references(brief_ref: str) -> N
         PinaxTrackerAdapter.validate_proposal(
             Proposal("Candidate", "What should be built?", "Queue is dry", brief_ref)
         )
+
+
+def test_pinax_resumable_claims_lists_builder_claimed_and_not_terminal(tmp_path: Path) -> None:
+    repo, item_id = pinax_repo(tmp_path)
+    campaign = CampaignRef("campaign", repo)
+    tracker = PinaxTrackerAdapter(repo)
+
+    # Nothing is claimed yet.
+    assert tracker.resumable_claims(campaign) == ()
+
+    item = tracker.next_item(campaign)
+    assert item is not None
+    tracker.claim(item, "builder@lane-one")
+
+    claims = tracker.resumable_claims(campaign)
+    assert [claim.item_id for claim in claims] == [item_id]
+    assert claims[0].brief_ref == "docs/brief.md"

@@ -2,8 +2,14 @@
 
 from autobuild.ports.contracts import (
     CommandPort,
+    EnvironmentProbePort,
+    FilesystemProbePort,
     HarnessPort,
     KnowledgePort,
+    LaneStatePort,
+    LeasePort,
+    NetworkProbePort,
+    ProgressPort,
     RunRecordPort,
     TrackerPort,
     WorkspacePort,
@@ -11,8 +17,14 @@ from autobuild.ports.contracts import (
 
 __all__ = [
     "CommandPort",
+    "EnvironmentProbePort",
+    "FilesystemProbePort",
     "HarnessPort",
     "KnowledgePort",
+    "LaneStatePort",
+    "LeasePort",
+    "NetworkProbePort",
+    "ProgressPort",
     "RunRecordPort",
     "TrackerPort",
     "WorkspacePort",

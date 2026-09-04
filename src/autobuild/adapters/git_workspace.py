@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import subprocess
 import time
@@ -15,6 +16,7 @@ from autobuild.domain import (
     AdapterError,
     AdapterIdentity,
     CampaignRef,
+    CampaignReport,
     ChangedPath,
     ChangeKind,
     DeliveryMode,
@@ -25,8 +27,11 @@ from autobuild.domain import (
     FinaliseResult,
     ProbeResult,
     RepositoryIdentity,
+    SnapshotFile,
     WorkItem,
     WorkspaceRef,
+    WorktreeSnapshot,
+    WorktreeStatus,
 )
 
 
@@ -102,19 +107,64 @@ class GitWorkspaceAdapter:
             self._leases[lease_id] = _Lease(repository, workspace)
         return workspace
 
+    def list_worktrees(self, campaign: CampaignRef) -> tuple[WorktreeStatus, ...]:
+        repository = self.identify(campaign.repository)
+        listing = self._git(repository.root, "worktree", "list", "--porcelain")
+        statuses: list[WorktreeStatus] = []
+        for block in listing.split("\n\n"):
+            root = head = branch = ""
+            for line in block.splitlines():
+                if line.startswith("worktree "):
+                    root = line.removeprefix("worktree ").strip()
+                elif line.startswith("HEAD "):
+                    head = line.removeprefix("HEAD ").strip()
+                elif line.startswith("branch "):
+                    branch = line.removeprefix("branch ").removeprefix("refs/heads/").strip()
+            if not root or not head:
+                continue
+            path = Path(root).resolve(strict=False)
+            if not self._under_scratch(path) or not path.exists():
+                continue
+            changed = self._changed_against(path, head)
+            statuses.append(
+                WorktreeStatus(path, branch, head, self._revision_digest(head, changed))
+            )
+        return tuple(statuses)
+
+    def adopt_worktree(
+        self, campaign: CampaignRef, item: WorkItem, root: Path
+    ) -> WorkspaceRef:
+        repository = self.identify(campaign.repository)
+        resolved = root.resolve(strict=False)
+        self._require_scratch_path(resolved)
+        if not resolved.exists():
+            raise EvidenceError(f"worktree to adopt does not exist: {resolved}")
+        if not self._worktree_registered(repository.root, resolved):
+            raise EvidenceError(f"worktree to adopt is not registered: {resolved}")
+        head = self._git(resolved, "rev-parse", "HEAD")
+        branch = self._git(resolved, "branch", "--show-current")
+        lease_id = uuid4().hex
+        workspace = WorkspaceRef(resolved, branch, head, lease_id)
+        with self._lock:
+            self._leases[lease_id] = _Lease(repository, workspace)
+        return workspace
+
+    def resume_delivery_commits(self, workspace: WorkspaceRef) -> tuple[str | None, str]:
+        self._require_lease(workspace)
+        tracker_commit = self._git(workspace.root, "rev-parse", "HEAD")
+        parent = self._git(workspace.root, "rev-parse", "--verify", "--quiet", "HEAD^", check=False)
+        return (parent.strip() or None, tracker_commit)
+
     def diff(self, workspace: WorkspaceRef) -> DiffEvidence:
         self._require_lease(workspace)
         head = self._git(workspace.root, "rev-parse", "HEAD")
         if head != workspace.start_commit:
-            raise EvidenceError("workspace history changed outside the finalisation boundary")
+            raise EvidenceError(
+                "worktree head moved outside the finalisation boundary: "
+                f"recorded {workspace.start_commit}, observed {head}"
+            )
         changed = self._changed_paths(workspace)
-        digest = hashlib.sha256()
-        digest.update(head.encode())
-        for entry in changed:
-            digest.update(entry.path.as_posix().encode())
-            digest.update(entry.kind.value.encode())
-            digest.update((entry.digest or "").encode())
-        workspace_revision = digest.hexdigest()
+        workspace_revision = self._revision_digest(head, changed)
         evidence_root = self._scratch_root / "evidence" / workspace.lease_id
         evidence_root.mkdir(parents=True, exist_ok=True)
         patch_path = evidence_root / "changes.patch"
@@ -136,12 +186,44 @@ class GitWorkspaceAdapter:
             tracked_patch + ("\n" if tracked_patch and untracked else "") + "\n".join(untracked),
             encoding="utf-8",
         )
-        return DiffEvidence(workspace, workspace_revision, changed, str(patch_path))
+        return DiffEvidence(workspace, workspace_revision, changed, str(patch_path), head)
+
+    def progress_digest(self, workspace: WorkspaceRef) -> str:
+        """A cheap digest of the worktree's product state for stall detection.
+
+        It combines ``git status --porcelain --untracked-files=all`` with the
+        size and modification time of every changed product path, so a builder
+        that is writing files keeps advancing the digest even between commits.
+        The command adapter calls this between samples; git is never run there."""
+
+        self._require_lease(workspace)
+        status = self._git(
+            workspace.root, "status", "--porcelain", "--untracked-files=all"
+        )
+        digest = hashlib.sha256()
+        for line in status.splitlines():
+            path = line[3:]
+            if not self._is_product_path(path):
+                continue
+            digest.update(line.encode("utf-8", "replace"))
+            try:
+                stat = (workspace.root / path).stat()
+                digest.update(f":{stat.st_size}:{stat.st_mtime_ns}".encode())
+            except OSError:
+                digest.update(b":absent")
+            digest.update(b"\n")
+        return digest.hexdigest()
 
     def commit_item(self, workspace: WorkspaceRef, request: FinaliseRequest) -> str:
         self._require_lease(workspace)
-        current = self.diff(workspace)
         expected = request.evidence.diff
+        observed_head = self._git(workspace.root, "rev-parse", "HEAD")
+        if observed_head != expected.head_commit:
+            raise EvidenceError(
+                "worktree head moved after review: "
+                f"recorded {expected.head_commit}, observed {observed_head}"
+            )
+        current = self.diff(workspace)
         if current.workspace_revision != expected.workspace_revision or current.changed_paths != expected.changed_paths:
             raise EvidenceError("workspace changed after validation and review")
         if not current.changed_paths:
@@ -150,10 +232,50 @@ class GitWorkspaceAdapter:
         self._git(workspace.root, "add", "-A", "--", *paths)
         self._git(workspace.root, "commit", "-m", request.commit_message, "--", *paths)
         item_commit = self._git(workspace.root, "rev-parse", "HEAD")
-        remaining = self._product_status(workspace.root)
-        if remaining:
-            raise EvidenceError(f"uncommitted product paths remain after scoped commit: {remaining}")
+        self._require_full_commit(workspace.root, paths)
         return item_commit
+
+    def confirm_delivery(
+        self, workspace: WorkspaceRef, result: FinaliseResult, target_branch: str
+    ) -> None:
+        lease = self._require_lease(workspace)
+        primary = lease.repository.root
+        for label, commit in (
+            ("item", result.item_commit),
+            ("tracker", result.tracker_commit),
+            ("merged", result.merged_commit),
+        ):
+            if commit is None:
+                continue
+            present = self._git(
+                primary, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", check=False
+            )
+            if not present.strip():
+                raise EvidenceError(
+                    f"reported {label} commit is absent from the repository: {commit}"
+                )
+        if result.merged_commit and target_branch.strip():
+            ancestry = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(primary),
+                    "merge-base",
+                    "--is-ancestor",
+                    result.merged_commit,
+                    target_branch,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if ancestry.returncode != 0:
+                raise EvidenceError(
+                    "merged commit is not reachable from the delivery target branch: "
+                    f"merged {result.merged_commit}, branch {target_branch}"
+                )
 
     def commit_tracker(
         self, workspace: WorkspaceRef, item_id: str, item_commit: str | None
@@ -185,6 +307,48 @@ class GitWorkspaceAdapter:
             *self._tracker_paths,
         )
         return self._git(workspace.root, "rev-parse", "HEAD")
+
+    def snapshot(self, workspace: WorkspaceRef) -> WorktreeSnapshot:
+        self._require_lease(workspace)
+        changed = self._changed_paths(workspace)
+        untracked = {
+            path
+            for path in filter(
+                None,
+                self._git(
+                    workspace.root, "ls-files", "--others", "--exclude-standard", "-z"
+                ).split("\0"),
+            )
+            if self._is_product_path(path)
+        }
+        tracked_specs = [
+            entry.path.as_posix()
+            for entry in changed
+            if entry.path.as_posix() not in untracked
+        ]
+        patch = b""
+        if tracked_specs:
+            patch = self._git_bytes(
+                workspace.root,
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                workspace.start_commit,
+                "--",
+                *tracked_specs,
+            )
+        files: list[SnapshotFile] = []
+        for entry in changed:
+            posix = entry.path.as_posix()
+            if posix not in untracked:
+                continue
+            absolute = workspace.root / entry.path
+            if absolute.is_symlink():
+                content = str(absolute.readlink()).encode("utf-8")
+            else:
+                content = absolute.read_bytes()
+            files.append(SnapshotFile(posix, content, entry.digest or ""))
+        return WorktreeSnapshot(workspace.start_commit, patch, tuple(files), changed)
 
     def deliver(self, workspace: WorkspaceRef, request: DeliveryRequest) -> FinaliseResult:
         lease = self._require_lease(workspace)
@@ -289,14 +453,112 @@ class GitWorkspaceAdapter:
             (f"remote {repository.remote}/{request.target_branch} verified",),
         )
 
+    def deliver_report(self, request: CampaignReport) -> FinaliseResult:
+        repository = self.identify(request.repository)
+        primary = repository.root
+        relative = Path(request.relative_path).as_posix().strip("/")
+        if not relative or relative.startswith("../") or Path(relative).is_absolute():
+            raise EvidenceError("campaign report path must be repository-relative")
+        if request.mode is DeliveryMode.CURRENT_BRANCH_PR:
+            branch = request.target_branch
+            if (
+                branch == repository.default_branch
+                and not request.allow_current_branch_default
+            ):
+                raise AdapterError(
+                    "current-branch-pr report refuses the detected default branch"
+                )
+        elif request.mode is DeliveryMode.PROTECTED_DEFAULT:
+            branch = repository.default_branch
+        else:
+            raise EvidenceError(f"unsupported delivery mode: {request.mode}")
+        self._require_clean_primary(primary, "before report")
+        if self._git(primary, "branch", "--show-current") != branch:
+            self._git(primary, "checkout", branch)
+        target = primary / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(request.content, encoding="utf-8")
+        self._git(primary, "add", "-A", "--", relative)
+        self._git(
+            primary,
+            "commit",
+            "-m",
+            f"ADDED: campaign {request.campaign_id} report",
+            "--",
+            relative,
+        )
+        report_commit = self._git(primary, "rev-parse", "HEAD")
+        self._require_clean_primary(primary, "after report")
+        pushed = request.mode is DeliveryMode.PROTECTED_DEFAULT or request.push_current_branch
+        if not pushed:
+            return FinaliseResult(
+                None,
+                report_commit,
+                report_commit,
+                False,
+                (f"report committed locally on {branch}", str(target)),
+            )
+        self._git(primary, "push", repository.remote, branch)
+        remote_line = self._git(
+            primary, "ls-remote", repository.remote, f"refs/heads/{branch}"
+        )
+        remote_revision = remote_line.split()[0] if remote_line.split() else ""
+        if remote_revision != report_commit:
+            raise AdapterError("remote verification did not observe the delivered report")
+        return FinaliseResult(
+            None,
+            report_commit,
+            report_commit,
+            True,
+            (f"remote {repository.remote}/{branch} verified", str(target)),
+        )
+
     def release(self, workspace: WorkspaceRef) -> None:
         with self._lock:
-            lease = self._leases.pop(workspace.lease_id, None)
+            lease = self._leases.get(workspace.lease_id)
         if lease is None:
             return
         self._require_scratch_path(workspace.root)
         if workspace.root.exists():
-            self._git(lease.repository.root, "worktree", "remove", "--force", str(workspace.root))
+            tracker_status = self._git(
+                workspace.root,
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                *self._tracker_paths,
+            )
+            if tracker_status.strip():
+                raise EvidenceError(
+                    "refusing to remove a worktree with uncommitted tracker files: "
+                    + ", ".join(sorted(line[3:] for line in tracker_status.splitlines() if line[3:]))
+                )
+        with self._lock:
+            self._leases.pop(workspace.lease_id, None)
+        if workspace.root.exists():
+            try:
+                self._git(
+                    lease.repository.root,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(workspace.root),
+                )
+            except AdapterError:
+                if self._worktree_registered(lease.repository.root, workspace.root):
+                    with self._lock:
+                        self._leases.setdefault(workspace.lease_id, lease)
+                    raise
+
+    def _worktree_registered(self, repository: Path, workspace: Path) -> bool:
+        target = os.path.normcase(str(workspace.resolve(strict=False)))
+        listing = self._git(repository, "worktree", "list", "--porcelain")
+        return any(
+            os.path.normcase(str(Path(line.removeprefix("worktree ")).resolve(strict=False)))
+            == target
+            for line in listing.splitlines()
+            if line.startswith("worktree ")
+        )
 
     def _require_lease(self, workspace: WorkspaceRef) -> _Lease:
         with self._lock:
@@ -307,19 +569,25 @@ class GitWorkspaceAdapter:
         return lease
 
     def _require_scratch_path(self, path: Path) -> None:
-        resolved = path.resolve(strict=False)
-        if resolved == self._scratch_root or self._scratch_root not in resolved.parents:
+        if not self._under_scratch(path):
             raise AdapterError(f"worktree path is outside configured scratch space: {path}")
 
+    def _under_scratch(self, path: Path) -> bool:
+        resolved = path.resolve(strict=False)
+        return resolved != self._scratch_root and self._scratch_root in resolved.parents
+
     def _changed_paths(self, workspace: WorkspaceRef) -> tuple[ChangedPath, ...]:
+        return self._changed_against(workspace.root, workspace.start_commit)
+
+    def _changed_against(self, root: Path, base: str) -> tuple[ChangedPath, ...]:
         entries: dict[str, ChangeKind] = {}
         raw = self._git(
-            workspace.root,
+            root,
             "diff",
             "--name-status",
             "-z",
             "--no-renames",
-            workspace.start_commit,
+            base,
             "--",
         )
         fields = raw.split("\0")
@@ -339,20 +607,28 @@ class GitWorkspaceAdapter:
                 else:
                     kind = ChangeKind.MODIFIED
                 entries[path] = kind
-        untracked = self._git(
-            workspace.root, "ls-files", "--others", "--exclude-standard", "-z"
-        )
+        untracked = self._git(root, "ls-files", "--others", "--exclude-standard", "-z")
         for path in filter(None, untracked.split("\0")):
             if self._is_product_path(path):
                 entries[path] = ChangeKind.ADDED
         changed: list[ChangedPath] = []
         for value, kind in sorted(entries.items()):
-            path = workspace.root / value
+            path = root / value
             if kind is not ChangeKind.DELETED and path.is_symlink():
                 kind = ChangeKind.SYMLINK
             digest = None if kind is ChangeKind.DELETED else self._digest(path)
             changed.append(ChangedPath(Path(value), kind, digest))
         return tuple(changed)
+
+    @staticmethod
+    def _revision_digest(head: str, changed: tuple[ChangedPath, ...]) -> str:
+        digest = hashlib.sha256()
+        digest.update(head.encode())
+        for entry in changed:
+            digest.update(entry.path.as_posix().encode())
+            digest.update(entry.kind.value.encode())
+            digest.update((entry.digest or "").encode())
+        return digest.hexdigest()
 
     def _is_product_path(self, path: str) -> bool:
         normal = path.replace("\\", "/")
@@ -370,9 +646,22 @@ class GitWorkspaceAdapter:
             digest.update(path.read_bytes())
         return digest.hexdigest()
 
-    def _product_status(self, root: Path) -> str:
-        lines = self._git(root, "status", "--porcelain", "--untracked-files=all").splitlines()
+    def _product_status(self, root: Path, paths: tuple[str, ...] | list[str] = ()) -> str:
+        args = ["status", "--porcelain", "--untracked-files=all"]
+        if paths:
+            args += ["--", *paths]
+        lines = self._git(root, *args).splitlines()
         return "\n".join(line for line in lines if self._is_product_path(line[3:]))
+
+    def _require_full_commit(self, root: Path, paths: list[str]) -> None:
+        """The named close-completeness contract: after the scoped commit the whole
+        product tree and the item's own changed paths must both report a clean
+        status, so a close can never ship a partial tree."""
+        remaining = self._product_status(root) or self._product_status(root, paths)
+        if remaining:
+            raise EvidenceError(
+                f"uncommitted product paths remain after scoped commit: {remaining}"
+            )
 
     def _require_clean_primary(self, primary: Path, timing: str) -> None:
         if self._git(primary, "status", "--porcelain", "--untracked-files=all"):
@@ -417,3 +706,15 @@ class GitWorkspaceAdapter:
         if check and completed.returncode != 0:
             raise AdapterError(f"git {' '.join(args)} failed: {detail}")
         return completed.stdout.rstrip("\r\n")
+
+    @staticmethod
+    def _git_bytes(root: Path, *args: str) -> bytes:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", "replace").strip()
+            raise AdapterError(f"git {' '.join(args)} failed: {detail}")
+        return completed.stdout

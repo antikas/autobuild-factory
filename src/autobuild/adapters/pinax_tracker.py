@@ -83,6 +83,117 @@ class PinaxTrackerAdapter:
             (caption or f"Measurable acceptance is defined by {brief_ref}",),
         )
 
+    def ready_items(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
+        root = campaign.repository.resolve(strict=False)
+        if root != self._repository:
+            raise AdapterError("campaign repository does not match the bound Pinax repository")
+        completed = self._run(
+            root, "ready", "--actor", "coordinator@autobuild", "--json", check=False
+        )
+        if completed.returncode != 0:
+            combined = f"{completed.stdout}\n{completed.stderr}".casefold()
+            if "no ready" in combined or ("queue" in combined and "empty" in combined):
+                return ()
+            raise AdapterError(
+                completed.stderr.strip() or completed.stdout.strip() or "pinax ready failed"
+            )
+        if not completed.stdout.strip():
+            return ()
+        payload = json.loads(completed.stdout)
+        rows = payload.get("items", payload) if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            raise AdapterError("pinax ready returned an unexpected JSON shape")
+        titles = self._titles(root)
+        items: list[WorkItem] = []
+        for row in rows:
+            if isinstance(row, dict):
+                item_id = str(row.get("item_id") or "")
+                title = str(row.get("title") or titles.get(item_id, "") or item_id)
+            elif isinstance(row, str):
+                item_id = row
+                title = titles.get(item_id, "") or item_id
+            else:
+                continue
+            if not item_id:
+                continue
+            brief_ref, caption = self._brief_note(root, item_id)
+            items.append(
+                WorkItem(
+                    item_id,
+                    title,
+                    brief_ref,
+                    (caption or f"Measurable acceptance is defined by {brief_ref}",),
+                )
+            )
+        return tuple(items)
+
+    @staticmethod
+    def _titles(root: Path) -> dict[str, str]:
+        titles: dict[str, str] = {}
+        for log in (root / ".ergon" / "log").glob("*.jsonl"):
+            for line in log.read_text(encoding="utf-8").splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "item.created":
+                    continue
+                payload = event.get("payload", {})
+                item_id = str(payload.get("item_id", ""))
+                title = str(payload.get("title", ""))
+                if item_id and title:
+                    titles[item_id] = title
+        return titles
+
+    def resumable_claims(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
+        root = campaign.repository.resolve(strict=False)
+        if root != self._repository:
+            raise AdapterError("campaign repository does not match the bound Pinax repository")
+        items_dir = root / ".ergon" / "items"
+        if not items_dir.is_dir():
+            return ()
+        terminal = {"done", "shipped", "parked", "cancelled", "blocked"}
+        result: list[WorkItem] = []
+        for path in sorted(items_dir.glob("*.md")):
+            front = self._frontmatter(path)
+            item_id = front.get("id", "").strip()
+            owner = front.get("owner", "").strip()
+            status = front.get("status", "").strip().casefold()
+            if not item_id or not owner.casefold().startswith("builder"):
+                continue
+            if status in terminal:
+                continue
+            try:
+                brief_ref, caption = self._brief_note(root, item_id)
+            except EvidenceError:
+                continue
+            result.append(
+                WorkItem(
+                    item_id,
+                    front.get("title", "").strip() or item_id,
+                    brief_ref,
+                    (caption or f"Measurable acceptance is defined by {brief_ref}",),
+                )
+            )
+        return tuple(result)
+
+    @staticmethod
+    def _frontmatter(path: Path) -> dict[str, str]:
+        front: dict[str, str] = {}
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return front
+        if not lines or lines[0].strip() != "---":
+            return front
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            key, sep, value = line.partition(":")
+            if sep:
+                front[key.strip()] = value.strip()
+        return front
+
     def claim(self, item: WorkItem, actor: str) -> ClaimReceipt:
         if self._git(
             self._repository, "status", "--porcelain", "--untracked-files=all"

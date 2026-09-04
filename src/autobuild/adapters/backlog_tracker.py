@@ -111,6 +111,50 @@ class BacklogTrackerAdapter:
                 )
         return None
 
+    def ready_items(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
+        root = campaign.repository.resolve(strict=False)
+        if root != self._repository:
+            raise AdapterError("campaign repository does not match the bound BACKLOG repository")
+        return tuple(
+            WorkItem(
+                row.item_id,
+                row.title,
+                row.brief_ref,
+                (f"Measurable acceptance is defined by {row.brief_ref}",),
+            )
+            for row in self._read(root).rows
+            if self._status_kind(row.status) == "ready"
+        )
+
+    def resumable_claims(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
+        root = campaign.repository.resolve(strict=False)
+        if root != self._repository:
+            raise AdapterError("campaign repository does not match the bound BACKLOG repository")
+        items: list[WorkItem] = []
+        for row in self._read(root).rows:
+            if self._status_kind(row.status) != "claimed":
+                continue
+            actor = self._claim_actor(row.status)
+            if not actor.casefold().startswith("builder"):
+                continue
+            items.append(
+                WorkItem(
+                    row.item_id,
+                    row.title,
+                    row.brief_ref,
+                    (f"Measurable acceptance is defined by {row.brief_ref}",),
+                )
+            )
+        return tuple(items)
+
+    @staticmethod
+    def _claim_actor(status: str) -> str:
+        normal = status.replace("*", "").strip()
+        prefix = "claimed by "
+        if normal.casefold().startswith(prefix):
+            return normal[len(prefix) :].strip()
+        return ""
+
     def claim(self, item: WorkItem, actor: str) -> ClaimReceipt:
         if self._git(
             self._repository, "status", "--porcelain", "--untracked-files=all"

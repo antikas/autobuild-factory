@@ -6,13 +6,16 @@ import shutil
 from pathlib import Path
 from uuid import uuid4
 
-from autobuild.adapters.harness_cli import CliHarnessAdapter
-from autobuild.domain import SeatRequest
+from autobuild.adapters.harness_cli import CliHarnessAdapter, _safe_name
+from autobuild.domain import LaneSignal, SeatRequest, SeatResult
 from autobuild.ports import CommandPort
 
 
 class CopilotCliHarnessAdapter(CliHarnessAdapter):
     adapter_name = "github-copilot"
+    # Source: the cross-tool Console Do Not Track standard. The Copilot CLI already
+    # runs with remote export and custom instructions disabled by argv.
+    telemetry_environment = (("DO_NOT_TRACK", "1"),)
 
     def __init__(
         self,
@@ -24,6 +27,16 @@ class CopilotCliHarnessAdapter(CliHarnessAdapter):
     ) -> None:
         super().__init__(command_port, output_root, command, model_map)
         self._auth_command = auth_command
+
+    # The Copilot CLI `--output-format=json` stream emits an
+    # ``{"type": "error", ...}`` object on failure carrying a ``code``/``type``
+    # (or a nested ``error`` object) with the GitHub Models limit codes
+    # (``rate_limited``, ``quota_exceeded``, ``unauthorized``). A limit named only
+    # in an assistant message body is prose and is not scanned.
+    def classify_failure(self, result: SeatResult) -> LaneSignal | None:
+        """Read a lane signal from the Copilot CLI's structured error object only."""
+
+        return self._structural_lane_signal(result)
 
     def _version_argv(self) -> tuple[str, ...]:
         return (*self._command, "version")
@@ -83,13 +96,18 @@ class CopilotCliHarnessAdapter(CliHarnessAdapter):
         )
         log_root = self._output_root / "logs"
         log_root.mkdir(parents=True, exist_ok=True)
+        prompts = self._output_root / "prompts"
+        prompts.mkdir(parents=True, exist_ok=True)
+        prompt = prompts / f"{_safe_name(run_ref)}.md"
+        prompt.write_text(request.instructions, encoding="utf-8")
         available = ",".join(available_tools)
         allowed = ",".join(allowed_tools)
         argv = (
             *self._command,
             "-C",
             str(request.workspace.root),
-            f"--prompt={request.instructions}",
+            "--prompt",
+            "-",
             f"--model={self._model(request.model_class)}",
             "--session-id",
             str(uuid4()),
@@ -109,4 +127,4 @@ class CopilotCliHarnessAdapter(CliHarnessAdapter):
             "--output-format=json",
             f"--log-dir={log_root}",
         )
-        return argv, None
+        return argv, None, str(prompt)

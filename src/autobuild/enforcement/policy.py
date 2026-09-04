@@ -12,6 +12,7 @@ from pathlib import Path
 
 from autobuild.domain import (
     CampaignRef,
+    CampaignReport,
     CloseEvidence,
     CommandRequest,
     DeliveryMode,
@@ -21,16 +22,20 @@ from autobuild.domain import (
     PolicyViolation,
     Proposal,
     ReviewDecision,
+    ReviewVerdict,
     Seat,
     RunEvent,
     RunRecordRef,
     SeatRequest,
     WorkspaceRef,
+    review_verdict_rule_error,
 )
+from autobuild.domain import LeaseGrant, LeaseRequest, LeaseSurface
 from autobuild.ports import (
     CommandPort,
     HarnessPort,
     KnowledgePort,
+    LeasePort,
     RunRecordPort,
     TrackerPort,
     WorkspacePort,
@@ -147,6 +152,8 @@ class EnforcedCommandPort:
             raise PolicyViolation("command does not identify one approved validator")
         if request.argv != matches[0].argv:
             raise PolicyViolation("validator argv differs from the approved item")
+        if request.stdin_ref is not None:
+            raise PolicyViolation("validator stdin differs from the approved item")
         executable = Path(request.argv[0]).name.casefold()
         allowed = {Path(tool).name.casefold() for tool in self._config.allowed_tools}
         if executable not in allowed:
@@ -198,13 +205,21 @@ class EnforcedHarnessPort:
             raise PolicyViolation("publication access has no human gate")
         if request.tool_policy.allow_protected_merge and not self._config.allow_protected_merge:
             raise PolicyViolation("protected merge access has no human gate")
-        return self._port.invoke(request)
+        result = self._port.invoke(request)
+        if isinstance(result.payload, ReviewVerdict):
+            rule_error = review_verdict_rule_error(result.payload)
+            if rule_error is not None:
+                raise EvidenceError(rule_error)
+        return result
 
     def cancel(self, run_ref: str) -> None:
         self._port.cancel(run_ref)
 
     def collect_usage(self, run_ref: str):
         return self._port.collect_usage(run_ref)
+
+    def classify_failure(self, result):
+        return self._port.classify_failure(result)
 
 
 class EnforcedWorkspacePort:
@@ -227,12 +242,34 @@ class EnforcedWorkspacePort:
         _require_workspace(workspace, self._config)
         return workspace
 
+    def list_worktrees(self, campaign: CampaignRef):
+        _require_path(campaign.repository, self._config, "campaign repository")
+        statuses = self._port.list_worktrees(campaign)
+        for status in statuses:
+            _require_path(status.root, self._config, "resumable worktree")
+        return statuses
+
+    def adopt_worktree(self, campaign: CampaignRef, item, root: Path):
+        _require_path(campaign.repository, self._config, "campaign repository")
+        _require_path(root, self._config, "resumable worktree")
+        workspace = self._port.adopt_worktree(campaign, item, root)
+        _require_workspace(workspace, self._config)
+        return workspace
+
+    def resume_delivery_commits(self, workspace: WorkspaceRef):
+        _require_workspace(workspace, self._config)
+        return self._port.resume_delivery_commits(workspace)
+
     def diff(self, workspace: WorkspaceRef):
         _require_workspace(workspace, self._config)
         result = self._port.diff(workspace)
         if result.workspace != workspace:
             raise EvidenceError("diff adapter returned a different workspace")
         return result
+
+    def progress_digest(self, workspace: WorkspaceRef) -> str:
+        _require_workspace(workspace, self._config)
+        return self._port.progress_digest(workspace)
 
     def commit_item(self, workspace: WorkspaceRef, request: FinaliseRequest) -> str:
         _require_workspace(workspace, self._config)
@@ -253,6 +290,10 @@ class EnforcedWorkspacePort:
             raise EvidenceError("item commit reference is empty")
         return self._port.commit_tracker(workspace, item_id, item_commit)
 
+    def snapshot(self, workspace: WorkspaceRef):
+        _require_workspace(workspace, self._config)
+        return self._port.snapshot(workspace)
+
     def deliver(self, workspace: WorkspaceRef, request: DeliveryRequest):
         _require_workspace(workspace, self._config)
         if not self._config.allow_repository_mutation:
@@ -265,6 +306,23 @@ class EnforcedWorkspacePort:
         if not request.tracker_commit.strip():
             raise EvidenceError("delivery requires a tracker commit")
         return self._port.deliver(workspace, request)
+
+    def confirm_delivery(self, workspace: WorkspaceRef, result, target_branch: str) -> None:
+        _require_workspace(workspace, self._config)
+        self._port.confirm_delivery(workspace, result, target_branch)
+
+    def deliver_report(self, request: CampaignReport):
+        _require_path(request.repository, self._config, "campaign repository")
+        if not self._config.allow_repository_mutation:
+            raise PolicyViolation("report delivery has no human gate")
+        if (
+            request.mode is DeliveryMode.PROTECTED_DEFAULT
+            and not self._config.allow_protected_merge
+        ):
+            raise PolicyViolation("protected-branch report delivery has no human gate")
+        if not request.relative_path.strip() or not request.campaign_id.strip():
+            raise EvidenceError("report delivery requires a campaign id and path")
+        return self._port.deliver_report(request)
 
     def release(self, workspace: WorkspaceRef) -> None:
         _require_workspace(workspace, self._config)
@@ -282,6 +340,14 @@ class EnforcedTrackerPort:
     def next_item(self, campaign: CampaignRef):
         _require_path(campaign.repository, self._config, "campaign repository")
         return self._port.next_item(campaign)
+
+    def ready_items(self, campaign: CampaignRef):
+        _require_path(campaign.repository, self._config, "campaign repository")
+        return self._port.ready_items(campaign)
+
+    def resumable_claims(self, campaign: CampaignRef):
+        _require_path(campaign.repository, self._config, "campaign repository")
+        return self._port.resumable_claims(campaign)
 
     def claim(self, item, actor: str):
         if not actor.strip():
@@ -349,6 +415,17 @@ class EnforcedRunRecordPort:
             raise EvidenceError("evidence name must not be empty")
         return self._port.write_evidence(record, name, content)
 
+    def write_evidence_file(self, record: RunRecordRef, relative_path: str, content: bytes):
+        _require_path(record.root, self._config, "run record")
+        if not relative_path.strip():
+            raise EvidenceError("evidence path must not be empty")
+        return self._port.write_evidence_file(record, relative_path, content)
+
+    def latest_phase_marker(self, item_id: str):
+        if not item_id.strip():
+            raise EvidenceError("phase marker lookup requires an item id")
+        return self._port.latest_phase_marker(item_id)
+
     def complete(self, record: RunRecordRef, summary: str):
         _require_path(record.root, self._config, "run record")
         return self._port.complete(record, summary)
@@ -366,6 +443,37 @@ class EnforcedKnowledgePort:
 
     def record_fog(self, fog):
         return self._port.record_fog(fog)
+
+
+class EnforcedLeasePort:
+    """Keep every lease surface and its lease file inside the allowed roots.
+
+    The lease adapter owns liveness and reclaim; this wrapper only refuses a
+    surface path that escapes the fence, so a lease can never guard or write
+    outside the repository, scratch space and configured roots."""
+
+    def __init__(self, port: LeasePort, config: PolicyConfig) -> None:
+        self._port = port
+        self._config = config
+
+    def probe(self):
+        return self._port.probe()
+
+    def acquire(self, request: LeaseRequest) -> LeaseGrant:
+        _require_path(request.surface.path, self._config, "lease surface")
+        return self._port.acquire(request)
+
+    def renew(self, grant: LeaseGrant) -> LeaseGrant:
+        _require_path(grant.surface.path, self._config, "lease surface")
+        return self._port.renew(grant)
+
+    def release(self, grant: LeaseGrant):
+        _require_path(grant.surface.path, self._config, "lease surface")
+        return self._port.release(grant)
+
+    def live_holder(self, surface: LeaseSurface):
+        _require_path(surface.path, self._config, "lease surface")
+        return self._port.live_holder(surface)
 
 
 class PolicyGateway:
@@ -391,3 +499,6 @@ class PolicyGateway:
 
     def knowledge(self, port: KnowledgePort) -> EnforcedKnowledgePort:
         return EnforcedKnowledgePort(port)
+
+    def lease(self, port: LeasePort) -> EnforcedLeasePort:
+        return EnforcedLeasePort(port, self.config)

@@ -18,6 +18,8 @@ from autobuild.domain import (
     CapabilityError,
     CommandRequest,
     EvidenceError,
+    LaneSignal,
+    LaneSignalKind,
     ProbeResult,
     ReviewDecision,
     ReviewFinding,
@@ -27,8 +29,39 @@ from autobuild.domain import (
     SeatRequest,
     SeatResult,
     SeatUsage,
+    review_verdict_rule_error,
 )
 from autobuild.ports import CommandPort
+
+
+# Structural limit codes mapped to their lane signal kind. The keys are the
+# values a CLI reports in its structured error fields, never words scanned from
+# prose. Adapters extend recognition through their own ``_limit_code_keys``.
+_LIMIT_CODES: dict[str, LaneSignalKind] = {
+    "rate_limit": LaneSignalKind.RATE_LIMIT,
+    "rate_limit_error": LaneSignalKind.RATE_LIMIT,
+    "rate_limit_exceeded": LaneSignalKind.RATE_LIMIT,
+    "rate_limited": LaneSignalKind.RATE_LIMIT,
+    "ratelimited": LaneSignalKind.RATE_LIMIT,
+    "overloaded": LaneSignalKind.RATE_LIMIT,
+    "overloaded_error": LaneSignalKind.RATE_LIMIT,
+    "usage_limit_reached": LaneSignalKind.RATE_LIMIT,
+    "429": LaneSignalKind.RATE_LIMIT,
+    "insufficient_quota": LaneSignalKind.QUOTA,
+    "quota_exceeded": LaneSignalKind.QUOTA,
+    "quota": LaneSignalKind.QUOTA,
+    "billing_hard_limit_reached": LaneSignalKind.QUOTA,
+    "authentication_error": LaneSignalKind.AUTH,
+    "invalid_api_key": LaneSignalKind.AUTH,
+    "unauthorized": LaneSignalKind.AUTH,
+    "401": LaneSignalKind.AUTH,
+}
+
+
+def _kind_for_code(value: object) -> LaneSignalKind | None:
+    if not isinstance(value, str):
+        return None
+    return _LIMIT_CODES.get(value.strip().casefold())
 
 
 BUILDER_SCHEMA: dict[str, Any] = {
@@ -53,12 +86,14 @@ REVIEW_SCHEMA: dict[str, Any] = {
                     "code": {"type": "string", "minLength": 1},
                     "consequence": {"type": "string", "minLength": 1},
                     "evidence_ref": {"type": "string", "minLength": 1},
+                    "blocking": {"type": "boolean"},
                     "specialist_boundary": {"type": ["string", "null"]},
                 },
                 "required": [
                     "code",
                     "consequence",
                     "evidence_ref",
+                    "blocking",
                     "specialist_boundary",
                 ],
                 "additionalProperties": False,
@@ -186,6 +221,10 @@ def _normalise_usage(text: str, source: str) -> SeatUsage:
 class CliHarnessAdapter:
     adapter_name = "cli"
     capabilities = frozenset({"fresh-seat", "cancel", "typed-result", "usage"})
+    # Environment that disables outbound telemetry for the child process. Source:
+    # the Console Do Not Track standard (https://consoledonottrack.com/), honoured
+    # by an increasing number of CLI tools. Subclasses add vendor-specific names.
+    telemetry_environment: tuple[tuple[str, str], ...] = (("DO_NOT_TRACK", "1"),)
 
     def __init__(
         self,
@@ -222,7 +261,7 @@ class CliHarnessAdapter:
     def invoke(self, request: SeatRequest) -> SeatResult:
         run_ref = f"{request.run_id}:{request.item_id}:{request.seat.value}:{self.adapter_name}"
         prepared = replace(request, instructions=self._materialise_evidence(request))
-        invocation, extra_output = self._invocation(prepared, run_ref)
+        invocation, extra_output, stdin_ref = self._invocation(prepared, run_ref)
         command = self._commands.run(
             CommandRequest(
                 command_id=run_ref,
@@ -230,10 +269,15 @@ class CliHarnessAdapter:
                 cwd=request.workspace.root,
                 environment=self._scratch_environment(),
                 timeout_seconds=request.timeout_seconds,
+                stdin_ref=stdin_ref,
+                progress_deadline_seconds=request.progress_deadline_seconds,
+                progress_digest=request.progress_digest,
             )
         )
         outcome = SeatOutcome.SUCCEEDED
-        if command.timed_out:
+        if command.stalled:
+            outcome = SeatOutcome.STALLED
+        elif command.timed_out:
             outcome = SeatOutcome.TIMED_OUT
         elif command.cancelled:
             outcome = SeatOutcome.CANCELLED
@@ -245,6 +289,12 @@ class CliHarnessAdapter:
         usage = _normalise_usage(raw, self.adapter_name)
         with self._lock:
             self._usage[run_ref] = usage
+        diagnostics = [f"stderr={command.stderr_ref}"]
+        recovered = self._recover_result(request, run_ref)
+        if outcome is not SeatOutcome.SUCCEEDED and recovered is not None:
+            outcome = SeatOutcome.SUCCEEDED
+            raw = recovered
+            diagnostics.append("result recovered from the seat result file")
         payload = None
         if outcome is SeatOutcome.SUCCEEDED:
             data = _contract_object(raw, request.result_contract)
@@ -258,8 +308,20 @@ class CliHarnessAdapter:
             usage,
             command.started_at,
             command.ended_at,
-            (f"stderr={command.stderr_ref}",),
+            tuple(diagnostics),
+            exit_code=command.exit_code,
+            model=self._model(request.model_class),
+            stall_sample_times=command.stall_sample_times,
         )
+
+    def _recover_result(self, request: SeatRequest, run_ref: str) -> str | None:
+        """Return a typed result the seat left behind by another route, or None.
+
+        Adapters that give the seat a second route for its result (a file in the
+        workspace) override this. The default has no second route.
+        """
+
+        return None
 
     def _materialise_evidence(self, request: SeatRequest) -> str:
         sections = [request.instructions]
@@ -282,6 +344,70 @@ class CliHarnessAdapter:
     def collect_usage(self, run_ref: str) -> SeatUsage:
         with self._lock:
             return self._usage.get(run_ref, SeatUsage(source=f"{self.adapter_name}:unavailable"))
+
+    # -- lane classification ---------------------------------------------------
+    # The structured error keys this adapter reads. Subclasses extend the tuple
+    # to name the CLI-specific fields their JSON output carries; the values are
+    # dictionary keys, never words matched against prose.
+    _limit_code_keys: tuple[str, ...] = ("code", "type", "error_type", "error_code", "reason")
+    _limit_reset_keys: tuple[str, ...] = ("reset_at", "resets_at", "reset_time")
+
+    def classify_failure(self, result: SeatResult) -> LaneSignal | None:
+        return self._structural_lane_signal(result)
+
+    def _structural_lane_signal(self, result: SeatResult) -> LaneSignal | None:
+        """Return a lane signal from structural evidence, or None.
+
+        Only a seat the process itself ended in error is classified. A successful
+        seat, or one the harness killed for stalling, timing out or cancellation,
+        never cools a lane. A failure that produced no structured output at all is
+        a spawn failure; otherwise the CLI's structured error fields are read for a
+        limit or quota code. Free text is never scanned, so a report that mentions
+        a limit in prose does not cool the lane."""
+
+        if result.outcome is not SeatOutcome.FAILED:
+            return None
+        documents = self._output_documents(result)
+        if not documents:
+            return LaneSignal(LaneSignalKind.SPAWN, detail="no structured output before exit")
+        return self._limit_signal(documents)
+
+    def _output_documents(self, result: SeatResult) -> list[Any]:
+        try:
+            raw = self._read(result.raw_output_ref)
+        except EvidenceError:
+            return []
+        return _documents(raw)
+
+    def _limit_signal(self, documents: list[Any]) -> LaneSignal | None:
+        for document in documents:
+            for candidate in _walk(document):
+                if not isinstance(candidate, dict):
+                    continue
+                signal = self._candidate_signal(candidate)
+                if signal is not None:
+                    return signal
+        return None
+
+    def _candidate_signal(self, candidate: dict[str, Any]) -> LaneSignal | None:
+        containers = [candidate]
+        nested = candidate.get("error")
+        if isinstance(nested, dict):
+            containers.append(nested)
+        for container in containers:
+            for key in self._limit_code_keys:
+                kind = _kind_for_code(container.get(key))
+                if kind is not None:
+                    return LaneSignal(kind, reset_at=self._candidate_reset(candidate, nested), detail=str(container.get(key)))
+        return None
+
+    def _candidate_reset(self, candidate: dict[str, Any], nested: Any) -> str | None:
+        for container in (candidate, nested if isinstance(nested, dict) else {}):
+            for key in self._limit_reset_keys:
+                value = container.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return None
 
     def _payload(self, request: SeatRequest, data: dict[str, Any], evidence_ref: str):
         if request.result_contract == "builder-report-v1":
@@ -306,6 +432,7 @@ class CliHarnessAdapter:
                         code=str(value["code"]),
                         consequence=str(value["consequence"]),
                         evidence_ref=str(value["evidence_ref"]),
+                        blocking=bool(value["blocking"]),
                         specialist_boundary=(
                             str(value["specialist_boundary"])
                             if value.get("specialist_boundary") is not None
@@ -315,9 +442,11 @@ class CliHarnessAdapter:
                 )
             except KeyError as exc:
                 raise EvidenceError("review finding is incomplete") from exc
-        if decision is not ReviewDecision.PASS and not findings:
-            raise EvidenceError("a blocking review decision requires a concrete finding")
-        return ReviewVerdict(request.item_id, decision, tuple(findings), evidence_ref)
+        verdict = ReviewVerdict(request.item_id, decision, tuple(findings), evidence_ref)
+        rule_error = review_verdict_rule_error(verdict)
+        if rule_error is not None:
+            raise EvidenceError(rule_error)
+        return verdict
 
     def _probe_run(self, label: str, argv: tuple[str, ...]):
         return self._commands.run(
@@ -331,7 +460,7 @@ class CliHarnessAdapter:
         )
 
     def _scratch_environment(self) -> tuple[tuple[str, str], ...]:
-        return scratch_environment(self._output_root / "scratch")
+        return (*scratch_environment(self._output_root / "scratch"), *self.telemetry_environment)
 
     def _model(self, model_class: str) -> str:
         return self._model_map.get(model_class, model_class)
@@ -363,7 +492,9 @@ class CliHarnessAdapter:
     def _probe_authentication(self) -> tuple[bool, str]:
         raise NotImplementedError
 
-    def _invocation(self, request: SeatRequest, run_ref: str) -> tuple[tuple[str, ...], Path | None]:
+    def _invocation(
+        self, request: SeatRequest, run_ref: str
+    ) -> tuple[tuple[str, ...], Path | None, str | None]:
         raise NotImplementedError
 
     @staticmethod

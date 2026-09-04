@@ -37,12 +37,14 @@ For each ready item, AutoBuild follows this sequence:
 4. Start a fresh builder session with the approved brief and allowed tools.
 5. Calculate the changed files and run the declared validator.
 6. Start a fresh read-only reviewer with the brief, diff, and validator evidence.
-7. Correct a material finding, ask a specialist when the finding names a specialist boundary, or park the item.
+7. Correct a blocking finding, ask a specialist when the finding names a specialist boundary, or park the item.
 8. Create a product commit and a separate tracker commit for accepted work.
 9. Deliver the item branch through the selected mode. Local PR delivery merges into the invoking branch and pushes only when separately authorised. Protected delivery merges into the default branch, pushes it, and verifies the remote revision.
 10. Continue until the queue is dry, the item limit is reached, or a structural evidence failure stops the campaign.
 
 The reviewer does not receive the builder transcript. Accepted work must still match the diff that passed validation and review.
+
+Every review finding carries a blocking flag. The reviewer blocks only for a concrete consequence it would not merge under its own name, and records every other reservation as a non-blocking finding on a passing verdict. A `correct` or `escalate` needs at least one blocking finding, a `park` needs at least one finding, and a `pass` carries non-blocking findings only. When a passing review carries non-blocking findings, AutoBuild accepts and delivers the item and records one non-runnable follow-up proposal per finding for the owner. The campaign report lists these proposals under Follow-ups.
 
 The `autobuild` skill reads the project configuration and launches the Python command. You can also call the command directly without installing either skill.
 
@@ -87,10 +89,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.3.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.3.0). Install the released command from PyPI:
+Release 0.4.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.4.0). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.3.0
+uv tool install autobuild-factory==0.4.0
 ```
 
 Check the command:
@@ -122,7 +124,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.3.0
+uv tool install autobuild-factory==0.4.0
 autobuild --help
 ```
 
@@ -213,6 +215,9 @@ Example `docs/items/APP-001.md`:
 ```markdown
 # Add the account summary
 
+Item nature: repository
+Item class: default
+
 ## Outcome
 
 Show the signed-in customer their account name and current balance on the dashboard.
@@ -229,11 +234,17 @@ Show the signed-in customer their account name and current balance on the dashbo
 - The empty and error states remain usable.
 - The declared project validator passes.
 
+## Declared paths
+
+`src/dashboard/account_summary.tsx` (new), `src/dashboard/index.ts`.
+
 ## Outside scope
 
 - No account editing.
 - No deployment or publication.
 ```
+
+Every brief carries two triage lines that AutoBuild reads before it claims the item, without a model call. The `Item nature` line names the class: `repository` work builds inside the isolated worktree, while `machine`, `cross-repository`, and `owner-gated` work cannot and is parked at once with reason `nature:<class>`. An absent line means `repository`. The `## Declared paths` section lists every path the item edits; any path that resolves outside the repository and the configured `allowed_roots` also marks the item `cross-repository`. Register `machine` and `cross-repository` items as blocked, not ready, so a person handles them outside the fence.
 
 The tracker stores the path to this file. AutoBuild passes the same brief to the builder and reviewer.
 
@@ -362,7 +373,11 @@ Create `.autobuild.toml` at the repository root. This file supplies facts that A
 harness = "codex"
 max_items = 10
 seat_timeout_seconds = 900
+seat_stall_seconds = 900
 command_timeout_seconds = 600
+
+[run.item_classes]
+large = 7200
 
 [tracker]
 kind = "auto"
@@ -383,11 +398,15 @@ allowed_roots = []
 
 ### Run settings
 
-`harness` is `claude-code`, `codex`, or `github-copilot`.
+`harness` is `claude-code`, `codex`, or `github-copilot`. For more than one lane with automatic failover, use `run.lanes` and `[lanes.*]` tables instead, described in "Configure harness lanes and failover".
 
 `max_items` limits accepted or parked item cycles in one campaign. The default is 20.
 
-`seat_timeout_seconds` limits each builder or reviewer process. The default is 900 seconds.
+`seat_timeout_seconds` limits each builder or reviewer process. The default is 900 seconds. It is the wall-clock cap for the `default` item class.
+
+`seat_stall_seconds` is the progress deadline. AutoBuild kills a seat only when its output, its worktree, and its direct child process all show no progress for this long. A slow but working seat is never killed for being quiet, and a seat whose output alone is silent keeps running. The sampling interval never exceeds 60 seconds. The default is 900 seconds.
+
+`[run.item_classes]` maps a class name to its expected wall-clock cap in seconds, for example `large = 7200`. A brief selects its class with an `Item class: <class>` line; an undeclared or unknown class means `default`, which uses `seat_timeout_seconds`. AutoBuild acts at the class cap and raises the seat-timeout ceiling to the largest declared class so a class cap is never refused.
 
 `command_timeout_seconds` limits the validator process. The default is 600 seconds.
 
@@ -438,6 +457,58 @@ command = ["/absolute/path/to/codex"]
 
 The command remains behind the selected harness adapter. It must support the flags and result format expected by that adapter.
 
+### Progress reporting
+
+AutoBuild renders one plain-language progress line per campaign and item event and streams it live, so the owner learns what the campaign is doing without watching the run record. The optional `[progress]` table selects the sinks:
+
+```toml
+[progress]
+file = true
+stderr = true
+command = ["/absolute/path/to/notify", "--stdin"]
+command_timeout_seconds = 5
+```
+
+`file` and `stderr` are booleans that default to true. The file sink appends every line to `progress.log` under the run record. The stderr sink writes and flushes each line, so a detached launch with redirected stderr keeps every line even if the process is killed.
+
+`command` is an optional non-empty string array. When set, AutoBuild runs the command once per line with the line on standard input, for a push notification or a chat message. The hook is a human-approved profile field, not a workflow command: it runs outside the validator policy. Each call has a hard ceiling of `command_timeout_seconds`, which defaults to 5. A missing executable, a non-zero exit, a timeout, or an encoding error is swallowed and counted, and the total is reported once on the `campaign completed` line as `progress hook failures: N`.
+
+## Configure harness lanes and failover
+
+A campaign can list more than one harness lane and flip to the next lane when a model reaches its subscription limit. The single-lane form above (`run.harness` plus `[models]`) stays valid and means one lane.
+
+Declare a tier map with a `[lanes.<harness>]` table per harness and a `run.lanes` order of preference:
+
+```toml
+[run]
+lanes = ["claude-code", "codex", "github-copilot"]
+lane_cool_seconds = 3600
+lane_state_root = "/path/to/local/lane-state"
+
+[lanes.claude-code]
+builder = "claude-opus-4-8"
+reviewer = "claude-opus-4-8"
+specialist = "claude-opus-4-8"
+
+[lanes.codex]
+builder = "gpt-5.6-sol"
+reviewer = "gpt-5.6-sol"
+specialist = "gpt-5.6-sol"
+
+[lanes.github-copilot]
+builder = "gpt-5.6"
+reviewer = "gpt-5.6"
+specialist = "gpt-5.6"
+```
+
+`run.lanes` names the lanes in order of preference. Each name must have a `[lanes.<harness>]` table with `builder` and `reviewer` model names; `specialist` is optional and defaults to the reviewer model. Lane choice is made at launch: preflight probes every listed lane, cools any lane whose executable is missing, unauthenticated or lacking a required capability with the `probe` signature, and starts the first capable lane. Pass `--harness <name>` to move a listed lane to the front for one launch.
+
+When a seat hits a structural limit on the active lane, that lane cools and the seat re-runs on the next capable lane. A limit is read only from the harness CLI's exit code and structured error fields, never from words in the event stream, so a report that mentions "rate limit" in prose with a clean exit and a valid result never cools a lane. When the vendor supplies a reset time the lane cools until then; otherwise it cools for `run.lane_cool_seconds` (default 3600). When no capable lane remains, the item parks with the lane signature, its worktree evidence is kept, and the campaign stops with the `lanes_exhausted` reason.
+
+`run.lane_state_root` is where the machine-local `lanes.json` cooling file lives. It defaults to the scratch root. Concurrent campaigns on one machine share this file under a lock, so a lane one campaign cooled is skipped by the others until it recovers. Pass `--lane-state-root` to override it for one launch.
+
+The active lane is recorded on tracker and run events: the claim actor is `builder@<lane>`, a park reason is prefixed `<lane>:`, the close briefing names the lane per seat, and run event payloads carry the lane. The manifest records the lane order and the cooling state.
+
 ## Choose the temporary work location
 
 The scratch setting is optional. With no override, AutoBuild uses the operating system temporary directory under an `autobuild` folder.
@@ -452,6 +523,71 @@ scratch_root = "/path/to/local/scratch"
 You can also pass `--scratch-root` for one run.
 
 AutoBuild places worktrees, run records, command output, evidence, and package caches below the selected root. It also sets `TMPDIR`, `TEMP`, `TMP`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`, `PYTHONPYCACHEPREFIX`, `XDG_CACHE_HOME`, and `NPM_CONFIG_CACHE` for child processes.
+
+## Restrict a campaign to selected items
+
+The `[selection]` table restricts a campaign to a chosen set of items. Both keys are optional:
+
+```toml
+[selection]
+allow = ["APP-001", "APP-004", "APP-002"]
+exclude = ["APP-007"]
+```
+
+`allow` is the closed universe for the campaign. When it is present AutoBuild builds only these items, and its order is the dispatch order regardless of the tracker's own ranking. AutoBuild selects the first allowed, non-excluded item that the tracker reports ready, then the next, until the allow-list is exhausted. An item that is not in the allow-list is never claimed, even if the tracker offers it first.
+
+`exclude` is checked at every selection, including after a refill attempt. An excluded item is skipped; a campaign with only excluded work ready ends `queue_dry`.
+
+The allow-list is a hard fence. If the tracker offers an item outside the allow-list as its next item, AutoBuild stops the campaign with the `scope_fence_violation` stop reason and makes no claim, rather than build out-of-scope work.
+
+Extend the profile lists for a single run with repeatable command-line flags:
+
+```text
+autobuild run --repository . --allow-item APP-001 --allow-item APP-004 --exclude-item APP-007 --delivery-mode current-branch-pr --allow-delivery
+```
+
+`--allow-item` and `--exclude-item` add to the profile lists for that run. AutoBuild records the final allow-list, exclude-list and their sources in `manifest.json` and in the campaign result under `selection`.
+
+## Preflight
+
+Before it claims the first item, AutoBuild runs a preflight doctor. The doctor runs
+after the adapter probes and before any tracker change, so a launch that cannot work
+on this environment stops before it touches the queue. Every probe that fails stops
+the launch with exit code 2 and a message that names the probe and the cause. A full
+pass is recorded in `manifest.json` under a `preflight` block with each probe, its
+result, and its detail.
+
+The probes are:
+
+- `dns-tls`: resolves DNS and completes a TLS handshake to every declared target.
+- `interception`: refuses an unlisted proxy or certificate environment variable.
+- `scratch`: confirms the scratch root exists or can be created, is writable, holds no foreign lock, and is not held by a live tracker-root lease from another campaign.
+- `telemetry`: confirms the selected harness disables its telemetry in the child environment.
+- `validator-runnable`: confirms the validator executable resolves, reports a version, and that a repository-relative script path exists.
+- `validator-offline`: runs the validator once in the primary checkout with proxies pointed at a closed port and offline flags set, so any dependency download fails at once.
+- `validator-budget`: confirms `command_timeout_seconds` is not below the declared validator budget.
+- `transport`: confirms the harness streams a large instruction through stdin or a prompt file and keeps every argv element small.
+- `briefs`: confirms the next ready item's brief file exists and is under 1 MiB.
+
+Configure the doctor in the project profile:
+
+```toml
+[preflight]
+tls_targets = ["registry.example.com:443", "api.example.com:8443"]
+accepted_environment = ["NODE_EXTRA_CA_CERTS", "SSLKEYLOGFILE"]
+
+[validator]
+id = "tests"
+argv = ["uv", "run", "pytest", "-q"]
+budget_seconds = 600
+```
+
+`tls_targets` lists `host:port` endpoints the campaign must reach. The doctor also
+checks the host of the `origin` remote when its URL uses `https`. `accepted_environment`
+names the interception variables this environment is allowed to carry; the doctor
+records the accepted names and their presence and refuses any other interception
+variable. `budget_seconds` is the lane's expected wall-clock; the doctor refuses when
+`command_timeout_seconds` is below it and records the measured offline duration.
 
 ## Run a campaign
 
@@ -503,17 +639,28 @@ The command prints `autobuild.campaign-result.v1` JSON. It includes:
 - repository and scratch paths
 - selected adapter names and versions
 - stop reason
+- the `selection` block with the allow-list, exclude-list and their sources
 - refill counts
 - each item disposition and state history
 - product, tracker, and merge commit identifiers
 - remote push result
 - final run report path
+- the committed repository report path
+- `progress_ref`, the absolute path of the plain-language progress log
+
+At the end of every campaign AutoBuild commits a report to `docs/campaigns/<campaign-id>.md` in the repository. The report lists Shipped items with their item and merged commits, Parked items with reasons, Failed items with errors, Follow-ups created during the campaign, the Next ready item, and a per-item table of seat durations and token usage. When the campaign runs with an allow-list, the report also lists every allowed item it left unbuilt with a reason: not ready, blocked, excluded, item bound, or lanes exhausted. The report commit is a tracker-class commit that touches only that path and is delivered through the selected delivery mode: pushed in `protected-default`, kept local in `current-branch-pr`.
+
+Every run event carries a real UTC timestamp and a JSON payload. The `campaign.started` payload names the harness, models, item bound, delivery mode, validator id, and manifest path. A `seat.completed` payload is written for each builder, reviewer, and specialist invocation with the seat, model class, resolved model, outcome, exit code, start and end times, duration, input and output tokens, cost, and raw output and stderr references. The `validation.completed`, `review.completed`, `specialist.completed`, `item.parked`, `item.finalised`, and `campaign.completed` events carry their own payload fields. An `item.correcting` event is appended when an item enters a correction round, with its `round` and the `triggering_evidence_ref` of the review that asked for the change.
+
+Each run directory also holds `progress.log`, the plain-language progress lines rendered from those same events, one per line and prefixed with the event UTC timestamp. The lines cover the campaign start, each item claim, seat completion, validation, review decision, correction round, park, delivery, and the campaign completion counts and report path.
 
 The stop reason is one of:
 
 - `queue_dry`: no runnable item remains
 - `item_bound`: the campaign reached `max_items`
 - `structural_failure`: required evidence or a contract was invalid
+- `scope_fence_violation`: the tracker offered an item outside the allow-list or inside the exclude-list; the campaign stopped without a claim
+- `lanes_exhausted`: every configured harness lane cooled on a subscription limit or spawn failure; the current item parked with the lane signature and its worktree evidence was kept
 
 The process exit code is:
 
@@ -525,10 +672,30 @@ The scratch root contains `runs/<run-id>/`. Each run directory contains:
 
 - `manifest.json` with configuration and adapter identities
 - `events.jsonl` with campaign and item events
-- `evidence/` with workflow-authored evidence such as the accepted trajectory
-- `report.txt` with the final summary
+- `progress.log` with one plain-language progress line per event
+- `evidence/` with workflow-authored evidence such as a per-item trajectory for every disposition
+- `report.txt` with the final summary and the committed repository report path
 
 Command output, harness output, and diff patches live under their own scratch subdirectories. Events point to those files. The brief, validator result, diff, review verdict, and commit identities form the acceptance record.
+
+## Watch a campaign
+
+`autobuild watch` follows the progress lines of a running or finished campaign from its run record. It reads only the run's `progress.log` and, to locate the runs root, the profile; it never reads the tracker and never writes anything.
+
+```text
+autobuild watch --run <run-id>
+autobuild watch --latest
+```
+
+Pass exactly one of `--run <run-id>` or `--latest`. The runs root is `--scratch-root` when given, otherwise `[run] scratch_root` from the profile named by `--profile` or found next to `--repository`, otherwise the same default the campaign uses. Resolving it reads only `[run] scratch_root`, so a watcher finds the runs without a complete profile.
+
+The command tracks a byte offset in `progress.log` and prints each newline-terminated line as it lands; a trailing partial line waits for its newline. Only the progress lines reach stdout; diagnostics go to stderr. Without `--timeout-seconds` the command polls until the campaign-completion line arrives. Pass `--timeout-seconds <n>` so a run whose process died never blocks the terminal.
+
+The process exit code is:
+
+- `0` when the campaign-completion line has been printed
+- `2` when the run does not exist, or no run exists for `--latest`
+- `3` when `--timeout-seconds` elapses before the completion line arrives
 
 ## Changes made by accepted and parked outcomes
 
@@ -536,7 +703,7 @@ An accepted item creates separate commits for product files and tracker state. I
 
 In `protected-default` mode, AutoBuild merges the item branch into the default branch with a merge commit, pushes the default branch, and checks that the remote points at that commit.
 
-A parked item writes the reason to the selected tracker and delivers that tracker-only result through the selected delivery mode. AutoBuild does not merge the unaccepted product changes. The isolated worktree is released after the park record is delivered.
+A parked item writes the reason to the selected tracker and delivers that tracker-only result through the selected delivery mode. AutoBuild does not merge the unaccepted product changes. Before it releases the worktree, AutoBuild snapshots the parked work into the run record so nothing is lost: the tracked changes as a binary patch against the start commit, every untracked product file copied verbatim, and a `snapshot.json` that lists the paths, their digests, and the park reason. The park reason and the `item.parked` event both name that snapshot directory. The isolated worktree is released only after the park record is delivered and the snapshot is written.
 
 A preflight failure occurs before a tracker claim. The primary repository remains unchanged.
 
@@ -588,7 +755,28 @@ The command must answer `--version`, and the fog ledger must already exist. Publ
 
 Normal failures park the claimed item and release the isolated worktree. A killed process or machine restart can leave a claimed item, an AutoBuild branch, or a worktree under the scratch root.
 
-AutoBuild does not attach a new campaign to an abandoned worktree automatically. Preserve the worktree until you have inspected it.
+At the start of every campaign, before it selects the first item, AutoBuild asks the tracker for items its builder actor still holds that are neither done nor parked, and reads each item's phase marker from the most recent run under the scratch root. An interrupted item resumes automatically when its state is good: the marker's worktree still exists as a registered worktree of the repository, the worktree head matches the marker, the product status digest still matches a `built`, `validated` or `reviewed` marker, the tracker still shows the item claimed, and no live lease from another campaign holds the worktree or the tracker root. A resumed item restarts from its marker: a build that is not yet trusted re-runs the builder, a `built` marker re-runs validation and review, a `validated` marker re-runs review, and a `reviewed` correction starts the next round with the same correction count. The run record notes `item.resumed` with the prior run id and marker state, and the campaign then continues to the rest of the queue.
+
+When the state is not good, AutoBuild parks the item with a stated reason and moves on rather than attaching to it. The reason is one of `resume:missing-worktree`, `resume:head-moved`, `resume:revision-changed`, `resume:lease-held`, `resume:tracker-mismatch` or `resume:missing-marker`. A parked item's worktree is snapshotted into the run record and left in place, so nothing is lost. A worktree under the scratch root that no claimed item owns is never attached; the campaign report lists it under Parked with reason `resume:orphan-worktree` and leaves it in place. These park cases still need a person: inspect the named worktree and reconcile it before you re-queue the item. Taking over a worktree that another live campaign holds is never automatic, so stop the named holder first.
+
+Preserve a parked or orphan worktree until you have inspected it.
+
+Every park preserves the parked work under the run record at `runs/<run-id>/evidence/<item-id>-park/`. That directory holds `snapshot.json` with the paths, digests, and park reason, `changes.patch` with the tracked changes as a binary patch against the start commit, and a `files/` folder with each untracked product file copied verbatim. Apply `changes.patch` to the start commit and restore the copied files to reproduce the parked tree. AutoBuild also refuses to remove a worktree while it still holds uncommitted tracker files, so a killed run leaves the tracker log in place rather than discarding it.
+
+### Single-writer leases
+
+Every campaign holds a lease on each surface it writes. There is one lease for the tracker root (the repository's `.ergon` directory or the backlog file's parent) and one lease for each isolated worktree. The campaign takes the tracker-root lease before the first claim and renews it at every item boundary. Each item takes its worktree lease when the worktree is created and drops it when the worktree is released.
+
+Lease records live under `<scratch-root>/leases/`, one JSON file per surface named by the SHA-256 of the surface path. Each record names the holder campaign id, the process id, the host, the start time, the last heartbeat, and the surface it guards. Read these files to see which campaign owns a surface after an interrupted run.
+
+A lease is live when its process id is still running on the recorded host and its heartbeat is younger than `run.lease_stale_seconds` (default 1800). A second campaign that starts against a live tracker lease stops with exit code 2 before any claim and names the holder campaign id and process id. There is no automatic take-over: stop the named holder first. A lease whose process is gone or whose heartbeat is older than the stale window is stale. The next campaign reclaims a stale lease, records the previous holder in the run record and the campaign report, and continues. Releasing a lease is idempotent, and releasing a lease this process does not hold is a recorded no-op.
+
+Set the stale window in the profile when a longer or shorter reclaim wait fits the project:
+
+```toml
+[run]
+lease_stale_seconds = 1800
+```
 
 Check the repository and tracker:
 
@@ -600,11 +788,29 @@ git branch --list "autobuild/*"
 
 Use `pinax status` for Pinax. For a Markdown backlog, inspect the claimed row. Read the latest run record under the scratch root before deciding whether to continue the branch manually or park the item.
 
-Do not start another AutoBuild campaign for the same claimed item until the tracker and worktree state are reconciled.
+AutoBuild resumes a good-state item on its own at the next launch. Reconcile the tracker and worktree by hand only for an item it parked with a `resume:` reason or an orphan worktree it reported.
 
 ## Common startup failures
 
 `tracker preflight failed` means Pinax and the configured backlog path were unavailable or invalid. Check `[tracker]`, `.ergon/`, the `pinax` command, and the backlog table.
+
+`dns-tls preflight failed` names a declared TLS target that did not resolve or complete a handshake. Check the network path, the `origin` remote URL, and `[preflight] tls_targets`.
+
+`interception preflight failed` names a proxy or certificate environment variable that is set but not listed. Remove it, or add its name to `[preflight] accepted_environment` when this environment must carry it.
+
+`scratch preflight failed` means the scratch root could not be created, was not writable, or held another process lock. Choose a writable `scratch_root` and clear stale locks.
+
+`telemetry preflight failed` means the selected harness did not disable its telemetry in the child environment. Update the harness adapter so it sets the disabling variables.
+
+`validator-runnable preflight failed` means the validator executable was not found, its version probe failed, or a repository-relative validator script is missing. Check `[validator] argv`.
+
+`validator-offline preflight failed` names the failing validator output line from an offline run. The validator downloaded a dependency or otherwise failed without the network. Vendor the dependency or fix the failing test.
+
+`validator-budget preflight failed` means `command_timeout_seconds` is below `[validator] budget_seconds`, or the offline run exceeded the budget. Raise the timeout or the budget.
+
+`transport preflight failed` means the harness would place the instructions on argv or in an oversized argv element. This is an adapter defect.
+
+`briefs preflight failed` names a ready item whose brief file is missing or larger than 1 MiB. Fix the brief path or trim the brief.
 
 `primary checkout must be clean` means the main repository has tracked or untracked changes. Commit, move, or intentionally resolve them before retrying.
 

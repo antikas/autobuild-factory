@@ -37,23 +37,28 @@ def render_seat_instructions(
         role = (
             "Review the actual brief, diff and validator evidence from a fresh context. Do not ask "
             "for or use the builder transcript. Judge intent, correctness, maintainability, "
-            "security and scope. Block only for a concrete consequence."
+            "security and scope. Mark a finding blocking only for a concrete consequence you would "
+            "not merge under your own name; record everything else as a non-blocking finding with "
+            "decision pass. Return correct or escalate only with a blocking finding."
         )
         contract = (
             'Return only JSON matching review-verdict-v1: '
             '{"decision":"pass|correct|escalate|park","findings":['
             '{"code":"...","consequence":"...","evidence_ref":"...",'
-            '"specialist_boundary":null}],"evidence_ref":"..."}.'
+            '"blocking":true,"specialist_boundary":null}],"evidence_ref":"..."}.'
         )
     else:
         role = (
             "Adjudicate only the specialist boundary named in the supplied finding. Preserve the "
-            "same acceptance criteria and return a decisive disposition with concrete evidence."
+            "same acceptance criteria and return a decisive disposition with concrete evidence. "
+            "Mark a finding blocking only for a concrete consequence you would not merge under your "
+            "own name; record everything else as a non-blocking finding with decision pass. Return "
+            "correct or escalate only with a blocking finding."
         )
         contract = (
             'Return only JSON matching review-verdict-v1: '
             '{"decision":"pass|correct|escalate|park","findings":['
             '{"code":"...","consequence":"...","evidence_ref":"...",'
-            '"specialist_boundary":null}],"evidence_ref":"..."}.'
+            '"blocking":true,"specialist_boundary":null}],"evidence_ref":"..."}.'
         )
     return f"{common}\nYour seat:\n{role}\n\nResult contract:\n{contract}\n"

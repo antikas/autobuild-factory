@@ -77,6 +77,20 @@ Blocking decisions use `correct`, `escalate` or `park` and require at least one 
 
 The GitHub Copilot command also uses `--disallow-temp-dir`. The child environment points every temporary and cache path at the active temporary work root.
 
+### Lane failure signals
+
+Each adapter owns the classification of its own failures through `classify_failure`. It reads a lane signal from structural evidence only: the process exit state and the CLI's structured error fields. It never scans the event stream for words. A successful seat, or a seat the harness killed for stalling, timing out or cancellation, never cools a lane, so a report that mentions "rate limit" in prose with a clean exit and a valid result is not a false kill. A failed process that produced no structured output at all is a spawn failure and cools the lane.
+
+The structured fields each adapter reads:
+
+| Adapter | Structured limit fields |
+|---|---|
+| Claude Code | the result object `is_error` with a nested `error.type` (or `subtype`) following the Anthropic error taxonomy, such as `rate_limit_error`, `overloaded_error` and `authentication_error` |
+| Codex | an `error` event or a `turn.failed` event with a nested `error` carrying the OpenAI error `type` or `code`, such as `rate_limit_exceeded`, `insufficient_quota` and `invalid_api_key` |
+| GitHub Copilot | an `error` object with a `code` or `type` (or a nested `error`) carrying the GitHub Models limit codes, such as `rate_limited`, `quota_exceeded` and `unauthorized` |
+
+A signal carries a kind (`rate_limit`, `quota`, `auth`, `spawn`) and a reset time when the vendor supplies one. Where a CLI surfaces a limit only in prose and carries no structured field, `classify_failure` returns nothing for that lane and never falls back to prose matching.
+
 ### Runtime registration
 
 The built-in adapter names are `claude-code`, `codex` and `github-copilot`. Each factory receives the bound host command port, an output directory, an optional command override and a model map. A fourth adapter can register through the same Python entry-point surface without editing the workflow.

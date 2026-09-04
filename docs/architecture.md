@@ -76,7 +76,7 @@ Explicit tracker and harness settings take precedence over discovery. Auto track
 
 ## Port contracts
 
-The workflow calls six semantic ports.
+The workflow calls seven semantic ports.
 
 | Port | Workflow request | Included adapters |
 |---|---|---|
@@ -86,6 +86,7 @@ The workflow calls six semantic ports.
 | `CommandPort` | Run the approved validator with captured output and process-tree control | Windows and POSIX process adapters |
 | `RunRecordPort` | Create a run, append events, write evidence, and complete a report | Local filesystem records |
 | `KnowledgePort` | Retrieve durable context and record unresolved directions | Koine or no-refill adapter |
+| `ProgressPort` | Begin a run stream and emit one plain-language line per event | File, stderr, and command hook progress adapters |
 
 Ports exchange dataclasses and enums. Vendor JSON, command flags, and shell strings remain inside adapters.
 
@@ -126,25 +127,33 @@ ready
   -> released
 ```
 
-The reviewer can return `pass`, `correct`, `escalate`, or `park`.
+The reviewer can return `pass`, `correct`, `escalate`, or `park`. Every finding carries a `blocking` flag. A finding is blocking only when the reviewer would not merge the change under its own name. A `correct` or `escalate` verdict must carry at least one blocking finding, a `park` verdict must carry at least one finding, and a `pass` may carry non-blocking findings only. A `pass` that carries a blocking finding, or a `correct` whose findings are all non-blocking, is an invalid verdict that the application rejects and parks. The `review.completed` event records the blocking and non-blocking finding codes separately.
 
 A correction starts another fresh builder and reviewer pair. The default ceiling is two correction rounds. An escalation starts a specialist seat for the named specialist boundary. Any final result other than `pass` parks the item.
+
+When a `pass` carries non-blocking findings, the application still accepts and delivers the item, then records one propose-only tracker follow-up per finding. Each follow-up uses the title `Follow-up: <item-id> <code>`, the finding consequence as its question, the reviewer evidence reference in its rationale, and `docs/campaigns/<campaign-id>.md` as its brief reference. These proposals are never runnable, and the campaign report lists them under Follow-ups.
 
 ## Evidence chain
 
 The acceptance path binds each decision to the same workspace state.
 
-1. `WorkspacePort.diff()` calculates changed paths, content digests, a binary patch reference, and a workspace revision digest.
+1. `WorkspacePort.diff()` calculates changed paths, content digests, a binary patch reference, a workspace revision digest, and the branch head the evidence was taken against.
 2. `CommandPort.run()` executes the declared validator in that worktree.
 3. `ValidationEvidence` binds the validator result and changed paths to the workspace revision.
 4. The reviewer receives the brief, patch reference, and validator output reference.
-5. `commit_item()` recalculates the diff and rejects a changed workspace.
-6. The product commit contains only the reviewed product paths.
-7. The tracker adapter writes the close state after the product commit.
-8. The tracker commit must sit immediately after the product commit.
-9. Delivery merges the item branch, pushes the default branch, and checks the remote revision.
+5. `commit_item()` pins the branch head: it rejects a head that moved since the recorded diff and names both the recorded and the observed head commit.
+6. `commit_item()` recalculates the diff and rejects a changed workspace.
+7. The product commit contains only the reviewed product paths, and a named close-completeness check confirms that the whole product tree and the item's own changed paths both report a clean status, so a close cannot ship a partial tree.
+8. The tracker adapter writes the close state after the product commit.
+9. The tracker commit must sit immediately after the product commit.
+10. Delivery merges the item branch, pushes the default branch, and checks the remote revision.
+11. After delivery the workspace confirms that the reported item, tracker, and merged commits exist and that the merged commit is reachable from the delivery target branch. A mismatch is a structural failure that stops the campaign.
 
 The application accepts a result only when this chain remains intact. A successful model process cannot substitute for missing validator or review evidence.
+
+Every disposition leaves a per-item trajectory file under the run record `evidence/` directory. The trajectory lists the state history, the seat outcomes, and the final reason, and it is written for accepted, parked, and failed items alike so an unaccepted item is as legible as an accepted one.
+
+A per-item phase marker `evidence/<item-id>-phase.json` sits beside the trajectory. It is rewritten at every state transition with the state, worktree root, branch, head commit, workspace revision, correction count, and timestamp, so the head and revision each decision ran against stay pinned to disk. Its terminal value is `closed` for an accepted item, written only after the tracker commit and delivery have both been verified, or `parked` for an unaccepted one. Both terminal values are marker-only and are not item states.
 
 ## Builder and reviewer isolation
 
@@ -221,6 +230,7 @@ The local record adapter writes one directory per campaign:
 runs/<run-id>/
   manifest.json
   events.jsonl
+  progress.log
   evidence/
   report.txt
 ```
@@ -228,6 +238,8 @@ runs/<run-id>/
 The manifest records the workflow version, repository, harness, model names, validator, refill counts, and selected adapter identities.
 
 Events record the item lifecycle and point to evidence files. The run record keeps decision evidence and diagnostic references. It does not place a full builder transcript in the review pack.
+
+Progress lines are rendered from those same events by a pure function in the application layer, so a line and its event payload share one source. The composite progress adapter fans each line out to its configured sinks: a file adapter that appends to `progress.log`, a stderr adapter that flushes each line, and an optional command hook adapter that forwards each line to a human-approved command. No progress adapter raises into the workflow.
 
 ## Failure handling
 
