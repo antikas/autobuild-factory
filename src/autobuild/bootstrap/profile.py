@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from autobuild.domain import FogRecord, Proposal, RefillPlan
+from autobuild.domain import CampaignSelection, FogRecord, Proposal, RefillPlan
 
 
 class ConfigurationError(ValueError):
@@ -31,6 +31,19 @@ class ProfileOverrides:
     refill_plan: str | None = None
     tracker_kind: str | None = None
     backlog_path: str | None = None
+    allow_items: tuple[str, ...] = ()
+    exclude_items: tuple[str, ...] = ()
+    lane_state_root: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LaneProfile:
+    """One harness lane's name and its per-seat model names."""
+
+    name: str
+    builder_model: str
+    reviewer_model: str
+    specialist_model: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,17 +56,31 @@ class RunSettings:
     specialist_model: str
     validator_id: str
     validator_argv: tuple[str, ...]
+    validator_budget_seconds: float | None
     allowed_tools: frozenset[str]
     allowed_roots: tuple[Path, ...]
     max_items: int
     seat_timeout_seconds: float
+    seat_stall_seconds: float
+    lease_stale_seconds: float
+    item_classes: Mapping[str, float]
     command_timeout_seconds: float
     scratch_root: Path | None
+    lanes: tuple[LaneProfile, ...]
+    lane_state_root: Path | None
+    lane_cool_seconds: float
     tracker_kind: str
     backlog_path: Path
+    selection: CampaignSelection
+    tls_targets: tuple[str, ...]
+    accepted_environment: frozenset[str]
     refill_plan: RefillPlan | None
     knowledge_command: tuple[str, ...] | None
     fog_ledger: Path | None
+    progress_command: tuple[str, ...] | None
+    progress_file: bool
+    progress_stderr: bool
+    progress_command_timeout_seconds: float
 
 
 def _table(document: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -189,6 +216,63 @@ def _required_settings(
     return harness, builder, reviewer, specialist or reviewer, validator_id
 
 
+def _lane_profile(lanes_table: Mapping[str, Any], name: str) -> LaneProfile:
+    table = lanes_table.get(name)
+    if not isinstance(table, Mapping):
+        raise ConfigurationError(f"[lanes.{name}] must be a TOML table")
+    builder = _optional_string(table.get("builder"), f"lanes.{name}.builder")
+    reviewer = _optional_string(table.get("reviewer"), f"lanes.{name}.reviewer")
+    specialist = _optional_string(table.get("specialist"), f"lanes.{name}.specialist")
+    missing = [
+        label
+        for label, value in (
+            (f"lanes.{name}.builder", builder),
+            (f"lanes.{name}.reviewer", reviewer),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ConfigurationError("missing lane configuration: " + ", ".join(missing))
+    assert builder is not None and reviewer is not None
+    return LaneProfile(name, builder, reviewer, specialist or reviewer)
+
+
+def _lanes_and_validator(
+    document: Mapping[str, Any],
+    run: Mapping[str, Any],
+    models: Mapping[str, Any],
+    validator: Mapping[str, Any],
+    overrides: ProfileOverrides,
+) -> tuple[tuple[LaneProfile, ...], str]:
+    """Build the ordered tier map and the validator id.
+
+    A profile with ``run.lanes`` and ``[lanes.<harness>]`` tables is the tier-map
+    form; the single-lane ``run.harness`` plus ``[models]`` form stays valid and
+    means one lane. ``--harness`` reorders the listed lanes so the named lane
+    starts this launch."""
+
+    validator_id = _optional_string(overrides.validator_id or validator.get("id"), "validator.id")
+    run_lanes = run.get("lanes")
+    if run_lanes is not None:
+        order = list(_string_list(run_lanes, "run.lanes"))
+        selected = _optional_string(overrides.harness, "--harness")
+        if selected is not None:
+            if selected not in order:
+                raise ConfigurationError(
+                    f"--harness {selected!r} is not one of run.lanes: " + ", ".join(order)
+                )
+            order = [selected, *[name for name in order if name != selected]]
+        lanes_table = _table(document, "lanes")
+        lanes = tuple(_lane_profile(lanes_table, name) for name in order)
+        if validator_id is None:
+            raise ConfigurationError("missing required run configuration: validator.id")
+        return lanes, validator_id
+    harness, builder, reviewer, specialist, validator_id = _required_settings(
+        run, models, validator, overrides
+    )
+    return (LaneProfile(harness, builder, reviewer, specialist),), validator_id
+
+
 def _validator_argv(
     validator: Mapping[str, Any], overrides: ProfileOverrides
 ) -> tuple[str, ...]:
@@ -230,6 +314,156 @@ def _allowed_roots(
     return tuple(_resolve_path(value, base) for value in values)
 
 
+def _tls_targets(preflight: Mapping[str, Any]) -> tuple[str, ...]:
+    value = preflight.get("tls_targets", [])
+    if not isinstance(value, list) or not all(isinstance(part, str) for part in value):
+        raise ConfigurationError("preflight.tls_targets must be a string array")
+    targets: list[str] = []
+    for entry in value:
+        text = entry.strip()
+        host, separator, port = text.rpartition(":")
+        if not separator or not host or not port.isdigit():
+            raise ConfigurationError(
+                f"preflight.tls_targets entry must be host:port, got {entry!r}"
+            )
+        targets.append(f"{host}:{int(port)}")
+    return tuple(targets)
+
+
+def _accepted_environment(preflight: Mapping[str, Any]) -> frozenset[str]:
+    value = preflight.get("accepted_environment", [])
+    if not isinstance(value, list) or not all(
+        isinstance(part, str) and part.strip() for part in value
+    ):
+        raise ConfigurationError("preflight.accepted_environment must be a string array")
+    return frozenset(part.strip() for part in value)
+
+
+def _selection_list(
+    profile_value: object,
+    cli_values: tuple[str, ...],
+    label: str,
+    profile_path: Path | None,
+) -> tuple[tuple[str, ...], str]:
+    profile_items: tuple[str, ...] = ()
+    if profile_value is not None:
+        if not isinstance(profile_value, list) or not all(
+            isinstance(part, str) and part.strip() for part in profile_value
+        ):
+            raise ConfigurationError(f"{label} must be an array of non-empty strings")
+        profile_items = tuple(part.strip() for part in profile_value)
+    cli_items = tuple(value.strip() for value in cli_values if value.strip())
+    merged: list[str] = []
+    for value in profile_items + cli_items:
+        if value not in merged:
+            merged.append(value)
+    sources: list[str] = []
+    if profile_items:
+        sources.append(str(profile_path) if profile_path is not None else "profile")
+    if cli_items:
+        sources.append("command line")
+    return tuple(merged), ", ".join(sources)
+
+
+def _selection(
+    table: Mapping[str, Any],
+    overrides: ProfileOverrides,
+    profile_path: Path | None,
+) -> CampaignSelection:
+    allow, allow_source = _selection_list(
+        table.get("allow"), overrides.allow_items, "selection.allow", profile_path
+    )
+    exclude, exclude_source = _selection_list(
+        table.get("exclude"), overrides.exclude_items, "selection.exclude", profile_path
+    )
+    return CampaignSelection(allow, exclude, allow_source, exclude_source)
+
+
+def _item_classes(run: Mapping[str, Any]) -> dict[str, float]:
+    value = run.get("item_classes", {})
+    if not isinstance(value, Mapping):
+        raise ConfigurationError("[run.item_classes] must be a TOML table")
+    classes: dict[str, float] = {}
+    for name, cap in value.items():
+        if not isinstance(cap, (int, float)) or isinstance(cap, bool) or cap <= 0:
+            raise ConfigurationError(
+                f"run.item_classes.{name} must be a positive number of seconds"
+            )
+        classes[name] = float(cap)
+    return classes
+
+
+def _progress_boolean(value: object, default: bool, label: str) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ConfigurationError(f"{label} must be a boolean")
+    return value
+
+
+def _progress(table: Mapping[str, Any]) -> tuple[tuple[str, ...] | None, bool, bool, float]:
+    """Validate the human-approved ``[progress]`` table.
+
+    ``command`` is an optional non-empty string array run once per line with the
+    line on stdin; ``file`` and ``stderr`` are booleans defaulting to true;
+    ``command_timeout_seconds`` is a positive per-call ceiling defaulting to 5."""
+
+    command_value = table.get("command")
+    command = (
+        None if command_value is None else _string_list(command_value, "progress.command")
+    )
+    file_enabled = _progress_boolean(table.get("file"), True, "progress.file")
+    stderr_enabled = _progress_boolean(table.get("stderr"), True, "progress.stderr")
+    timeout = table.get("command_timeout_seconds", 5)
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+        raise ConfigurationError(
+            "progress.command_timeout_seconds must be a positive number of seconds"
+        )
+    return command, file_enabled, stderr_enabled, float(timeout)
+
+
+def _budget_seconds(validator: Mapping[str, Any]) -> float | None:
+    if "budget_seconds" not in validator:
+        return None
+    value = validator["budget_seconds"]
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        raise ConfigurationError("validator.budget_seconds must be a positive number")
+    return float(value)
+
+
+def read_run_scratch_root(
+    repository: str | Path,
+    profile_path: str | Path | None,
+    override: str | None,
+) -> Path | None:
+    """Resolve the run scratch root from ``--scratch-root`` then ``[run]
+    scratch_root``, reading no other profile field.
+
+    This never loads models, the validator or lane tables, so a watcher can find
+    a run's scratch root from a profile that would not pass full validation. An
+    explicit override is resolved against the working directory and short-circuits
+    the profile entirely. A profile ``[run] scratch_root`` is resolved against the
+    profile's own directory, matching ``load_settings``. Returns ``None`` when
+    neither source sets it, leaving the default to the caller."""
+
+    if override:
+        return Path(override).expanduser().resolve(strict=False)
+    resolved_repository = Path(repository).expanduser().resolve(strict=False)
+    default_profile = resolved_repository / ".autobuild.toml"
+    selected_profile = (
+        Path(profile_path).expanduser()
+        if profile_path is not None
+        else default_profile
+        if default_profile.is_file()
+        else None
+    )
+    document, resolved_profile = _load_document(selected_profile)
+    base = resolved_profile.parent if resolved_profile is not None else resolved_repository
+    run = _table(document, "run")
+    scratch_value = _optional_string(run.get("scratch_root"), "run.scratch_root")
+    return _resolve_path(scratch_value, base) if scratch_value else None
+
+
 def load_settings(
     repository: str | Path,
     profile_path: str | Path | None = None,
@@ -254,12 +488,20 @@ def load_settings(
     harness = _table(document, "harness")
     policy = _table(document, "policy")
     tracker = _table(document, "tracker")
+    preflight = _table(document, "preflight")
     refill = _table(document, "refill")
     knowledge = _table(document, "knowledge")
+    selection = _table(document, "selection")
+    progress = _table(document, "progress")
 
-    harness_name, builder, reviewer, specialist, validator_id = _required_settings(
-        run, models, validator, overrides
+    lanes, validator_id = _lanes_and_validator(
+        document, run, models, validator, overrides
     )
+    primary = lanes[0]
+    harness_name = primary.name
+    builder = primary.builder_model
+    reviewer = primary.reviewer_model
+    specialist = primary.specialist_model
     raw_harness_command = harness.get("command")
     if overrides.harness_command:
         harness_command = overrides.harness_command
@@ -273,14 +515,30 @@ def load_settings(
         else int(run.get("max_items", 20))
     )
     seat_timeout = float(run.get("seat_timeout_seconds", 900))
+    seat_stall = float(run.get("seat_stall_seconds", 900))
+    lease_stale = float(run.get("lease_stale_seconds", 1800))
     command_timeout = float(run.get("command_timeout_seconds", 600))
-    if max_items < 1 or seat_timeout <= 0 or command_timeout <= 0:
+    if (
+        max_items < 1
+        or seat_timeout <= 0
+        or seat_stall <= 0
+        or lease_stale <= 0
+        or command_timeout <= 0
+    ):
         raise ConfigurationError("run bounds and timeouts must be positive")
+    item_classes = _item_classes(run)
 
     scratch_value = overrides.scratch_root or _optional_string(
         run.get("scratch_root"), "run.scratch_root"
     )
     scratch_root = _resolve_path(scratch_value, base) if scratch_value else None
+    lane_state_value = overrides.lane_state_root or _optional_string(
+        run.get("lane_state_root"), "run.lane_state_root"
+    )
+    lane_state_root = _resolve_path(lane_state_value, base) if lane_state_value else None
+    lane_cool_seconds = float(run.get("lane_cool_seconds", 3600))
+    if lane_cool_seconds <= 0:
+        raise ConfigurationError("run.lane_cool_seconds must be a positive number of seconds")
     tracker_kind = (
         _optional_string(overrides.tracker_kind or tracker.get("kind"), "tracker.kind")
         or "auto"
@@ -309,6 +567,9 @@ def load_settings(
         if raw_knowledge_command is not None
         else None
     )
+    tls_targets = _tls_targets(preflight)
+    accepted_environment = _accepted_environment(preflight)
+    validator_budget_seconds = _budget_seconds(validator)
     fog_value = _optional_string(knowledge.get("fog_ledger"), "knowledge.fog_ledger")
     fog_ledger = _resolve_path(fog_value, base) if fog_value else None
     if (knowledge_command is None) != (fog_ledger is None):
@@ -319,6 +580,7 @@ def load_settings(
         raise ConfigurationError(
             "a refill plan containing fog requires knowledge.command and knowledge.fog_ledger"
         )
+    progress_command, progress_file, progress_stderr, progress_timeout = _progress(progress)
     return RunSettings(
         repository=resolved_repository,
         harness=harness_name,
@@ -328,15 +590,29 @@ def load_settings(
         specialist_model=specialist,
         validator_id=validator_id,
         validator_argv=_validator_argv(validator, overrides),
+        validator_budget_seconds=validator_budget_seconds,
         allowed_tools=_allowed_tools(policy, overrides),
         allowed_roots=_allowed_roots(policy, overrides, base),
         max_items=max_items,
         seat_timeout_seconds=seat_timeout,
+        seat_stall_seconds=seat_stall,
+        lease_stale_seconds=lease_stale,
+        item_classes=item_classes,
         command_timeout_seconds=command_timeout,
         scratch_root=scratch_root,
+        lanes=lanes,
+        lane_state_root=lane_state_root,
+        lane_cool_seconds=lane_cool_seconds,
         tracker_kind=tracker_kind,
         backlog_path=backlog_path,
+        selection=_selection(selection, overrides, resolved_profile),
+        tls_targets=tls_targets,
+        accepted_environment=accepted_environment,
         refill_plan=refill_plan,
         knowledge_command=knowledge_command,
         fog_ledger=fog_ledger,
+        progress_command=progress_command,
+        progress_file=progress_file,
+        progress_stderr=progress_stderr,
+        progress_command_timeout_seconds=progress_timeout,
     )

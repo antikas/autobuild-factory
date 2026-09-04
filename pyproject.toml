@@ -1,6 +1,6 @@
 [project]
 name = "autobuild-factory"
-version = "0.3.0"
+version = "0.4.0"
 description = "The software factory's build cycle, harness-neutral: logic once, mechanisms behind adapters."
 readme = "README.md"
 license = { file = "LICENSE" }

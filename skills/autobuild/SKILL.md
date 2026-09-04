@@ -20,10 +20,10 @@ autobuild run --repository <repo> --profile <profile> --harness <current-harness
 
 Use `--delivery-mode protected-default` only when the human has approved a merge and push to the repository's default branch. The local PR mode does not push unless the human also supplies `--push-current-branch`.
 
-If `autobuild` is not installed, run version 0.3.0 from the public release:
+If `autobuild` is not installed, run version 0.4.0 from the public release:
 
 ```text
-uvx --from autobuild-factory==0.3.0 autobuild run ...
+uvx --from autobuild-factory==0.4.0 autobuild run ...
 ```
 
 Supply `--scratch-root` only when the caller or machine has provided one. With no override, AutoBuild uses the operating system's standard temporary directory.

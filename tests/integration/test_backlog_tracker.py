@@ -133,6 +133,25 @@ def test_backlog_claim_close_and_proposal_use_separate_tracker_commits(
     ).split()[0]
 
 
+def test_backlog_ready_items_lists_ready_rows_in_table_order(tmp_path: Path) -> None:
+    repo = backlog_repo(tmp_path)
+    (repo / "BACKLOG.md").write_text(
+        "# Backlog\n\n"
+        "| Item | Title | Status | Brief |\n"
+        "|---|---|---|---|\n"
+        "| TST-001 | First | Ready | docs/brief.md |\n"
+        "| TST-002 | Second | Claimed by other | docs/brief.md |\n"
+        "| TST-003 | Third | Ready | docs/brief.md |\n",
+        encoding="utf-8",
+    )
+    tracker = BacklogTrackerAdapter(repo)
+
+    items = tracker.ready_items(CampaignRef("campaign", repo))
+
+    assert [item.item_id for item in items] == ["TST-001", "TST-003"]
+    assert items[0].brief_ref == "docs/brief.md"
+
+
 def test_backlog_refuses_a_claim_before_mutating_a_dirty_checkout(
     tmp_path: Path,
 ) -> None:
@@ -147,3 +166,24 @@ def test_backlog_refuses_a_claim_before_mutating_a_dirty_checkout(
         tracker.claim(item, "builder@proof")
 
     assert (repo / "BACKLOG.md").read_bytes() == before
+
+
+def test_backlog_resumable_claims_lists_only_builder_claimed_rows(tmp_path: Path) -> None:
+    repo = backlog_repo(tmp_path)
+    (repo / "BACKLOG.md").write_text(
+        "# Backlog\n\n"
+        "| Item | Title | Status | Brief |\n"
+        "|---|---|---|---|\n"
+        "| TST-001 | Interrupted | Claimed by builder@lane-one | docs/brief.md |\n"
+        "| TST-002 | Owned by a person | Claimed by alice | docs/brief.md |\n"
+        "| TST-003 | Finished | Done (abc123) | docs/brief.md |\n"
+        "| TST-004 | Set aside | Parked: resume:head-moved | docs/brief.md |\n"
+        "| TST-005 | Waiting | Ready | docs/brief.md |\n",
+        encoding="utf-8",
+    )
+    tracker = BacklogTrackerAdapter(repo)
+
+    claims = tracker.resumable_claims(CampaignRef("campaign", repo))
+
+    assert [item.item_id for item in claims] == ["TST-001"]
+    assert claims[0].brief_ref == "docs/brief.md"

@@ -9,3 +9,6 @@
 *.sh text eol=lf
 *.toml text eol=lf
 *.json text eol=lf
+# Harness-parsed surfaces stay LF on every host.
+skills/** text eol=lf
+scripts/** text eol=lf
