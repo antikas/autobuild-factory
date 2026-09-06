@@ -50,6 +50,14 @@ The `autobuild` skill reads the project configuration and launches the Python co
 
 The repository and source archive contain both skill folders. The Python wheel installs the `autobuild` command only. Install the skills through the coding assistant's normal skill method, or use their `SKILL.md` files from a checkout.
 
+## Coordinated mode: run the queue inside the coding assistant
+
+The `autobuild` skill offers a second mode at launch. In coordinated mode the coding-assistant session itself is the coordinator: it claims items, writes the briefs, dispatches a fresh builder seat and a fresh blind reviewer seat per item, adjudicates findings, integrates by merge, runs the post-merge validator in a detached worktree, closes the item in the tracker with an acceptance briefing, and keeps the campaign record. The project profile, tracker and validator are the same as in application mode; only the runner differs.
+
+Choose coordinated mode when the owner wants to watch and steer, when items are design-heavy and need judgment-tier seats, when stops are expected to become new items mid-campaign, or when the application is not installed. Choose the application for a long unattended mechanical queue.
+
+The mode is documented in [`skills/autobuild-coordinated/SKILL.md`](../skills/autobuild-coordinated/SKILL.md): the item cycle, the standing rules distilled from coordinated campaigns (`rules.md`), one adapter per runtime (`adapters/`), brief and record templates (`templates/`), the per-file staging, lane and scratch-audit scripts (`scripts/`), and the two custom agents a GitHub Copilot seat runs under (`agents/`). Install the skill folder through the coding assistant's normal skill method; for GitHub Copilot also install the two agent files to `~/.copilot/agents/` or a repository's `.github/agents/`.
+
 ## Project inputs for execution
 
 Stage 2 needs these project facts:
@@ -89,10 +97,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.4.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.4.0). Install the released command from PyPI:
+Release 0.5.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.5.0). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.4.0
+uv tool install autobuild-factory==0.5.0
 ```
 
 Check the command:
@@ -124,7 +132,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.4.0
+uv tool install autobuild-factory==0.5.0
 autobuild --help
 ```
 

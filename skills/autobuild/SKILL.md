@@ -1,12 +1,14 @@
 ---
 name: autobuild
-description: Run a repository's ready Pinax or BACKLOG.md queue through the released portable AutoBuild workflow. Use for requests such as "run the backlog", "burn down the backlog", or "autobuild this project". The skill configures and launches the Python command. The application owns the build sequence.
+description: Run a repository's ready Pinax or BACKLOG.md queue, either through the released AutoBuild application or, when the owner chooses coordinated mode at launch, inside this session with fresh builder and blind reviewer seats. Use for requests such as "run the backlog", "burn down the backlog", or "autobuild this project". The skill configures and launches the Python command. The application owns the build sequence.
 user-invocable: true
 ---
 
 # AutoBuild
 
-This skill collects the project settings and launches the released Python application. The application owns the complete campaign.
+This skill collects the project settings and launches the campaign in one of two modes. The application mode launches the released Python application, which owns the complete campaign. The coordinated mode runs the same method inside this session through the sibling skill `../autobuild-coordinated/SKILL.md`, with fresh builder and blind reviewer seats dispatched by this session.
+
+Choose the mode first. When the request names one ("run it with the application", "coordinate it here", "run it with subagents"), use it. Otherwise state the two modes in one line each with a recommendation (the application for a long unattended mechanical queue; coordinated when the owner wants to watch and steer, when items are design-heavy, or when the application is not installed) and ask the owner for one word. For the coordinated mode, read the sibling skill and follow it; the rest of this file is the application mode.
 
 Use the repository passed by the user. A bare invocation means the current repository only. Read its instructions and identify the operational tracker once. Use `pinax status --json` when `.ergon/` exists and [Pinax](https://github.com/antikas/pinax-tracker) is available. Otherwise check the supported `BACKLOG.md` or `docs/BACKLOG.md` table described in `docs/running-autobuild.md`. The application selects and takes the next item.
 
@@ -20,10 +22,10 @@ autobuild run --repository <repo> --profile <profile> --harness <current-harness
 
 Use `--delivery-mode protected-default` only when the human has approved a merge and push to the repository's default branch. The local PR mode does not push unless the human also supplies `--push-current-branch`.
 
-If `autobuild` is not installed, run version 0.4.0 from the public release:
+If `autobuild` is not installed, run version 0.5.0 from the public release:
 
 ```text
-uvx --from autobuild-factory==0.4.0 autobuild run ...
+uvx --from autobuild-factory==0.5.0 autobuild run ...
 ```
 
 Supply `--scratch-root` only when the caller or machine has provided one. With no override, AutoBuild uses the operating system's standard temporary directory.

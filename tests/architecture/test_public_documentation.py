@@ -38,6 +38,8 @@ def public_markdown() -> tuple[Path, ...]:
         ROOT / "README.md",
         *(ROOT / "docs").glob("*.md"),
         *(ROOT / "skills").glob("*/SKILL.md"),
+        *(ROOT / "skills").glob("*/*/*.md"),
+        *(ROOT / "skills").glob("*/*.md"),
     )
 
 
