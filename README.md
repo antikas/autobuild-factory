@@ -20,6 +20,7 @@ The workflow is harness-neutral. Claude Code, Codex and GitHub Copilot sit behin
 - `src/autobuild/enforcement/`: gates, validators and schemas
 - `skills/autobuild-plan/`: plans, reviews and registers an end-to-end queue, then stops before launch
 - `skills/autobuild/`: configures and launches the Python workflow against a ready queue
+- `skills/autobuild-coordinated/`: runs the same method inside a coding-assistant session with fresh builder and blind reviewer seats, chosen at launch instead of the application
 - `tests/`: the test lane
 
 ## Start here
@@ -28,7 +29,7 @@ The [setup and run guide](docs/running-autobuild.md) explains installation, harn
 
 AutoBuild has two stages. Use `autobuild-plan` for research, planning, independent review and tracker registration. After the owner approves that result, use `autobuild` to run the queue. [The operating guide starts with the planning stage](docs/running-autobuild.md#stage-1-plan-and-register-the-work).
 
-Release 0.4.0 is available from PyPI as [`autobuild-factory`](https://pypi.org/project/autobuild-factory/) and as a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.4.0). The guide also has a [macOS setup path](docs/running-autobuild.md#set-up-autobuild-on-macos) and [GitHub Copilot setup](docs/running-autobuild.md#github-copilot-cli).
+Release 0.5.0 is available from PyPI as [`autobuild-factory`](https://pypi.org/project/autobuild-factory/) and as a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.5.0). The guide also has a [macOS setup path](docs/running-autobuild.md#set-up-autobuild-on-macos) and [GitHub Copilot setup](docs/running-autobuild.md#github-copilot-cli).
 
 Platform and coding assistant are separate choices. You can use Codex on macOS, GitHub Copilot on Windows, or any other supported combination.
 
