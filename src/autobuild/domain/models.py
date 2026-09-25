@@ -24,6 +24,19 @@ class Seat(str, Enum):
     SPECIALIST = "specialist"
 
 
+class EffortLevel(str, Enum):
+    """How much a seat's model thinks before and between actions.
+
+    The levels are harness-neutral. Each harness adapter declares the levels it
+    can pass and maps a level onto its own command option."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+
+
 class SeatOutcome(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -446,10 +459,26 @@ class ItemExecutionSpec:
     push_current_branch: bool = False
     allow_current_branch_default: bool = False
     seat_stall_seconds: float = 900.0
+    # One (lane name, seat, level) entry per seat that sets an effort on a lane. A
+    # seat runs at the effort of the lane it runs on, so a seat that moves lanes
+    # after a limit takes the new lane's effort.
+    lane_efforts: tuple[tuple[str, Seat, EffortLevel], ...] = ()
+
+    def seat_effort(self, seat: Seat, lane: str) -> EffortLevel | None:
+        """The effort ``seat`` asks for on ``lane``, or None to leave the harness
+        default in force."""
+
+        for entry_lane, entry_seat, level in self.lane_efforts:
+            if entry_lane == lane and entry_seat is seat:
+                return level
+        return None
 
     def __post_init__(self) -> None:
         if not self.validator_id.strip() or not self.validator_argv:
             raise ValueError("item execution requires an approved validator")
+        entries = [(lane, seat) for lane, seat, _level in self.lane_efforts]
+        if len(entries) != len(set(entries)):
+            raise ValueError("lane_efforts sets the same seat more than once on one lane")
         if self.seat_timeout_seconds <= 0 or self.command_timeout_seconds <= 0:
             raise ValueError("execution timeouts must be positive")
         if self.seat_stall_seconds <= 0:
@@ -477,6 +506,8 @@ class SeatRequest:
     # callable the item workflow binds to the seat's own workspace.
     progress_deadline_seconds: float = 0.0
     progress_digest: Callable[[], str] | None = None
+    # None leaves the harness's own configured effort in force.
+    effort: EffortLevel | None = None
 
     def __post_init__(self) -> None:
         if self.timeout_seconds <= 0:
@@ -538,6 +569,7 @@ class SeatObservation:
     raw_output_ref: str
     stderr_ref: str
     lane: str = ""
+    effort: EffortLevel | None = None
 
 
 @dataclass(frozen=True, slots=True)

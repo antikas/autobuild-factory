@@ -22,6 +22,7 @@ from autobuild.domain import (
     CommandResult,
     DiffEvidence,
     DeliveryMode,
+    EffortLevel,
     EvidenceError,
     FogRecord,
     ItemDisposition,
@@ -39,6 +40,7 @@ from autobuild.domain import (
     ReviewVerdict,
     RunEvent,
     RunRecordRef,
+    Seat,
     SeatOutcome,
     SeatResult,
     SeatUsage,
@@ -1171,6 +1173,136 @@ def test_a_succeeded_seat_never_cools_the_lane_even_when_a_signal_is_available()
     assert state.cools == []
     assert ("item-1", "builder@lane-one") in ports.tracker.claims
     assert ("item-1", "builder@lane-two") not in ports.tracker.claims
+
+
+# --- Seat effort ---------------------------------------------------------------
+
+
+def _seat_payloads(ports: WorkflowPorts) -> list[dict]:
+    return [
+        dict(event.payload)
+        for event in ports.records.events
+        if event.event_type == "seat.completed"
+    ]
+
+
+def test_a_spec_without_efforts_sends_and_records_every_seat_without_effort() -> None:
+    ports = make_ports(
+        [builder(), review(ReviewDecision.ESCALATE), review(ReviewDecision.PASS, "specialist")],
+        [command()],
+        diff_count=1,
+    )
+
+    outcome = ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert [request.effort for request in ports.harness.requests] == [None, None, None]
+    assert [observation.effort for observation in outcome.seats] == [None, None, None]
+    assert [payload["effort"] for payload in _seat_payloads(ports)] == [None, None, None]
+
+
+def test_each_seat_request_and_observation_carries_its_own_effort() -> None:
+    ports = make_ports(
+        [builder(), review(ReviewDecision.ESCALATE), review(ReviewDecision.PASS, "specialist")],
+        [command()],
+        diff_count=1,
+    )
+    efforts = (
+        ("", Seat.BUILDER, EffortLevel.MEDIUM),
+        ("", Seat.REVIEWER, EffortLevel.HIGH),
+        ("", Seat.SPECIALIST, EffortLevel.MAX),
+    )
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), replace(spec(), lane_efforts=efforts), ports.records.create(campaign())
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    expected = [
+        (Seat.BUILDER, EffortLevel.MEDIUM),
+        (Seat.REVIEWER, EffortLevel.HIGH),
+        (Seat.SPECIALIST, EffortLevel.MAX),
+    ]
+    assert [(request.seat, request.effort) for request in ports.harness.requests] == expected
+    assert [(observation.seat, observation.effort) for observation in outcome.seats] == expected
+    assert [
+        (payload["seat"], payload["model_class"], payload["effort"])
+        for payload in _seat_payloads(ports)
+    ] == [
+        ("builder", "builder-class", "medium"),
+        ("reviewer", "reviewer-class", "high"),
+        ("specialist", "specialist-class", "max"),
+    ]
+
+
+def test_a_seat_that_moves_lanes_takes_the_effort_of_the_lane_it_runs_on() -> None:
+    ports, _state = lane_ports(
+        [failed_builder("one")],
+        [builder("two"), review(ReviewDecision.PASS)],
+        [command()],
+        diff_count=1,
+        one_signal=LaneSignal(LaneSignalKind.RATE_LIMIT),
+    )
+    efforts = (
+        ("lane-one", Seat.BUILDER, EffortLevel.MEDIUM),
+        ("lane-two", Seat.BUILDER, EffortLevel.HIGH),
+    )
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), replace(spec(), lane_efforts=efforts), ports.records.create(campaign())
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    one, two = (lane.harness for lane in ports.lanes)
+    assert [request.effort for request in one.requests] == [EffortLevel.MEDIUM]
+    assert [(request.seat, request.effort) for request in two.requests] == [
+        (Seat.BUILDER, EffortLevel.HIGH),
+        (Seat.REVIEWER, None),
+    ]
+    assert [(observation.lane, observation.effort) for observation in outcome.seats] == [
+        ("lane-one", EffortLevel.MEDIUM),
+        ("lane-two", EffortLevel.HIGH),
+        ("lane-two", None),
+    ]
+
+
+def test_a_lane_that_cannot_pass_the_seat_effort_never_runs_the_seat_without_it() -> None:
+    ports = make_ports([builder()], [], diff_count=0)
+    ports.harness.effort_levels = frozenset({EffortLevel.LOW})
+    efforts = (("", Seat.BUILDER, EffortLevel.HIGH),)
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), replace(spec(), lane_efforts=efforts), ports.records.create(campaign())
+    )
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert "cannot pass effort high" in (outcome.reason or "")
+    assert ports.harness.requests == []
+
+
+def test_a_spec_with_efforts_stays_hashable_and_equal_by_value() -> None:
+    efforts = (
+        ("lane-one", Seat.BUILDER, EffortLevel.MEDIUM),
+        ("lane-two", Seat.REVIEWER, EffortLevel.HIGH),
+    )
+    first = replace(spec(), lane_efforts=efforts)
+    second = replace(spec(), lane_efforts=tuple(efforts))
+
+    assert hash(first) == hash(second)
+    assert {first, second} == {first}
+    assert first.seat_effort(Seat.BUILDER, "lane-one") is EffortLevel.MEDIUM
+    assert first.seat_effort(Seat.REVIEWER, "lane-one") is None
+    assert first.seat_effort(Seat.BUILDER, "lane-three") is None
+
+
+def test_a_spec_that_sets_one_seat_twice_on_a_lane_is_refused() -> None:
+    efforts = (
+        ("lane-one", Seat.BUILDER, EffortLevel.MEDIUM),
+        ("lane-one", Seat.BUILDER, EffortLevel.HIGH),
+    )
+
+    with pytest.raises(ValueError, match="same seat more than once on one lane"):
+        replace(spec(), lane_efforts=efforts)
 
 
 # --- Automatic resume from a good state ---------------------------------------

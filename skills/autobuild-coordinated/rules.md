@@ -1,6 +1,6 @@
 # Standing rules for a coordinated campaign
 
-These rules came from campaigns that ran the method by hand. Each states the failure it prevents. A brief that departs from one names the departure and the reason.
+Each rule states the failure it prevents. A brief that departs from one names the departure and the reason.
 
 ## Commands and history
 
@@ -42,6 +42,6 @@ These rules came from campaigns that ran the method by hand. Each states the fai
 
 ## Seats and tiers
 
-- Fresh seats and a blind reviewer are the mechanism, not the ceremony. Every first review in the reference campaign found a defect the green validator had missed, in more than half the items a contract-level one. The builder's own validator run is pre-review evidence, never acceptance.
-- Design-heavy items take the review-tier model for the builder as well; mechanical items take the build tier and are corrected once each. The profile carries one builder, reviewer and specialist tier; the coordinator raises a design-heavy item's builder to the reviewer tier and records the choice in the campaign record.
+- Fresh seats and a blind reviewer are the mechanism, not the ceremony. A first blind review regularly finds a defect the green validator missed, often at the level of the contract. The builder's own validator run is pre-review evidence, never acceptance.
+- Design-heavy items take the review-tier model for the builder as well; mechanical items take the build tier and are corrected once each. The profile carries one builder, reviewer and specialist tier, each with an effort beside it; the coordinator raises a design-heavy item's builder to the reviewer tier, keeps the builder effort unless it records a different choice, and records the choice in the campaign record.
 - The meter is read before every seat and after every item; the gates are recorded even when they never bind.

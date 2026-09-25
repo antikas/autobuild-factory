@@ -8,7 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from autobuild.domain import CampaignSelection, FogRecord, Proposal, RefillPlan
+from autobuild.domain import (
+    CampaignSelection,
+    EffortLevel,
+    FogRecord,
+    Proposal,
+    RefillPlan,
+    Seat,
+)
 
 
 class ConfigurationError(ValueError):
@@ -38,12 +45,27 @@ class ProfileOverrides:
 
 @dataclass(frozen=True, slots=True)
 class LaneProfile:
-    """One harness lane's name and its per-seat model names."""
+    """One harness lane's name and its per-seat model names and effort levels.
+
+    An effort of None means the seat sets no effort on this lane."""
 
     name: str
     builder_model: str
     reviewer_model: str
     specialist_model: str
+    builder_effort: EffortLevel | None = None
+    reviewer_effort: EffortLevel | None = None
+    specialist_effort: EffortLevel | None = None
+
+    def efforts(self) -> dict[Seat, EffortLevel]:
+        """The seats that set an effort on this lane, with their levels."""
+
+        configured = (
+            (Seat.BUILDER, self.builder_effort),
+            (Seat.REVIEWER, self.reviewer_effort),
+            (Seat.SPECIALIST, self.specialist_effort),
+        )
+        return {seat: effort for seat, effort in configured if effort is not None}
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +238,61 @@ def _required_settings(
     return harness, builder, reviewer, specialist or reviewer, validator_id
 
 
+def _effort(value: object, label: str) -> EffortLevel | None:
+    if value is None:
+        return None
+    accepted = tuple(level.value for level in EffortLevel)
+    if not isinstance(value, str) or value not in accepted:
+        raise ConfigurationError(f"{label} must be one of: " + ", ".join(accepted))
+    return EffortLevel(value)
+
+
+_EFFORT_KEYS = ("builder_effort", "reviewer_effort", "specialist_effort")
+
+
+def _seat_efforts(
+    table: Mapping[str, Any], prefix: str
+) -> tuple[EffortLevel | None, EffortLevel | None, EffortLevel | None]:
+    """Read ``builder_effort``, ``reviewer_effort`` and ``specialist_effort`` from
+    one model table; an absent ``specialist_effort`` takes ``reviewer_effort``."""
+
+    builder, reviewer, specialist = (
+        _effort(table.get(key), f"{prefix}.{key}") for key in _EFFORT_KEYS
+    )
+    return builder, reviewer, specialist if specialist is not None else reviewer
+
+
+def _refuse_unread_efforts(table: Mapping[str, Any], prefix: str, reason: str) -> None:
+    """Refuse an effort key in a table this profile form does not read, since the
+    effort would apply to no seat. ``reason`` may name the key as ``{key}``."""
+
+    for key in _EFFORT_KEYS:
+        if key in table:
+            raise ConfigurationError(f"{prefix}.{key} {reason.format(key=key)}")
+
+
+def _refuse_lane_efforts_without_lanes(document: Mapping[str, Any]) -> None:
+    lanes_table = document.get("lanes")
+    if not isinstance(lanes_table, Mapping):
+        return
+    for name, table in lanes_table.items():
+        if isinstance(table, Mapping):
+            _refuse_unread_efforts(
+                table,
+                f"lanes.{name}",
+                "is not used: lane tables are read only when run.lanes is set; "
+                "set {key} in [models]",
+            )
+
+
+def _refuse_duplicate_lanes(order: list[str]) -> None:
+    duplicates = sorted({name for name in order if order.count(name) > 1})
+    if duplicates:
+        raise ConfigurationError(
+            "run.lanes names a lane more than once: " + ", ".join(duplicates)
+        )
+
+
 def _lane_profile(lanes_table: Mapping[str, Any], name: str) -> LaneProfile:
     table = lanes_table.get(name)
     if not isinstance(table, Mapping):
@@ -234,7 +311,13 @@ def _lane_profile(lanes_table: Mapping[str, Any], name: str) -> LaneProfile:
     if missing:
         raise ConfigurationError("missing lane configuration: " + ", ".join(missing))
     assert builder is not None and reviewer is not None
-    return LaneProfile(name, builder, reviewer, specialist or reviewer)
+    return LaneProfile(
+        name,
+        builder,
+        reviewer,
+        specialist or reviewer,
+        *_seat_efforts(table, f"lanes.{name}"),
+    )
 
 
 def _lanes_and_validator(
@@ -254,7 +337,13 @@ def _lanes_and_validator(
     validator_id = _optional_string(overrides.validator_id or validator.get("id"), "validator.id")
     run_lanes = run.get("lanes")
     if run_lanes is not None:
+        _refuse_unread_efforts(
+            models,
+            "models",
+            "is not used when run.lanes is set; set {key} in the [lanes.<harness>] tables",
+        )
         order = list(_string_list(run_lanes, "run.lanes"))
+        _refuse_duplicate_lanes(order)
         selected = _optional_string(overrides.harness, "--harness")
         if selected is not None:
             if selected not in order:
@@ -267,10 +356,14 @@ def _lanes_and_validator(
         if validator_id is None:
             raise ConfigurationError("missing required run configuration: validator.id")
         return lanes, validator_id
+    _refuse_lane_efforts_without_lanes(document)
     harness, builder, reviewer, specialist, validator_id = _required_settings(
         run, models, validator, overrides
     )
-    return (LaneProfile(harness, builder, reviewer, specialist),), validator_id
+    lane = LaneProfile(
+        harness, builder, reviewer, specialist, *_seat_efforts(models, "models")
+    )
+    return (lane,), validator_id
 
 
 def _validator_argv(

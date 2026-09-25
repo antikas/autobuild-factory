@@ -57,7 +57,8 @@ class LeaseHeld(AutoBuildError):
     """A live single-writer lease names another holder for the same surface.
 
     The campaign refuses to write into a surface a live campaign owns. There is
-    no automatic take-over: the founder rule is that the holder is stopped first.
+    no automatic take-over: the holder is stopped first, so two campaigns never
+    write the same surface.
     The held record is carried so the message names the holder."""
 
     def __init__(self, record: "LeaseRecord") -> None:

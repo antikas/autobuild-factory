@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from autobuild.adapters.harness_cli import CliHarnessAdapter, _safe_name
-from autobuild.domain import LaneSignal, SeatRequest, SeatResult
+from autobuild.domain import EffortLevel, LaneSignal, SeatRequest, SeatResult
 from autobuild.ports import CommandPort
 
 
@@ -16,6 +16,7 @@ class CopilotCliHarnessAdapter(CliHarnessAdapter):
     # Source: the cross-tool Console Do Not Track standard. The Copilot CLI already
     # runs with remote export and custom instructions disabled by argv.
     telemetry_environment = (("DO_NOT_TRACK", "1"),)
+    effort_levels = frozenset(EffortLevel)
 
     def __init__(
         self,
@@ -53,8 +54,12 @@ class CopilotCliHarnessAdapter(CliHarnessAdapter):
         authenticated = result.exit_code == 0
         return authenticated, "GitHub CLI authentication fallback is available" if authenticated else "GitHub Copilot is not authenticated"
 
+    def _effort_option(self, level: str) -> tuple[str, ...]:
+        return (f"--reasoning-effort={level}",)
+
     def _invocation(self, request: SeatRequest, run_ref: str):
         self._require_known_tools(request.tool_policy.allowed_tools)
+        effort = self._effort_arguments(request)
         availability = {
             "read": ("view", "glob", "grep"),
             "write": ("apply_patch", "create", "edit"),
@@ -109,6 +114,7 @@ class CopilotCliHarnessAdapter(CliHarnessAdapter):
             "--prompt",
             "-",
             f"--model={self._model(request.model_class)}",
+            *effort,
             "--session-id",
             str(uuid4()),
             f"--available-tools={available}",

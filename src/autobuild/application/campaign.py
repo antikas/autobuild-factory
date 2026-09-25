@@ -55,7 +55,8 @@ _RESUMABLE_MARKER_STATES = frozenset(
     }
 )
 # The marker states whose recorded workspace revision must still match the live
-# worktree digest for a good resume, per the founder ruling.
+# worktree digest for a good resume, so a worktree changed after the marker is
+# never resumed as if it were the recorded one.
 _DIGEST_CHECK_STATES = frozenset(
     {ItemState.BUILT.value, ItemState.VALIDATED.value, ItemState.REVIEWED.value}
 )

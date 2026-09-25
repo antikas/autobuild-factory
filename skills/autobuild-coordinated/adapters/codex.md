@@ -4,7 +4,7 @@ The protocol in `SKILL.md` and `rules.md` is unchanged here. This file maps its 
 
 ## Seats
 
-Codex has no in-session subagent tool. A fresh seat is a separate `codex exec` process started from the coordinator's shell, the same way the AutoBuild application drives its Codex harness:
+Codex has no in-session subagent tool. A fresh seat is a separate `codex exec` process started from the coordinator's shell, the same way the AutoBuild application drives its Codex harness. This command passes no effort, so a seat runs at the effort Codex is configured with, whatever the profile names:
 
 ```text
 codex -a never -s <workspace-write | read-only> -C <lane-path> -m <tier> exec --ephemeral --ignore-rules --json \

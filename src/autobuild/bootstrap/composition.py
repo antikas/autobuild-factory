@@ -32,13 +32,14 @@ from autobuild.adapters import (
 from autobuild.application import CampaignRunner, Lane, WorkflowPorts
 from autobuild.bootstrap.builtins import register_first_party_harnesses
 from autobuild.bootstrap.environment import configure_scratch_environment
-from autobuild.bootstrap.profile import ConfigurationError, RunSettings
+from autobuild.bootstrap.profile import ConfigurationError, LaneProfile, RunSettings
 from autobuild.bootstrap.registry import AdapterRegistry
 from autobuild.domain import (
     AdapterIdentity,
     CampaignContext,
     CampaignRef,
     DeliveryMode,
+    EffortLevel,
     ItemExecutionSpec,
     LaneSignal,
     LaneSignalKind,
@@ -89,6 +90,22 @@ def _probe(name: str, adapter: object) -> tuple[str, str, str]:
 _REQUIRED_HARNESS_CAPABILITIES = frozenset({"fresh-seat", "cancel", "typed-result", "usage"})
 
 
+def _require_lane_efforts(lane: LaneProfile, adapter: object) -> None:
+    """Refuse the launch when a lane sets a seat effort its adapter cannot pass.
+
+    An adapter states the levels it can pass in ``effort_levels``; one that
+    states none cannot run any seat with an effort."""
+
+    accepted = getattr(adapter, "effort_levels", frozenset())
+    for seat, effort in lane.efforts().items():
+        if effort not in accepted:
+            levels = ", ".join(level.value for level in EffortLevel if level in accepted)
+            raise ConfigurationError(
+                f"lane {lane.name} sets {seat.value} effort {effort.value}, which its "
+                f"harness adapter cannot pass (accepted: {levels or 'none'})"
+            )
+
+
 def _build_lanes(
     settings: RunSettings,
     command: object,
@@ -98,19 +115,18 @@ def _build_lanes(
 ):
     """Build one harness per configured lane in preference order.
 
-    Each lane's adapter is probed at launch. A lane whose executable is missing,
-    unauthenticated or lacking a required capability is cooled with the ``probe``
-    signature so the router skips it; the first capable lane is the active lane
-    for this launch. When no lane is capable the launch fails."""
+    Every lane's seat efforts are checked against its adapter before any lane is
+    probed, so a refused effort stops the launch with no probe run and no lane
+    cooled. Each lane's adapter is then probed. A lane whose executable is
+    missing, unauthenticated or lacking a required capability is cooled with the
+    ``probe`` signature so the router skips it; the first capable lane is the
+    active lane for this launch. When no lane is capable the launch fails."""
 
     registry = AdapterRegistry()
     register_first_party_harnesses(registry)
     registry.load_entry_points()
     single = len(settings.lanes) == 1
-    lanes: list[tuple[str, object]] = []
-    lane_manifest: list[dict[str, object]] = []
-    active: tuple[str, object, AdapterIdentity] | None = None
-    diagnostics: list[str] = []
+    created: list[tuple[LaneProfile, object]] = []
     for lane in settings.lanes:
         config: dict[str, object] = {
             "command_port": command,
@@ -124,6 +140,13 @@ def _build_lanes(
         if single and settings.harness_command is not None:
             config["command"] = settings.harness_command
         adapter = registry.create(PortKind.HARNESS, lane.name, config)
+        _require_lane_efforts(lane, adapter)
+        created.append((lane, adapter))
+    lanes: list[tuple[str, object]] = []
+    lane_manifest: list[dict[str, object]] = []
+    active: tuple[str, object, AdapterIdentity] | None = None
+    diagnostics: list[str] = []
+    for lane, adapter in created:
         probe = adapter.probe()
         capabilities = getattr(adapter, "capabilities", frozenset())
         missing = _REQUIRED_HARNESS_CAPABILITIES - capabilities
@@ -550,6 +573,12 @@ def _specification(
     push_current_branch: bool,
     allow_current_branch_default: bool,
 ):
+    lane_efforts = tuple(
+        (lane.name, seat, effort)
+        for lane in settings.lanes
+        for seat, effort in lane.efforts().items()
+    )
+
     def for_item(item) -> ItemExecutionSpec:
         brief_path = Path(item.brief_ref).expanduser()
         brief_text = _read_brief_text(settings.repository, brief_path)
@@ -572,6 +601,7 @@ def _specification(
             builder_model_class="builder",
             reviewer_model_class="reviewer",
             specialist_model_class="specialist",
+            lane_efforts=lane_efforts,
             seat_timeout_seconds=seat_timeout,
             seat_stall_seconds=settings.seat_stall_seconds,
             command_timeout_seconds=settings.command_timeout_seconds,

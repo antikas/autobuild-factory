@@ -28,9 +28,9 @@ Choose the application when the queue is mechanical, unattended and long, or whe
 ## Preconditions
 
 - An approved queue: Pinax (`pinax status` shows ready items with briefs) or a `BACKLOG.md` in the AutoBuild format.
-- A project profile `.autobuild.toml` naming the builder, reviewer and specialist model tiers, the validator command (`[validator] argv`) and the tool policy. If it is absent, ask the owner for those facts once and write the profile before the first claim.
+- A project profile `.autobuild.toml` naming the builder, reviewer and specialist model tiers, optionally an effort beside each tier (the Claude Code adapter starts each seat at it; the Codex and GitHub Copilot adapters run seats at the assistant's own configured effort), the validator command (`[validator] argv`) and the tool policy. If it is absent, ask the owner for those facts once and write the profile before the first claim.
 - A campaign environment file, written once from `templates/env.sh`: it points every temporary and cache path at the scratch root and sets whatever the validator needs. Every seat sources it before every command.
-- The inputs the briefs name, resolved once per campaign and written into the campaign record: the constraints file (the project's constraints document, or the brief's own Constraints section when the project has none); the validator command from the profile; the map probe, when the project has a path-mapped validator, otherwise the validator command itself; the records directory (`docs/campaigns/` unless the project names another); and the report line budgets (40 lines for a builder, 30 for a reviewer unless the item needs more).
+- The inputs the briefs name, resolved once per campaign and written into the campaign record: the constraints file (the project's constraints document, or the brief's own Constraints section when the project has none); the validator command from the profile; the map probe, when the project has a path-mapped validator, otherwise the validator command itself; the records directory (`docs/campaigns/` unless the project names another); and the builder's report line budget (40 lines unless the item needs more); a reviewer's report lists every finding with its severity and confidence and is kept short enough to read in one pass.
 - A scratch root on the build drive, given to every seat. Nothing is written to the operating system's temporary directory. The `scripts/audit_scratch.sh` check runs after every item.
 - Lanes: one reusable Git worktree per parallel lane (`scripts/lane.sh new <lane> <branch>`), each with its own bootstrapped environment, and one detached worktree for the post-merge master lane (`scripts/lane.sh master-lane`). The main tree is never a lane.
 - The subscription or usage meter, when the runtime has one: read before every seat and after every item, warn at the owner's warning level, stop at the owner's stop level.
@@ -38,7 +38,7 @@ Choose the application when the queue is mechanical, unattended and long, or whe
 ## The item cycle
 
 1. Claim. `pinax claim <id>` (or mark the BACKLOG item in progress) and commit the tracker change. The coordinator commits; builders never touch the tracker.
-2. Brief. Write the builder brief from `templates/builder-brief.md`: the item brief, the constraints file, the paths the item owns, the shell rules, the scratch path, the pre-review checklist and the return contract. Name the model tier from the profile.
+2. Brief. Write the builder brief from `templates/builder-brief.md`: the item brief, the constraints file, the paths the item owns, the shell rules, the scratch path, the pre-review checklist and the return contract. Name the model tier and effort from the profile.
 3. Build. Dispatch the builder in its lane through the runtime adapter. Wait for its report. Treat its validator run as pre-review evidence, never as acceptance.
 4. Freeze. Nothing runs in the lane while a reviewer reads it. A reviewer's report ends with the line "nothing running"; no fold or correction starts before that line arrives.
 5. Review. Dispatch a fresh reviewer with `templates/reviewer-brief.md` against the frozen lane. The reviewer re-drives red proofs on scratch copies, rebuilds what the builder claims to have built, and compares generated trees against the base branch.
@@ -60,8 +60,8 @@ The coordinator alone writes the tracker, always with an actor, and commits trac
 
 - Campaign record: one file per campaign under the project's records directory, with the table from `templates/campaign-record.md` and dated entries for every dispatch, verdict, fix-forward, incident and ruling.
 - Item briefing: one file per accepted item, committed with the tracker close.
-- Process record: the method lessons of the campaign, written as they happen, harvested at close into the owning method document.
-- Daily record: a line for a release, an evidence-boundary change or a material capability change.
+- Process record: the method lessons of the campaign, written as they happen, harvested at close into the project's method documentation.
+- Change log: a line for a release, an evidence-boundary change or a material capability change, wherever the project records its changes.
 
 ## Fix-forwards
 

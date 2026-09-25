@@ -56,7 +56,7 @@ The `autobuild` skill offers a second mode at launch. In coordinated mode the co
 
 Choose coordinated mode when the owner wants to watch and steer, when items are design-heavy and need judgment-tier seats, when stops are expected to become new items mid-campaign, or when the application is not installed. Choose the application for a long unattended mechanical queue.
 
-The mode is documented in [`skills/autobuild-coordinated/SKILL.md`](../skills/autobuild-coordinated/SKILL.md): the item cycle, the standing rules distilled from coordinated campaigns (`rules.md`), one adapter per runtime (`adapters/`), brief and record templates (`templates/`), the per-file staging, lane and scratch-audit scripts (`scripts/`), and the two custom agents a GitHub Copilot seat runs under (`agents/`). Install the skill folder through the coding assistant's normal skill method; for GitHub Copilot also install the two agent files to `~/.copilot/agents/` or a repository's `.github/agents/`.
+The mode is documented in [`skills/autobuild-coordinated/SKILL.md`](../skills/autobuild-coordinated/SKILL.md): the item cycle, the standing rules distilled from coordinated campaigns (`rules.md`), one adapter per runtime (`adapters/`), brief and record templates (`templates/`), the per-file staging, lane and scratch-audit scripts (`scripts/`), and the seat agent definitions (`agents/`). `agents/` holds the two custom agents a GitHub Copilot seat runs under and, in `agents/claude-code/`, the Claude Code seat definitions, one per effort level, which start each Claude Code seat at the profile's effort for that seat, or at `high` when the profile sets none. Install the skill folder through the coding assistant's normal skill method; for GitHub Copilot also install the two agent files to `~/.copilot/agents/` or a repository's `.github/agents/`. The [Claude Code adapter](../skills/autobuild-coordinated/adapters/claude-code.md) describes where the Claude Code seat definitions install.
 
 ## Project inputs for execution
 
@@ -97,10 +97,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.5.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.5.0). Install the released command from PyPI:
+Release 0.6.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.6.0). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.5.0
+uv tool install autobuild-factory==0.6.0
 ```
 
 Check the command:
@@ -132,7 +132,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.5.0
+uv tool install autobuild-factory==0.6.0
 autobuild --help
 ```
 
@@ -424,6 +424,18 @@ allowed_roots = []
 
 Use model names accepted by the selected harness. AutoBuild records the configured names and passes them to the harness command.
 
+`builder_effort`, `reviewer_effort`, and `specialist_effort` are optional. Each one sets how much that seat's model thinks before and between actions, which is the main control over the seat's cost and time. The accepted values are `low`, `medium`, `high`, `xhigh`, and `max`. Any other value stops the launch with an error that names the key. `specialist_effort` defaults to `reviewer_effort`. When a key is absent, AutoBuild passes no effort for that seat and the harness applies its own configured default. In this single-lane form the effort keys belong in `[models]`; an effort key in a `[lanes.<harness>]` table stops the launch with an error that names it, because lane tables are read only when `run.lanes` is set.
+
+```toml
+[models]
+builder = "gpt-5.6-sol"
+reviewer = "gpt-5.6-sol"
+builder_effort = "medium"
+reviewer_effort = "high"
+```
+
+In this example the specialist runs at `high`, the reviewer effort. Each harness adapter passes the level through its own command option, listed in [Harness adapters](harness-adapters.md#seat-effort). The `seat.completed` run event records the effort AutoBuild requested for each seat. AutoBuild checks the level only against the harness adapter; whether the model applies it is decided by the harness when the seat starts. GitHub Copilot CLI 1.0.88 or later reports a level the model does not offer and leaves it unapplied, and Codex passes any level to its service, so choose a level the selected model offers.
+
 ### Validator settings
 
 `id` is a stable name for the validator evidence.
@@ -494,14 +506,18 @@ lane_cool_seconds = 3600
 lane_state_root = "/path/to/local/lane-state"
 
 [lanes.claude-code]
-builder = "claude-opus-4-8"
-reviewer = "claude-opus-4-8"
-specialist = "claude-opus-4-8"
+builder = "claude-opus-5-5"
+reviewer = "claude-opus-5-5"
+specialist = "claude-opus-5-5"
+builder_effort = "medium"
+reviewer_effort = "high"
 
 [lanes.codex]
 builder = "gpt-5.6-sol"
 reviewer = "gpt-5.6-sol"
 specialist = "gpt-5.6-sol"
+builder_effort = "high"
+reviewer_effort = "high"
 
 [lanes.github-copilot]
 builder = "gpt-5.6"
@@ -509,7 +525,7 @@ reviewer = "gpt-5.6"
 specialist = "gpt-5.6"
 ```
 
-`run.lanes` names the lanes in order of preference. Each name must have a `[lanes.<harness>]` table with `builder` and `reviewer` model names; `specialist` is optional and defaults to the reviewer model. Lane choice is made at launch: preflight probes every listed lane, cools any lane whose executable is missing, unauthenticated or lacking a required capability with the `probe` signature, and starts the first capable lane. Pass `--harness <name>` to move a listed lane to the front for one launch.
+`run.lanes` names the lanes in order of preference. Each name must have a `[lanes.<harness>]` table with `builder` and `reviewer` model names; `specialist` is optional and defaults to the reviewer model. Each lane table also accepts the optional `builder_effort`, `reviewer_effort`, and `specialist_effort` keys, with the values and defaults described in "Model settings". Effort belongs to the lane: a seat runs at the effort its current lane sets, so a seat that moves to the next lane after a limit takes that lane's effort, and a lane without the key passes no effort and uses its harness default. In the example the `github-copilot` lane sets no effort. `[models]` is not read when `run.lanes` is set, so an effort key there stops the launch with an error that names the key and points to the lane tables. Before any lane is probed, AutoBuild refuses to launch when a lane sets an effort its harness adapter cannot pass, and the error names the lane and the seat. A name listed twice in `run.lanes` also stops the launch, with an error that names it. Lane choice is made at launch: preflight probes every listed lane, cools any lane whose executable is missing, unauthenticated or lacking a required capability with the `probe` signature, and starts the first capable lane. Pass `--harness <name>` to move a listed lane to the front for one launch.
 
 When a seat hits a structural limit on the active lane, that lane cools and the seat re-runs on the next capable lane. A limit is read only from the harness CLI's exit code and structured error fields, never from words in the event stream, so a report that mentions "rate limit" in prose with a clean exit and a valid result never cools a lane. When the vendor supplies a reset time the lane cools until then; otherwise it cools for `run.lane_cool_seconds` (default 3600). When no capable lane remains, the item parks with the lane signature, its worktree evidence is kept, and the campaign stops with the `lanes_exhausted` reason.
 
@@ -658,7 +674,7 @@ The command prints `autobuild.campaign-result.v1` JSON. It includes:
 
 At the end of every campaign AutoBuild commits a report to `docs/campaigns/<campaign-id>.md` in the repository. The report lists Shipped items with their item and merged commits, Parked items with reasons, Failed items with errors, Follow-ups created during the campaign, the Next ready item, and a per-item table of seat durations and token usage. When the campaign runs with an allow-list, the report also lists every allowed item it left unbuilt with a reason: not ready, blocked, excluded, item bound, or lanes exhausted. The report commit is a tracker-class commit that touches only that path and is delivered through the selected delivery mode: pushed in `protected-default`, kept local in `current-branch-pr`.
 
-Every run event carries a real UTC timestamp and a JSON payload. The `campaign.started` payload names the harness, models, item bound, delivery mode, validator id, and manifest path. A `seat.completed` payload is written for each builder, reviewer, and specialist invocation with the seat, model class, resolved model, outcome, exit code, start and end times, duration, input and output tokens, cost, and raw output and stderr references. The `validation.completed`, `review.completed`, `specialist.completed`, `item.parked`, `item.finalised`, and `campaign.completed` events carry their own payload fields. An `item.correcting` event is appended when an item enters a correction round, with its `round` and the `triggering_evidence_ref` of the review that asked for the change.
+Every run event carries a real UTC timestamp and a JSON payload. The `campaign.started` payload names the harness, models, item bound, delivery mode, validator id, and manifest path. A `seat.completed` payload is written for each builder, reviewer, and specialist invocation with the seat, model class, requested effort (`null` when the seat requested none), resolved model, outcome, exit code, start and end times, duration, input and output tokens, cost, and raw output and stderr references. The `validation.completed`, `review.completed`, `specialist.completed`, `item.parked`, `item.finalised`, and `campaign.completed` events carry their own payload fields. An `item.correcting` event is appended when an item enters a correction round, with its `round` and the `triggering_evidence_ref` of the review that asked for the change.
 
 Each run directory also holds `progress.log`, the plain-language progress lines rendered from those same events, one per line and prefixed with the event UTC timestamp. The lines cover the campaign start, each item claim, seat completion, validation, review decision, correction round, park, delivery, and the campaign completion counts and report path.
 

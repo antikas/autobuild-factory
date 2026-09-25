@@ -17,6 +17,7 @@ from autobuild.domain import (
     BuilderReport,
     CapabilityError,
     CommandRequest,
+    EffortLevel,
     EvidenceError,
     LaneSignal,
     LaneSignalKind,
@@ -225,6 +226,9 @@ class CliHarnessAdapter:
     # the Console Do Not Track standard (https://consoledonottrack.com/), honoured
     # by an increasing number of CLI tools. Subclasses add vendor-specific names.
     telemetry_environment: tuple[tuple[str, str], ...] = (("DO_NOT_TRACK", "1"),)
+    # The effort levels this adapter can pass to its command. A seat asking for any
+    # other level is refused, never run without its effort.
+    effort_levels: frozenset[EffortLevel] = frozenset()
 
     def __init__(
         self,
@@ -464,6 +468,20 @@ class CliHarnessAdapter:
 
     def _model(self, model_class: str) -> str:
         return self._model_map.get(model_class, model_class)
+
+    def _effort_arguments(self, request: SeatRequest) -> tuple[str, ...]:
+        """The command arguments that set the seat's effort; none when it sets none."""
+
+        if request.effort is None:
+            return ()
+        if request.effort not in self.effort_levels:
+            raise CapabilityError(
+                f"{self.adapter_name} cannot pass effort {request.effort.value} to its command"
+            )
+        return self._effort_option(request.effort.value)
+
+    def _effort_option(self, level: str) -> tuple[str, ...]:
+        raise NotImplementedError
 
     def _write_schema(self, run_ref: str, contract: str) -> Path:
         root = self._output_root / "contracts"

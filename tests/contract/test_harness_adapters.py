@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -16,6 +18,7 @@ from autobuild.domain import (
     AdapterIdentity,
     CapabilityError,
     CommandResult,
+    EffortLevel,
     EvidenceError,
     LaneSignalKind,
     ReviewDecision,
@@ -633,6 +636,177 @@ def test_claude_streams_materialised_large_evidence_instead_of_argv(tmp_path: Pa
     prompt = Path(dispatched.stdin_ref).read_text(encoding="utf-8")
     assert "APPROVED-BRIEF-CONTENT" in prompt
     assert "D" * 200_000 in prompt
+
+
+FIXED_SESSION = UUID("00000000-0000-4000-8000-000000000001")
+
+
+@pytest.fixture
+def fixed_session(monkeypatch: pytest.MonkeyPatch) -> str:
+    monkeypatch.setattr("autobuild.adapters.claude_harness.uuid4", lambda: FIXED_SESSION)
+    monkeypatch.setattr("autobuild.adapters.copilot_harness.uuid4", lambda: FIXED_SESSION)
+    return str(FIXED_SESSION)
+
+
+def pinned_claude_vector(tmp_path: Path, session: str) -> tuple[str, ...]:
+    schema = json.dumps(result_schema("review-verdict-v1"), separators=(",", ":"))
+    return (
+        sys.executable,
+        "--print",
+        "--safe-mode",
+        "--no-session-persistence",
+        "--permission-mode",
+        "dontAsk",
+        "--append-system-prompt",
+        "Your final action must be the structured output matching this schema, "
+        f"with no extra fields: {schema}. Do not end on a question or a report in prose.",
+        "--session-id",
+        session,
+        "--model",
+        "model-id",
+        "--tools",
+        "Glob,Grep,Read",
+        "--allowedTools",
+        "Glob,Grep,Read",
+        "--output-format",
+        "json",
+        "--json-schema",
+        schema,
+    )
+
+
+def pinned_codex_vector(tmp_path: Path, session: str) -> tuple[str, ...]:
+    output_root = (tmp_path / "harness").resolve()
+    return (
+        sys.executable,
+        "-a",
+        "never",
+        "-s",
+        "read-only",
+        "-C",
+        str(tmp_path / "worktree"),
+        "-m",
+        "model-id",
+        "exec",
+        "--ephemeral",
+        "--ignore-rules",
+        "--json",
+        "--output-schema",
+        str(output_root / "contracts" / "run-item-reviewer.schema.json"),
+        "-o",
+        str(output_root / "last-messages" / "run-item-reviewer.json"),
+        "-",
+    )
+
+
+def pinned_copilot_vector(tmp_path: Path, session: str) -> tuple[str, ...]:
+    output_root = (tmp_path / "harness").resolve()
+    return (
+        sys.executable,
+        "-C",
+        str(tmp_path / "worktree"),
+        "--prompt",
+        "-",
+        "--model=model-id",
+        "--session-id",
+        session,
+        "--available-tools=glob,grep,view",
+        "--allow-tool=read",
+        "--no-ask-user",
+        "--no-auto-update",
+        "--no-custom-instructions",
+        "--no-experimental",
+        "--no-remote",
+        "--no-remote-export",
+        "--disable-builtin-mcps",
+        "--disallow-temp-dir",
+        "--no-bash-env",
+        "--no-color",
+        "--stream=off",
+        "--output-format=json",
+        f"--log-dir={output_root / 'logs'}",
+    )
+
+
+PINNED_VECTORS = [
+    (ClaudeCodeHarnessAdapter, pinned_claude_vector),
+    (CodexHarnessAdapter, pinned_codex_vector),
+    (CopilotCliHarnessAdapter, pinned_copilot_vector),
+]
+
+
+def reviewer_vector(tmp_path: Path, adapter_class, seat: SeatRequest) -> tuple[str, ...]:
+    adapter = adapter_class(
+        FakeCommandAdapter(identity()),
+        tmp_path / "harness",
+        command=(sys.executable,),
+        model_map={"model-class": "model-id"},
+    )
+    argv, _extra, _stdin = adapter._invocation(seat, "run:item:reviewer")
+    return argv
+
+
+@pytest.mark.parametrize("adapter_class, pinned", PINNED_VECTORS)
+def test_a_seat_without_effort_keeps_the_pinned_argument_vector(
+    tmp_path: Path, fixed_session: str, adapter_class, pinned
+) -> None:
+    seat = request(tmp_path, Seat.REVIEWER, "review-verdict-v1", frozenset({"read"}))
+
+    assert reviewer_vector(tmp_path, adapter_class, seat) == pinned(tmp_path, fixed_session)
+
+
+@pytest.mark.parametrize("level", list(EffortLevel))
+@pytest.mark.parametrize(
+    "adapter_class, pinned, following, effort_arguments",
+    [
+        (ClaudeCodeHarnessAdapter, pinned_claude_vector, "--tools", lambda level: ("--effort", level)),
+        (
+            CodexHarnessAdapter,
+            pinned_codex_vector,
+            "exec",
+            lambda level: ("-c", f"model_reasoning_effort={level}"),
+        ),
+        (
+            CopilotCliHarnessAdapter,
+            pinned_copilot_vector,
+            "--session-id",
+            lambda level: (f"--reasoning-effort={level}",),
+        ),
+    ],
+)
+def test_a_seat_effort_adds_only_the_harness_effort_argument(
+    tmp_path: Path, fixed_session: str, adapter_class, pinned, following, effort_arguments, level
+) -> None:
+    seat = replace(
+        request(tmp_path, Seat.REVIEWER, "review-verdict-v1", frozenset({"read"})),
+        effort=level,
+    )
+    expected = list(pinned(tmp_path, fixed_session))
+    position = expected.index(following)
+    expected[position:position] = effort_arguments(level.value)
+
+    assert reviewer_vector(tmp_path, adapter_class, seat) == tuple(expected)
+
+
+@pytest.mark.parametrize(
+    "adapter_class",
+    [ClaudeCodeHarnessAdapter, CodexHarnessAdapter, CopilotCliHarnessAdapter],
+)
+def test_an_effort_the_adapter_does_not_declare_is_refused_before_dispatch(
+    tmp_path: Path, adapter_class
+) -> None:
+    commands = FakeCommandAdapter(identity())
+    adapter = adapter_class(commands, tmp_path / "harness", command=(sys.executable,))
+    adapter.effort_levels = frozenset({EffortLevel.LOW})
+    seat = replace(
+        request(tmp_path, Seat.BUILDER, "builder-report-v1", frozenset({"read", "write"})),
+        effort=EffortLevel.HIGH,
+    )
+
+    with pytest.raises(CapabilityError, match="cannot pass effort high"):
+        adapter.invoke(seat)
+
+    assert commands.requests == []
 
 
 def test_oversized_evidence_is_refused_before_cli_dispatch(tmp_path: Path) -> None:

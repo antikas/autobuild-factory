@@ -4,7 +4,7 @@ Coding assistants can work through a backlog, but the result becomes hard to tru
 
 A fresh builder changes one ready item from the project's tracked queue in an isolated Git worktree. The queue can be [Pinax](https://github.com/antikas/pinax-tracker) or a supported `BACKLOG.md` table. A fresh reviewer sees the approved request, changed files and test evidence without the builder transcript. The application accepts, parks or stops the item, then records enough evidence to judge the outcome without reconstructing a chat session.
 
-The workflow is harness-neutral. Claude Code, Codex and GitHub Copilot sit behind adapters selected at startup; the campaign sequence does not change with the assistant, operating system or shell.
+The workflow is harness-neutral. Claude Code, Codex and GitHub Copilot sit behind adapters selected at startup; the campaign sequence does not change with the assistant, operating system or shell. The project profile names the model for each seat and, optionally, the effort level that controls how much that model thinks; each adapter passes both in its assistant's own form.
 
 ## Run sequence
 
@@ -29,7 +29,7 @@ The [setup and run guide](docs/running-autobuild.md) explains installation, harn
 
 AutoBuild has two stages. Use `autobuild-plan` for research, planning, independent review and tracker registration. After the owner approves that result, use `autobuild` to run the queue. [The operating guide starts with the planning stage](docs/running-autobuild.md#stage-1-plan-and-register-the-work).
 
-Release 0.5.0 is available from PyPI as [`autobuild-factory`](https://pypi.org/project/autobuild-factory/) and as a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.5.0). The guide also has a [macOS setup path](docs/running-autobuild.md#set-up-autobuild-on-macos) and [GitHub Copilot setup](docs/running-autobuild.md#github-copilot-cli).
+Release 0.6.0 is available from PyPI as [`autobuild-factory`](https://pypi.org/project/autobuild-factory/) and as a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.6.0). The guide also has a [macOS setup path](docs/running-autobuild.md#set-up-autobuild-on-macos) and [GitHub Copilot setup](docs/running-autobuild.md#github-copilot-cli).
 
 Platform and coding assistant are separate choices. You can use Codex on macOS, GitHub Copilot on Windows, or any other supported combination.
 
