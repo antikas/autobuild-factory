@@ -695,6 +695,7 @@ class ItemWorkflow:
         builder = self._invoke_seat(
             record,
             seats,
+            spec,
             SeatRequest(
                 run_id=record.run_id,
                 item_id=spec.item.item_id,
@@ -770,6 +771,7 @@ class ItemWorkflow:
         reviewer = self._invoke_seat(
             record,
             seats,
+            spec,
             SeatRequest(
                 run_id=record.run_id,
                 item_id=spec.item.item_id,
@@ -822,6 +824,7 @@ class ItemWorkflow:
         result = self._invoke_seat(
             record,
             seats,
+            spec,
             SeatRequest(
                 run_id=record.run_id,
                 item_id=spec.item.item_id,
@@ -892,24 +895,30 @@ class ItemWorkflow:
         return error
 
     def _invoke_seat(
-        self, record: RunRecordRef, seats: list[SeatObservation], request: SeatRequest
+        self,
+        record: RunRecordRef,
+        seats: list[SeatObservation],
+        spec: ItemExecutionSpec,
+        request: SeatRequest,
     ) -> SeatResult:
         """Invoke one seat, moving lanes on a structural limit signal.
 
         Every attempt is recorded as its own ``seat.completed`` event stamped with
-        the lane it ran on. A limit signal cools the lane and re-runs the same
-        seat on the next capable lane; when none remains ``current_lane`` raises
-        ``LanesExhausted``."""
+        the lane it ran on and carries the effort that lane sets for the seat. A
+        limit signal cools the lane and re-runs the same seat on the next capable
+        lane; when none remains ``current_lane`` raises ``LanesExhausted``."""
 
         assert self._router is not None
         while True:
             lane = self._router.current_lane()
-            result = lane.harness.invoke(request)
+            attempt = replace(request, effort=spec.seat_effort(request.seat, lane.name))
+            result = lane.harness.invoke(attempt)
             if result.lane != lane.name:
                 result = replace(result, lane=lane.name)
             observation = SeatObservation(
-                seat=request.seat,
-                model_class=request.model_class,
+                seat=attempt.seat,
+                model_class=attempt.model_class,
+                effort=attempt.effort,
                 model=result.model,
                 outcome=result.outcome,
                 exit_code=result.exit_code,
@@ -927,16 +936,16 @@ class ItemWorkflow:
             self._event(
                 record,
                 "seat.completed",
-                request.item_id,
+                attempt.item_id,
                 result.raw_output_ref,
                 payload=self._seat_payload(observation),
             )
             if result.outcome is SeatOutcome.SUCCEEDED:
-                self._note_builder_lane(request, result)
+                self._note_builder_lane(attempt, result)
                 return result
             signal = lane.harness.classify_failure(result)
             if signal is None:
-                self._note_builder_lane(request, result)
+                self._note_builder_lane(attempt, result)
                 return result
             self._router.signal(lane, signal)
 
@@ -1015,6 +1024,7 @@ class ItemWorkflow:
         return {
             "seat": observation.seat.value,
             "model_class": observation.model_class,
+            "effort": observation.effort.value if observation.effort is not None else None,
             "model": observation.model,
             "outcome": observation.outcome.value,
             "exit_code": observation.exit_code,

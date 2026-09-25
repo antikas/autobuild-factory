@@ -9,6 +9,7 @@ from autobuild.domain import (
     AdapterIdentity,
     CampaignRef,
     CampaignReport,
+    CapabilityError,
     ClaimReceipt,
     CloseEvidence,
     CommandRequest,
@@ -16,6 +17,7 @@ from autobuild.domain import (
     DeliveryRequest,
     DiffEvidence,
     DurableContext,
+    EffortLevel,
     EvidenceError,
     FinaliseRequest,
     FinaliseResult,
@@ -67,8 +69,13 @@ class FakeHarnessAdapter(FakeAdapter):
     # default of None means a failure never cools the lane.
     signal: LaneSignal | None = None
     classified: list[SeatResult] = field(default_factory=list)
+    # The effort levels this lane's harness can pass. A seat asking for any other
+    # level is refused before it is recorded, as a harness adapter refuses it.
+    effort_levels: frozenset[EffortLevel] = frozenset(EffortLevel)
 
     def invoke(self, request: SeatRequest) -> SeatResult:
+        if request.effort is not None and request.effort not in self.effort_levels:
+            raise CapabilityError(f"fake harness cannot pass effort {request.effort.value}")
         self.requests.append(request)
         if not self.scripted_results:
             raise AssertionError("fake harness has no scripted result")

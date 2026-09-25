@@ -1,21 +1,45 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
-from autobuild.bootstrap.composition import _max_seat_timeout, _specification, run_campaign
+from autobuild.adapters import (
+    ClaudeCodeHarnessAdapter,
+    CodexHarnessAdapter,
+    CopilotCliHarnessAdapter,
+)
+from autobuild.bootstrap.composition import (
+    _build_lanes,
+    _max_seat_timeout,
+    _require_lane_efforts,
+    _specification,
+    run_campaign,
+)
 from autobuild.bootstrap.environment import default_scratch_root, resolve_runs_root
-from autobuild.bootstrap.profile import ConfigurationError, ProfileOverrides, load_settings
+from autobuild.bootstrap.profile import (
+    ConfigurationError,
+    LaneProfile,
+    ProfileOverrides,
+    load_settings,
+)
+from autobuild.bootstrap.registry import AdapterRegistry
 from autobuild.cli import _overrides, _parser
 from autobuild.domain import (
+    AdapterIdentity,
     CampaignSelection,
     DeliveryMode,
+    EffortLevel,
     FogRecord,
+    PortKind,
+    ProbeResult,
     Proposal,
     RefillPlan,
+    Seat,
     WorkItem,
 )
+from autobuild.testing import FakeCommandAdapter, FakeLaneStateAdapter
 
 
 PROFILE = """
@@ -455,6 +479,270 @@ def test_single_lane_form_is_one_lane_and_defaults(tmp_path: Path) -> None:
     assert settings.lanes[0].builder_model == "builder-model"
     assert settings.lane_cool_seconds == 3600.0
     assert settings.lane_state_root is None
+
+
+def _load(tmp_path: Path, profile: str):
+    repository = tmp_path / "project"
+    repository.mkdir()
+    (repository / ".autobuild.toml").write_text(profile, encoding="utf-8")
+    args = arguments(repository)
+    return load_settings(repository, args.profile, _overrides(args))
+
+
+def _spec_for(settings):
+    for_item = _specification(
+        settings, DeliveryMode.CURRENT_BRANCH_PR, "main", "base", False, False
+    )
+    return for_item(WorkItem("item", "title", "docs/brief.md", ("accepted",)))
+
+
+def test_single_lane_effort_keys_resolve_per_seat_and_reach_the_spec(tmp_path: Path) -> None:
+    settings = _load(
+        tmp_path,
+        PROFILE.replace(
+            'reviewer = "reviewer-model"',
+            'reviewer = "reviewer-model"\n'
+            'builder_effort = "medium"\n'
+            'reviewer_effort = "high"\n'
+            'specialist_effort = "max"',
+        ),
+    )
+
+    lane = settings.lanes[0]
+    assert (lane.builder_effort, lane.reviewer_effort, lane.specialist_effort) == (
+        EffortLevel.MEDIUM,
+        EffortLevel.HIGH,
+        EffortLevel.MAX,
+    )
+    spec = _spec_for(settings)
+    assert spec.seat_effort(Seat.BUILDER, "codex") is EffortLevel.MEDIUM
+    assert spec.seat_effort(Seat.REVIEWER, "codex") is EffortLevel.HIGH
+    assert spec.seat_effort(Seat.SPECIALIST, "codex") is EffortLevel.MAX
+
+
+def test_an_absent_specialist_effort_takes_the_reviewer_effort(tmp_path: Path) -> None:
+    settings = _load(
+        tmp_path,
+        PROFILE.replace(
+            'reviewer = "reviewer-model"',
+            'reviewer = "reviewer-model"\nreviewer_effort = "xhigh"',
+        ),
+    )
+
+    lane = settings.lanes[0]
+    assert lane.builder_effort is None
+    assert lane.specialist_effort is EffortLevel.XHIGH
+    assert lane.efforts() == {Seat.REVIEWER: EffortLevel.XHIGH, Seat.SPECIALIST: EffortLevel.XHIGH}
+
+
+def test_a_profile_without_effort_keys_gives_every_seat_no_effort(tmp_path: Path) -> None:
+    settings = _load(tmp_path, PROFILE)
+
+    lane = settings.lanes[0]
+    assert (lane.builder_effort, lane.reviewer_effort, lane.specialist_effort) == (None, None, None)
+    spec = _spec_for(settings)
+    for seat in Seat:
+        assert spec.seat_effort(seat, "codex") is None
+
+
+def test_lane_effort_keys_resolve_per_lane_and_seat(tmp_path: Path) -> None:
+    settings = _load(
+        tmp_path,
+        LANE_PROFILE.replace(
+            'specialist = "claude-opus"',
+            'specialist = "claude-opus"\nbuilder_effort = "medium"\nreviewer_effort = "high"',
+        ).replace(
+            'specialist = "gpt-specialist"',
+            'specialist = "gpt-specialist"\nbuilder_effort = "high"\nspecialist_effort = "low"',
+        ),
+    )
+
+    claude, codex = settings.lanes
+    assert claude.efforts() == {
+        Seat.BUILDER: EffortLevel.MEDIUM,
+        Seat.REVIEWER: EffortLevel.HIGH,
+        Seat.SPECIALIST: EffortLevel.HIGH,
+    }
+    assert codex.efforts() == {Seat.BUILDER: EffortLevel.HIGH, Seat.SPECIALIST: EffortLevel.LOW}
+    spec = _spec_for(settings)
+    assert spec.seat_effort(Seat.BUILDER, "claude-code") is EffortLevel.MEDIUM
+    assert spec.seat_effort(Seat.BUILDER, "codex") is EffortLevel.HIGH
+    assert spec.seat_effort(Seat.REVIEWER, "codex") is None
+
+
+@pytest.mark.parametrize("value", ['"extreme"', '"HIGH"', '""', "3", "true"])
+def test_an_invalid_model_effort_names_the_key(tmp_path: Path, value: str) -> None:
+    profile = PROFILE.replace(
+        'reviewer = "reviewer-model"', f'reviewer = "reviewer-model"\nbuilder_effort = {value}'
+    )
+
+    with pytest.raises(ConfigurationError, match=r"models\.builder_effort must be one of: low, medium, high, xhigh, max"):
+        _load(tmp_path, profile)
+
+
+@pytest.mark.parametrize("key", ["builder_effort", "reviewer_effort", "specialist_effort"])
+def test_an_invalid_lane_effort_names_the_lane_key(tmp_path: Path, key: str) -> None:
+    profile = LANE_PROFILE.replace(
+        'specialist = "gpt-specialist"', f'specialist = "gpt-specialist"\n{key} = "turbo"'
+    )
+
+    with pytest.raises(ConfigurationError, match=rf"lanes\.codex\.{key} must be one of"):
+        _load(tmp_path, profile)
+
+
+@pytest.mark.parametrize("key", ["builder_effort", "reviewer_effort", "specialist_effort"])
+@pytest.mark.parametrize("value", ['"high"', '"turbo"'])
+def test_a_models_effort_in_the_lane_form_is_refused_not_dropped(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    profile = LANE_PROFILE + f"\n[models]\nbuilder = \"ignored-model\"\n{key} = {value}\n"
+
+    with pytest.raises(
+        ConfigurationError,
+        match=rf"models\.{key} is not used when run\.lanes is set; set {key} in the \[lanes\.<harness>\] tables",
+    ):
+        _load(tmp_path, profile)
+
+
+@pytest.mark.parametrize("key", ["builder_effort", "reviewer_effort", "specialist_effort"])
+@pytest.mark.parametrize("value", ['"high"', '"turbo"'])
+def test_a_lane_table_effort_in_the_single_lane_form_is_refused_not_dropped(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    profile = PROFILE + f'\n[lanes.codex]\nbuilder = "ignored-model"\n{key} = {value}\n'
+
+    with pytest.raises(
+        ConfigurationError,
+        match=(
+            rf"lanes\.codex\.{key} is not used: lane tables are read only when "
+            rf"run\.lanes is set; set {key} in \[models\]"
+        ),
+    ):
+        _load(tmp_path, profile)
+
+
+def test_model_names_in_lane_tables_stay_ignored_in_the_single_lane_form(tmp_path: Path) -> None:
+    settings = _load(tmp_path, PROFILE + '\n[lanes.codex]\nbuilder = "ignored-model"\n')
+
+    assert [lane.name for lane in settings.lanes] == ["codex"]
+    assert settings.builder_model == "builder-model"
+
+
+def test_a_lane_named_twice_in_run_lanes_is_refused(tmp_path: Path) -> None:
+    profile = LANE_PROFILE.replace(
+        'lanes = ["claude-code", "codex"]', 'lanes = ["codex", "claude-code", "codex"]'
+    ).replace('specialist = "gpt-specialist"', 'specialist = "gpt-specialist"\nbuilder_effort = "high"')
+
+    with pytest.raises(ConfigurationError, match=r"run\.lanes names a lane more than once: codex$"):
+        _load(tmp_path, profile)
+
+
+def test_a_spec_built_from_a_profile_with_efforts_is_hashable(tmp_path: Path) -> None:
+    settings = _load(
+        tmp_path,
+        LANE_PROFILE.replace(
+            'specialist = "claude-opus"',
+            'specialist = "claude-opus"\nbuilder_effort = "medium"\nreviewer_effort = "high"',
+        ).replace(
+            'specialist = "gpt-specialist"',
+            'specialist = "gpt-specialist"\nbuilder_effort = "high"',
+        ),
+    )
+    first, second = _spec_for(settings), _spec_for(settings)
+
+    assert first.lane_efforts
+    assert hash(first) == hash(second)
+    assert first == second
+
+
+def test_model_names_in_models_stay_ignored_in_the_lane_form(tmp_path: Path) -> None:
+    settings = _load(tmp_path, LANE_PROFILE + '\n[models]\nbuilder = "ignored-model"\n')
+
+    assert settings.builder_model == "claude-opus"
+
+
+class _StubHarness:
+    def __init__(self, effort_levels=None) -> None:
+        if effort_levels is not None:
+            self.effort_levels = effort_levels
+        self.probed = False
+
+    def probe(self):
+        self.probed = True
+        return ProbeResult.ready(AdapterIdentity("stub", "1"))
+
+
+def test_the_launch_refuses_a_lane_effort_before_probing_any_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _load(
+        tmp_path,
+        LANE_PROFILE.replace(
+            'specialist = "claude-opus"',
+            'specialist = "claude-opus"\nbuilder_effort = "medium"',
+        ).replace(
+            'specialist = "gpt-specialist"',
+            'specialist = "gpt-specialist"\nreviewer_effort = "max"',
+        ),
+    )
+    stubs = {
+        "claude-code": _StubHarness(frozenset(EffortLevel)),
+        "codex": _StubHarness(frozenset({EffortLevel.LOW, EffortLevel.MEDIUM})),
+    }
+
+    def register(registry) -> None:
+        for name, stub in stubs.items():
+            registry.register(PortKind.HARNESS, name, lambda config, stub=stub: stub)
+
+    monkeypatch.setattr("autobuild.bootstrap.composition.register_first_party_harnesses", register)
+    monkeypatch.setattr(AdapterRegistry, "load_entry_points", lambda self: None)
+    lane_state = FakeLaneStateAdapter(AdapterIdentity("lane-state", "1"))
+
+    with pytest.raises(
+        ConfigurationError,
+        match=r"lane codex sets reviewer effort max, which its harness adapter cannot pass \(accepted: low, medium\)",
+    ):
+        _build_lanes(
+            settings,
+            FakeCommandAdapter(AdapterIdentity("command", "1")),
+            tmp_path / "scratch",
+            lane_state,
+            "campaign",
+        )
+
+    assert [stub.probed for stub in stubs.values()] == [False, False]
+    assert lane_state.cools == []
+
+
+def test_an_adapter_that_declares_no_effort_levels_refuses_any_lane_effort() -> None:
+    lane = LaneProfile("third-party", "b", "r", "r", builder_effort=EffortLevel.LOW)
+
+    with pytest.raises(
+        ConfigurationError,
+        match=r"lane third-party sets builder effort low, which its harness adapter cannot pass \(accepted: none\)",
+    ):
+        _require_lane_efforts(lane, _StubHarness())
+
+
+def test_a_lane_without_efforts_launches_on_an_adapter_that_declares_none() -> None:
+    _require_lane_efforts(LaneProfile("third-party", "b", "r", "r"), _StubHarness())
+
+
+@pytest.mark.parametrize(
+    "adapter_class", [ClaudeCodeHarnessAdapter, CodexHarnessAdapter, CopilotCliHarnessAdapter]
+)
+def test_every_first_party_adapter_accepts_every_effort_level(tmp_path: Path, adapter_class) -> None:
+    adapter = adapter_class(
+        FakeCommandAdapter(AdapterIdentity("command", "1")),
+        tmp_path / "harness",
+        command=(sys.executable,),
+    )
+    lane = LaneProfile(
+        "lane", "b", "r", "r", EffortLevel.LOW, EffortLevel.XHIGH, EffortLevel.MAX
+    )
+
+    _require_lane_efforts(lane, adapter)
+    assert adapter.effort_levels == frozenset(EffortLevel)
 
 
 def _settings_with_progress(tmp_path: Path, table: str):

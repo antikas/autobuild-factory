@@ -7,7 +7,7 @@ AutoBuild sends the same typed seat request to every coding assistant. A small a
 ## Adapter sequence
 
 1. AutoBuild creates a fresh builder request for one tracked item and its isolated workspace.
-2. The selected adapter starts its command with the approved model, tools, paths and timeout.
+2. The selected adapter starts its command with the approved model, effort, tools, paths and timeout.
 3. The builder leaves its product changes uncommitted so validation can inspect the final workspace state.
 4. AutoBuild creates a fresh reviewer request containing the brief, diff and validator evidence. It does not include the builder transcript.
 5. The adapter returns the same typed verdict and usage record whichever command ran the seat.
@@ -18,7 +18,7 @@ The operator approves the item, model classes and tool policy before the campaig
 
 The workflow renders the builder instructions once. They name the approved brief, acceptance criteria, workspace and result contract. The adapter receives those finished instructions through a typed request (`SeatRequest`).
 
-The adapter maps the abstract model class to the command's model name. It also maps semantic tools such as `read`, `write`, `python` and `git` to the command's permission flags. An unknown tool fails before the command starts.
+The adapter maps the abstract model class to the command's model name, and the seat's effort level, when the request carries one, to the command's effort option. It also maps semantic tools such as `read`, `write`, `python` and `git` to the command's permission flags. An unknown tool fails before the command starts.
 
 The host command adapter starts the process and captures both output streams under the active temporary work root. It owns quoting, environment inheritance, timeout, cancellation and process tree termination. The harness adapter never creates a second process runner.
 
@@ -77,6 +77,22 @@ Blocking decisions use `correct`, `escalate` or `park` and require at least one 
 
 The GitHub Copilot command also uses `--disallow-temp-dir`. The child environment points every temporary and cache path at the active temporary work root.
 
+### Seat effort
+
+A seat request can carry an effort level: `low`, `medium`, `high`, `xhigh` or `max`. The level comes from the `builder_effort`, `reviewer_effort` or `specialist_effort` key of the lane the seat runs on. Each adapter passes it through its own command option:
+
+| Adapter | Effort argument |
+|---|---|
+| Claude Code | `--effort <level>`, placed after `--model` |
+| Codex | `-c model_reasoning_effort=<level>`, placed after `-m` and before `exec` |
+| GitHub Copilot | `--reasoning-effort=<level>`, placed after `--model` |
+
+A seat request without an effort adds no argument, so the command line is exactly the one the adapter builds without the setting and the harness applies its own configured default.
+
+The seat request and the `seat.completed` run event carry the level AutoBuild requested. Whether the model applies it is decided by the harness when the seat starts: GitHub Copilot CLI 1.0.88 or later reports a level the model does not offer and leaves it unapplied, and Codex passes any value to its service.
+
+Each adapter declares the levels it can pass in `effort_levels`. The three built-in adapters declare all five levels, because each command documents all five. Before any lane is probed, AutoBuild compares every lane's configured efforts with its adapter's declared levels and stops with a configuration error that names the lane and the seat when a level is not declared. An adapter that declares no levels therefore refuses any lane that sets an effort. An adapter that receives an undeclared level refuses the seat before it starts the command. No adapter drops a configured effort.
+
 ### Lane failure signals
 
 Each adapter owns the classification of its own failures through `classify_failure`. It reads a lane signal from structural evidence only: the process exit state and the CLI's structured error fields. It never scans the event stream for words. A successful seat, or a seat the harness killed for stalling, timing out or cancellation, never cools a lane, so a report that mentions "rate limit" in prose with a clean exit and a valid result is not a false kill. A failed process that produced no structured output at all is a spawn failure and cools the lane.
@@ -93,7 +109,7 @@ A signal carries a kind (`rate_limit`, `quota`, `auth`, `spawn`) and a reset tim
 
 ### Runtime registration
 
-The built-in adapter names are `claude-code`, `codex` and `github-copilot`. Each factory receives the bound host command port, an output directory, an optional command override and a model map. A fourth adapter can register through the same Python entry-point surface without editing the workflow.
+The built-in adapter names are `claude-code`, `codex` and `github-copilot`. Each factory receives the bound host command port, an output directory, an optional command override and a model map. A fourth adapter can register through the same Python entry-point surface without editing the workflow. It declares the effort levels it can pass in `effort_levels`, as described in "Seat effort".
 
 ### Version compatibility
 
@@ -103,4 +119,6 @@ Official references:
 
 - [Claude Code command-line reference](https://code.claude.com/docs/en/cli-reference)
 - [Codex CLI repository](https://github.com/openai/codex)
+- [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
 - [GitHub Copilot CLI programmatic reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference)
+- [GitHub Copilot CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference)

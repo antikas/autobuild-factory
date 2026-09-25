@@ -5,7 +5,7 @@ import tomllib
 from pathlib import Path
 
 
-ROOT = Path(__file__).parents[2]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def public_paths() -> frozenset[str] | None:
@@ -37,9 +37,7 @@ def public_markdown() -> tuple[Path, ...]:
     return (
         ROOT / "README.md",
         *(ROOT / "docs").glob("*.md"),
-        *(ROOT / "skills").glob("*/SKILL.md"),
-        *(ROOT / "skills").glob("*/*/*.md"),
-        *(ROOT / "skills").glob("*/*.md"),
+        *(ROOT / "skills").rglob("*.md"),
     )
 
 

@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from autobuild.adapters.harness_cli import CliHarnessAdapter, _safe_name, result_schema
-from autobuild.domain import LaneSignal, Seat, SeatRequest, SeatResult
+from autobuild.domain import EffortLevel, LaneSignal, Seat, SeatRequest, SeatResult
 from autobuild.ports import CommandPort
 
 SEAT_RESULT_FILE = ".autobuild-seat-result.json"
@@ -77,6 +77,7 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
     # window surfaces as ``rate_limit_error``. Older builds also carry ``subtype``.
     # A limit reported only in the ``result`` prose is deliberately not scanned.
     _limit_code_keys = ("code", "type", "subtype", "error_type", "error_code", "reason")
+    effort_levels = frozenset(EffortLevel)
 
     def classify_failure(self, result: SeatResult) -> LaneSignal | None:
         """Read a lane signal from Claude Code's structured result fields only."""
@@ -97,8 +98,12 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
         authenticated = bool(payload.get("loggedIn") or payload.get("authenticated"))
         return authenticated, "Claude Code authentication is available" if authenticated else "Claude Code is not authenticated"
 
+    def _effort_option(self, level: str) -> tuple[str, ...]:
+        return ("--effort", level)
+
     def _invocation(self, request: SeatRequest, run_ref: str):
         self._require_known_tools(request.tool_policy.allowed_tools)
+        effort = self._effort_arguments(request)
         mapping = {
             "read": ("Read", "Glob", "Grep"),
             "write": ("Edit", "Write", "NotebookEdit"),
@@ -126,6 +131,7 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
             str(uuid4()),
             "--model",
             self._model(request.model_class),
+            *effort,
             "--tools",
             ",".join(tools),
             "--allowedTools",

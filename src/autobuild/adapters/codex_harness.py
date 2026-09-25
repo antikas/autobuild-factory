@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from autobuild.adapters.harness_cli import CliHarnessAdapter, _safe_name
-from autobuild.domain import LaneSignal, Seat, SeatRequest, SeatResult
+from autobuild.domain import EffortLevel, LaneSignal, Seat, SeatRequest, SeatResult
 from autobuild.ports import CommandPort
 
 
@@ -17,6 +17,7 @@ class CodexHarnessAdapter(CliHarnessAdapter):
         ("DO_NOT_TRACK", "1"),
         ("OTEL_SDK_DISABLED", "true"),
     )
+    effort_levels = frozenset(EffortLevel)
 
     def __init__(
         self,
@@ -46,8 +47,12 @@ class CodexHarnessAdapter(CliHarnessAdapter):
         authenticated = result.exit_code == 0 and "not logged" not in output
         return authenticated, "Codex authentication is available" if authenticated else "Codex is not authenticated"
 
+    def _effort_option(self, level: str) -> tuple[str, ...]:
+        return ("-c", f"model_reasoning_effort={level}")
+
     def _invocation(self, request: SeatRequest, run_ref: str):
         self._require_known_tools(request.tool_policy.allowed_tools)
+        effort = self._effort_arguments(request)
         schema = self._write_schema(run_ref, request.result_contract)
         prompts = self._output_root / "prompts"
         prompts.mkdir(parents=True, exist_ok=True)
@@ -70,6 +75,7 @@ class CodexHarnessAdapter(CliHarnessAdapter):
             str(request.workspace.root),
             "-m",
             self._model(request.model_class),
+            *effort,
             "exec",
             "--ephemeral",
             "--ignore-rules",

@@ -18,7 +18,7 @@ This skill produces the plan that `/autobuild` later executes. It researches the
 
 ## Phase 1: inspect each affected surface
 
-Use one capable scout per surface, in parallel when the host supports it, with structured output and per-answer file evidence. Pin the implementation-capable model tier available in the current host. Standard surfaces:
+Read small surfaces yourself. Use one scout per surface that is too wide to read directly, in parallel when the host supports it, with structured output and per-answer file evidence. Pin the implementation-capable model tier available in the current host. Standard surfaces:
 - **the build repositories:** compare the documented extension method with the latest implementation. Inspect coupling checks, test lanes, the declared validator, deployment code, repository drift, and pinned upstream data.
 - **every publication surface** implied by "end to end": inspect its structure, the files one new entry changes, and its deployment state.
 - **the programme docs:** open decisions and named gates touching the ask; what has been executed since the spec was written.
@@ -27,7 +27,7 @@ Ask scouts to report contradictions in the request's assumptions. The author rea
 
 ## Phase 2: write the plan
 
-Create one plan at `plans/<date>-<slug>/plan.md` in the knowledge repository or the target repository's `docs/plans/` directory. Use this structure:
+Create one plan at `plans/<date>-<slug>/plan.md` in the team's shared planning repository or the target repository's `docs/plans/` directory. Use this structure:
 
 1. **Current position:** give a plain English summary that a new reader can follow.
 2. **Mandate:** state the owner's request and the gates that authorise activation and launch.
@@ -47,13 +47,13 @@ Use four fresh reviewer sessions and run them in parallel when the host supports
 3. **Architecture and source ownership:** check repository claims against code, reuse existing patterns and prevent duplicate sources of truth.
 4. **Premortem:** describe how the plan could cause production damage, user harm, cross-repository failure, a costly decision or a failed run.
 
-Each seat returns `PASS`, `PASS_WITH_FOLDS`, or `FAIL`. It lists file-backed blockers, direct folds and the claims it checked. Verify every blocker against the code, apply accepted folds, and repeat failed reviews with fresh seats. Record every round in `review-verdict.md` beside the plan.
+Each seat returns `PASS`, `PASS_WITH_FOLDS`, or `FAIL`. It lists file-backed blockers, direct folds and the claims it checked. Verify every blocker against the code, apply accepted folds, and repeat failed reviews with fresh seats. Stop after three review rounds without a PASS or PASS_WITH_FOLDS and bring the open blockers to the owner. Record every round in `review-verdict.md` beside the plan.
 
 ## Phase 4: register the queue and stop
 
 Only after PASS / PASS_WITH_FOLDS-with-folds-applied:
 1. Register the queue in each repo's tracker in dependency order. Use `pinax add` on a Pinax repo. Otherwise add rows to the supported `BACKLOG.md` table with a `Ready` status and a brief reference, following `../../docs/running-autobuild.md`. Acceptance belongs in the brief, with the plan and spec named as its sources. Every brief carries an `Item nature` line (`repository`, `machine`, `cross-repository`, or `owner-gated`) and a `## Declared paths` section listing every path the item edits; AutoBuild reads both at claim without a model call. Owner-gated Pinax items get their gate typed **at registration** (`pinax block <id> --gate decision`); owner-gated backlog rows use `Blocked`, never `Ready`. Register `machine` and `cross-repository` items as blocked with a decision gate the same way, because a fenced builder cannot touch a machine or a path outside the repository; a person handles them outside the run. Registration commits ride the default branch (register-before-branch invariant).
-2. Hygiene: index the plan folder wherever plans are indexed; log the day's delta; update memory if a durable lesson surfaced.
+2. Hygiene: index the plan folder wherever the project indexes plans, and record any durable lesson where the project keeps them.
 3. **Report and stop.** Give the owner the plain English plan summary, verdict, decisions and override windows, open gates, and launch command. Wait for the owner's launch instruction.
 
 ## Acceptance criteria

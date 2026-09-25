@@ -4,7 +4,7 @@ The protocol in `SKILL.md` and `rules.md` is unchanged here. This file maps its 
 
 ## Seats
 
-Copilot has no in-session subagent tool. A fresh seat is a separate Copilot CLI process started from the coordinator's shell with a custom agent and an explicit prompt, the same way the AutoBuild application drives its Copilot harness:
+Copilot has no in-session subagent tool. A fresh seat is a separate Copilot CLI process started from the coordinator's shell with a custom agent and an explicit prompt, the same way the AutoBuild application drives its Copilot harness. This command passes no effort, so a seat runs at the effort Copilot is configured with, whatever the profile names:
 
 ```text
 copilot -C <lane-path> --agent autobuild-builder --prompt - --model=<tier> \
