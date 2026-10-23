@@ -42,11 +42,13 @@ from autobuild.domain import (
     SeatResult,
     SeatUsage,
     TrackerPublication,
+    UsageReading,
     WorkItem,
     WorkspaceRef,
     WorktreeSnapshot,
     WorktreeStatus,
 )
+from autobuild.domain.models import SeatTransport
 
 
 @dataclass
@@ -73,6 +75,13 @@ class FakeHarnessAdapter(FakeAdapter):
     # The effort levels this lane's harness can pass. A seat asking for any other
     # level is refused before it is recorded, as a harness adapter refuses it.
     effort_levels: frozenset[EffortLevel] = frozenset(EffortLevel)
+    # The opaque usage meter id this lane declares, and the model classes each
+    # meter scope label covers, standing in for the adapter's own decision.
+    meter_id: str | None = None
+    meter_scopes: dict[str, frozenset[str]] = field(default_factory=dict)
+
+    def meter_scope_covers(self, scope: str, model_class: str) -> bool:
+        return model_class in self.meter_scopes.get(scope, frozenset())
 
     def invoke(self, request: SeatRequest) -> SeatResult:
         if request.effort is not None and request.effort not in self.effort_levels:
@@ -93,6 +102,44 @@ class FakeHarnessAdapter(FakeAdapter):
         if result.outcome is not SeatOutcome.FAILED:
             return None
         return self.signal
+
+    def seat_transport(self, request: SeatRequest) -> SeatTransport:
+        return SeatTransport(0, True, (("DO_NOT_TRACK", "1"),), in_process=True)
+
+
+@dataclass
+class FakeAgentSdkClient:
+    """A scripted Agent SDK client standing in for the SDK package.
+
+    Each ``run`` replays the next script: a list of message records, where an
+    exception instance in the list is raised at that point. With
+    ``block_until_cancelled`` a run then waits for its cancellation event, as a
+    long seat would."""
+
+    sdk_version: str = "0.0-fake"
+    installed: bool = True
+    scripts: list[list[object]] = field(default_factory=list)
+    block_until_cancelled: bool = False
+    specs: list[object] = field(default_factory=list)
+    version_calls: int = 0
+    # Runs whose cancellation event was set while they waited.
+    cancelled_runs: int = 0
+
+    def version(self) -> str:
+        self.version_calls += 1
+        if not self.installed:
+            raise ImportError("No module named 'claude_agent_sdk'")
+        return self.sdk_version
+
+    def run(self, spec, on_message, on_stderr, cancelled) -> None:
+        self.specs.append(spec)
+        script = self.scripts.pop(0) if self.scripts else []
+        for item in script:
+            if isinstance(item, BaseException):
+                raise item
+            on_message(dict(item))
+        if self.block_until_cancelled and cancelled.wait(10):
+            self.cancelled_runs += 1
 
 
 @dataclass
@@ -410,7 +457,8 @@ class FakeLaneStateAdapter(FakeAdapter):
 
     ``cooled`` holds the lanes currently in force; ``cool`` records a signal and
     keeps the lane cooled for the rest of the test, so the router treats it as
-    unavailable. ``cools`` records every call for assertions."""
+    unavailable. The record's ``cooled_until`` is the signal's reset when it
+    carries one. ``cools`` records every call for assertions."""
 
     cooled: dict[str, LaneCooling] = field(default_factory=dict)
     cools: list[tuple[str, LaneSignal, str]] = field(default_factory=list)
@@ -421,7 +469,7 @@ class FakeLaneStateAdapter(FakeAdapter):
     def cool(self, lane: str, signal: LaneSignal, campaign_id: str) -> LaneCooling:
         record = LaneCooling(
             lane=lane,
-            cooled_until="2999-01-01T00:00:00+00:00",
+            cooled_until=signal.reset_at or "2999-01-01T00:00:00+00:00",
             signature=signal.signature,
             last_failure_at="2026-09-03T00:00:00+00:00",
             campaign_id=campaign_id,
@@ -432,6 +480,23 @@ class FakeLaneStateAdapter(FakeAdapter):
 
     def snapshot(self) -> tuple[LaneCooling, ...]:
         return tuple(self.cooled.values())
+
+
+@dataclass
+class FakeUsageMeter(FakeAdapter):
+    """Scripted meter readings. Each ``read`` returns the next scripted reading
+    for the meter id and repeats the last one once the script runs out, so a
+    test scripts only the readings that change. ``reads`` records every id."""
+
+    readings: dict[str, list[UsageReading]] = field(default_factory=dict)
+    reads: list[str] = field(default_factory=list)
+
+    def read(self, meter_id: str) -> UsageReading:
+        self.reads.append(meter_id)
+        script = self.readings.get(meter_id)
+        if not script:
+            return UsageReading.failed(meter_id, "fake meter has no scripted reading")
+        return script.pop(0) if len(script) > 1 else script[0]
 
 
 @dataclass

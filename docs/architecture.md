@@ -68,9 +68,10 @@ The CLI loads `.autobuild.toml` and applies explicit command-line overrides. Boo
 4. Resolve the selected harness through the adapter registry.
 5. Choose the no-refill or Koine knowledge adapter from the refill plan.
 6. Probe every selected adapter before a claim.
-7. Record adapter identities and versions in the run manifest.
-8. Wrap the adapters with policy-enforced port implementations.
-9. Start the campaign runner with one immutable `WorkflowPorts` object.
+7. With a `[usage]` table, read the meter of every metered lane, cool each lane at its stop level until its reset, and refuse the launch when every lane is at its stop level.
+8. Record adapter identities and versions in the run manifest.
+9. Wrap the adapters with policy-enforced port implementations.
+10. Start the campaign runner with one immutable `WorkflowPorts` object.
 
 Explicit tracker and harness settings take precedence over discovery. Auto tracker selection prefers Pinax when it is usable, then checks the supported backlog path.
 
@@ -87,6 +88,10 @@ The workflow calls seven semantic ports.
 | `RunRecordPort` | Create a run, append events, write evidence, and complete a report | Local filesystem records |
 | `KnowledgePort` | Retrieve durable context and record unresolved directions | Koine or no-refill adapter |
 | `ProgressPort` | Begin a run stream and emit one plain-language line per event | File, stderr, and command hook progress adapters |
+
+Two further ports serve lane routing. `LaneStatePort` keeps the machine-local lane cooling shared across campaigns. `UsageMeterPort` reads a usage meter by the opaque id a harness adapter declares and returns a normalised `UsageReading`; it never raises and its readings carry no credential. Its adapters are the Claude subscription meter, a null meter whose readings always fail, and a scripted fake. Bootstrap supplies a meter only when the profile has a `[usage]` table.
+
+The level rule has one owner, `UsagePolicy` in the domain layer. It judges a reading and returns the unscoped limits that stop a lane with the latest of their resets, the model-scoped limits that stop only covered seats, the limits at the warning level, and any reason the reading cannot be used. The launch preflight and the item workflow both call it. The item workflow reads the meter before each seat on a metered lane: an unscoped stop cools the lane through the same lane signal path a harness limit uses, with the meter's reset time; a model-scoped stop sends only that seat past the lane for that one seat, without cooling the lane and without moving the item's lane position.
 
 Ports exchange dataclasses and enums. Vendor JSON, command flags, and shell strings remain inside adapters.
 

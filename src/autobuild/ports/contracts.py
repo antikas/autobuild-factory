@@ -36,11 +36,13 @@ from autobuild.domain import (
     SeatResult,
     SeatUsage,
     TrackerPublication,
+    UsageReading,
     WorkItem,
     WorkspaceRef,
     WorktreeSnapshot,
     WorktreeStatus,
 )
+from autobuild.domain.models import SeatTransport
 
 
 class Probeable(Protocol):
@@ -130,6 +132,17 @@ class HarnessPort(Probeable, Protocol):
 
 
 @runtime_checkable
+class SeatTransportPort(Protocol):
+    """An optional harness declaration of how a seat reaches its child.
+
+    The preflight doctor reads it to check the instruction transport and the
+    child's telemetry environment without knowing the harness's mechanism. An
+    in-process harness must declare it."""
+
+    def seat_transport(self, request: SeatRequest) -> SeatTransport: ...
+
+
+@runtime_checkable
 class CommandPort(Probeable, Protocol):
     def run(self, request: CommandRequest) -> CommandResult: ...
     def cancel(self, command_id: str) -> None: ...
@@ -201,6 +214,18 @@ class LaneStatePort(Probeable, Protocol):
     def active(self, lane: str) -> LaneCooling | None: ...
     def cool(self, lane: str, signal: LaneSignal, campaign_id: str) -> LaneCooling: ...
     def snapshot(self) -> tuple[LaneCooling, ...]: ...
+
+
+@runtime_checkable
+class UsageMeterPort(Probeable, Protocol):
+    """Read-only access to the usage meters harness lanes declare.
+
+    ``read`` takes the opaque meter id a harness adapter declares and returns one
+    normalised reading. It never raises: every failure, including a meter id the
+    adapter does not serve, is a reading with ``ok=False``. No credential appears
+    in a reading, its error text or any record the adapter writes."""
+
+    def read(self, meter_id: str) -> UsageReading: ...
 
 
 @runtime_checkable

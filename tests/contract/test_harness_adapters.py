@@ -30,7 +30,8 @@ from autobuild.domain import (
     ToolPolicy,
     WorkspaceRef,
 )
-from autobuild.testing import FakeCommandAdapter
+from autobuild.testing import FakeAgentSdkClient, FakeCommandAdapter
+from autobuild.adapters.claude_sdk_harness import ClaudeSdkHarnessAdapter
 from autobuild.adapters.harness_cli import result_schema
 
 
@@ -835,3 +836,145 @@ def test_oversized_evidence_is_refused_before_cli_dispatch(tmp_path: Path) -> No
         adapter.invoke(seat)
 
     assert commands.requests == []
+
+
+# -- the Agent SDK lane: the same classification contract over SDK messages ------
+
+CREDIT_EXHAUSTED = (
+    "Your credit balance is too low to access the Anthropic API. "
+    "Please go to Plans & Billing to upgrade or purchase credits."
+)
+SPEND_LIMIT = (
+    "You have reached your specified workspace API usage limits. "
+    "You will regain access on 2026-11-01 at 00:00 UTC."
+)
+
+
+def sdk_result_record(**fields) -> dict:
+    record = {
+        "message": "ResultMessage",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "result": "done",
+        "structured_output": None,
+        "usage": {"input_tokens": 3, "output_tokens": 2},
+        "total_cost_usd": 0.01,
+        "api_error_status": None,
+    }
+    record.update(fields)
+    return record
+
+
+def sdk_failed_seat(tmp_path: Path, script: list) -> tuple[ClaudeSdkHarnessAdapter, SeatResult]:
+    key = tmp_path / "secrets" / "sdk.key"
+    key.parent.mkdir(exist_ok=True)
+    key.write_text("sk-ant-api03-CONTRACT-SENTINEL", encoding="utf-8")
+    adapter = ClaudeSdkHarnessAdapter(
+        FakeCommandAdapter(identity()),
+        tmp_path / "harness",
+        key,
+        client=FakeAgentSdkClient(scripts=[script]),
+    )
+    result = adapter.invoke(
+        request(tmp_path, Seat.BUILDER, "builder-report-v1", frozenset({"read", "write"}))
+    )
+    return adapter, result
+
+
+@pytest.mark.parametrize(
+    "script, kind, reset_at",
+    [
+        (
+            [sdk_result_record(is_error=True, api_error_status=400, result=CREDIT_EXHAUSTED)],
+            LaneSignalKind.QUOTA,
+            None,
+        ),
+        (
+            [sdk_result_record(is_error=True, api_error_status=400, result="Credit balance is too low")],
+            LaneSignalKind.QUOTA,
+            None,
+        ),
+        (
+            [sdk_result_record(is_error=True, api_error_status=400, result=SPEND_LIMIT)],
+            LaneSignalKind.QUOTA,
+            "2026-11-01T00:00:00+00:00",
+        ),
+        (
+            [
+                {"message": "AssistantMessage", "content": [], "error": "billing_error"},
+                sdk_result_record(is_error=True, api_error_status=400, result=SPEND_LIMIT),
+            ],
+            LaneSignalKind.QUOTA,
+            "2026-11-01T00:00:00+00:00",
+        ),
+        (
+            [
+                {"message": "AssistantMessage", "content": [], "error": "rate_limit"},
+                sdk_result_record(is_error=True, api_error_status=429, result="Rate limited"),
+            ],
+            LaneSignalKind.RATE_LIMIT,
+            None,
+        ),
+        (
+            [sdk_result_record(is_error=True, api_error_status=401, result="Invalid API key")],
+            LaneSignalKind.AUTH,
+            None,
+        ),
+    ],
+)
+def test_sdk_structured_limit_response_classifies(
+    tmp_path: Path, script, kind, reset_at
+) -> None:
+    adapter, failed = sdk_failed_seat(tmp_path, script)
+
+    assert failed.outcome is SeatOutcome.FAILED
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is kind
+    assert signal.reset_at == reset_at
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        [
+            sdk_result_record(
+                result="the brief says the credit balance is too low to access the API",
+                structured_output={"summary": "built", "report_ref": "r"},
+            )
+        ],
+        [sdk_result_record(is_error=True, result=CREDIT_EXHAUSTED)],
+        [
+            {
+                "message": "UserMessage",
+                "content": [{"block": "ToolResultBlock", "content": '{"type": "rate_limit_error"}'}],
+            },
+            sdk_result_record(is_error=True, subtype="error_during_execution", result=None),
+        ],
+    ],
+)
+def test_sdk_prose_mentioning_a_limit_does_not_classify(tmp_path: Path, script) -> None:
+    adapter, seat = sdk_failed_seat(tmp_path, script)
+
+    assert adapter.classify_failure(seat) is None
+
+
+def test_sdk_failed_seat_without_structured_output_is_a_spawn_signal(tmp_path: Path) -> None:
+    adapter, spawn = sdk_failed_seat(tmp_path, [RuntimeError("bundled CLI did not start")])
+
+    signal = adapter.classify_failure(spawn)
+
+    assert spawn.outcome is SeatOutcome.FAILED
+    assert signal is not None
+    assert signal.kind is LaneSignalKind.SPAWN
+
+
+def test_sdk_plain_failure_without_a_limit_field_does_not_cool_the_lane(tmp_path: Path) -> None:
+    adapter, failed = sdk_failed_seat(
+        tmp_path, [sdk_result_record(is_error=True, subtype="error_during_execution", result=None)]
+    )
+
+    assert failed.outcome is SeatOutcome.FAILED
+    assert adapter.classify_failure(failed) is None

@@ -12,6 +12,7 @@ from autobuild.ports.contracts import (
     ProgressPort,
     RunRecordPort,
     TrackerPort,
+    UsageMeterPort,
     WorkspacePort,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "ProgressPort",
     "RunRecordPort",
     "TrackerPort",
+    "UsageMeterPort",
     "WorkspacePort",
 ]

@@ -697,6 +697,7 @@ def test_preflight_records_every_probe_when_the_environment_is_fit(tmp_path: Pat
         "interception",
         "scratch",
         "telemetry",
+        "removed-environment",
         "validator-runnable",
         "validator-offline",
         "validator-budget",
@@ -814,6 +815,61 @@ def test_preflight_stops_when_the_harness_leaves_telemetry_on(tmp_path: Path) ->
             filesystem,
             command,
         )
+
+
+REMOVED = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+def _removed_probe(tmp_path: Path, values: dict[str, str]):
+    network, environment, filesystem, command = passing_probes(tmp_path)
+    environment.values = values
+    probes = run(
+        preflight_request(tmp_path, removed_environment=REMOVED),
+        network,
+        environment,
+        filesystem,
+        command,
+    )
+    return next(probe for probe in probes if probe.name == "removed-environment")
+
+
+def test_preflight_warns_by_name_when_a_removed_variable_is_set_in_the_parent(
+    tmp_path: Path,
+) -> None:
+    sentinel = "sentinel-billing-value-7f3a"
+
+    probe = _removed_probe(tmp_path, {"ANTHROPIC_API_KEY": sentinel})
+
+    assert probe.passed is True
+    assert probe.detail == (
+        "warning: ANTHROPIC_API_KEY is set in the parent environment "
+        "and is removed from every seat child"
+    )
+    assert sentinel not in probe.detail
+
+
+def test_preflight_names_every_removed_variable_that_is_set(tmp_path: Path) -> None:
+    sentinel = "sentinel-billing-value-7f3a"
+
+    probe = _removed_probe(
+        tmp_path, {"ANTHROPIC_API_KEY": sentinel, "ANTHROPIC_AUTH_TOKEN": sentinel}
+    )
+
+    assert probe.detail == (
+        "warning: ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN are set in the parent "
+        "environment and are removed from every seat child"
+    )
+    assert sentinel not in probe.detail
+
+
+def test_preflight_reports_no_warning_when_no_removed_variable_is_set(tmp_path: Path) -> None:
+    probe = _removed_probe(tmp_path, {})
+
+    assert probe.passed is True
+    assert probe.detail == (
+        "none set in the parent environment: ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN"
+    )
+    assert "warning" not in probe.detail
 
 
 def test_preflight_stops_when_the_validator_executable_is_missing(tmp_path: Path) -> None:

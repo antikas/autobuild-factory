@@ -50,7 +50,12 @@ def test_first_party_harnesses_share_the_same_registration_surface(tmp_path) -> 
 
     register_first_party_harnesses(registry)
 
-    assert registry.names(PortKind.HARNESS) == ("claude-code", "codex", "github-copilot")
+    assert registry.names(PortKind.HARNESS) == (
+        "claude-code",
+        "claude-sdk",
+        "codex",
+        "github-copilot",
+    )
     created = registry.create(
         PortKind.HARNESS,
         "codex",

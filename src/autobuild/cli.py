@@ -9,10 +9,10 @@ import time
 from pathlib import Path
 
 from autobuild.adapters.progress import ProgressLogReader, is_completion_line
-from autobuild.bootstrap.composition import run_campaign
+from autobuild.bootstrap.composition import preflight_report, read_usage, run_campaign
 from autobuild.bootstrap.environment import resolve_runs_root
 from autobuild.bootstrap.profile import ProfileOverrides, load_settings
-from autobuild.domain import DeliveryMode, ItemDisposition
+from autobuild.domain import DeliveryMode, ItemDisposition, UsageReading
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -22,37 +22,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
     run = subcommands.add_parser("run", help="Run ready tracker items until a bound or stop condition")
-    run.add_argument("--repository", default=".")
-    run.add_argument("--profile")
-    run.add_argument("--harness")
-    run.add_argument("--harness-arg", action="append")
-    run.add_argument("--builder-model")
-    run.add_argument("--reviewer-model")
-    run.add_argument("--specialist-model")
-    run.add_argument("--validator-id")
-    run.add_argument("--validator-argv-json")
-    run.add_argument("--allowed-tool", action="append")
-    run.add_argument("--allowed-root", action="append")
-    run.add_argument("--max-items", type=int)
+    _profile_arguments(run)
     run.add_argument("--campaign-id")
-    run.add_argument("--scratch-root")
-    run.add_argument(
-        "--lane-state-root",
-        help="Directory for the machine-local shared lane cooling file (lanes.json).",
-    )
-    run.add_argument("--tracker", choices=("auto", "pinax", "backlog"))
-    run.add_argument("--backlog")
-    run.add_argument(
-        "--allow-item",
-        action="append",
-        help="Add an item id to the campaign allow-list (repeatable).",
-    )
-    run.add_argument(
-        "--exclude-item",
-        action="append",
-        help="Add an item id to the campaign exclude-list (repeatable).",
-    )
-    run.add_argument("--refill-plan")
     run.add_argument("--allow-delivery", action="store_true")
     run.add_argument(
         "--delivery-mode",
@@ -91,7 +62,56 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         help="Stop with exit 3 if no completion line arrives within this many seconds.",
     )
+
+    usage = subcommands.add_parser(
+        "usage",
+        help="Read the subscription usage meter once, read-only",
+    )
+    usage.add_argument("--json", action="store_true", help="Print the normalised reading as JSON.")
+    usage.add_argument("--scratch-root", help="Directory for the meter command's output files.")
+
+    preflight = subcommands.add_parser(
+        "preflight",
+        help="Probe every lane and run the launch preflight without claiming any item",
+    )
+    _profile_arguments(preflight)
+    preflight.add_argument("--json", action="store_true", help="Print the report as JSON.")
     return parser
+
+
+def _profile_arguments(command: argparse.ArgumentParser) -> None:
+    """The profile and override arguments shared by ``run`` and ``preflight``."""
+
+    command.add_argument("--repository", default=".")
+    command.add_argument("--profile")
+    command.add_argument("--harness")
+    command.add_argument("--harness-arg", action="append")
+    command.add_argument("--builder-model")
+    command.add_argument("--reviewer-model")
+    command.add_argument("--specialist-model")
+    command.add_argument("--validator-id")
+    command.add_argument("--validator-argv-json")
+    command.add_argument("--allowed-tool", action="append")
+    command.add_argument("--allowed-root", action="append")
+    command.add_argument("--max-items", type=int)
+    command.add_argument("--scratch-root")
+    command.add_argument(
+        "--lane-state-root",
+        help="Directory for the machine-local shared lane cooling file (lanes.json).",
+    )
+    command.add_argument("--tracker", choices=("auto", "pinax", "backlog"))
+    command.add_argument("--backlog")
+    command.add_argument(
+        "--allow-item",
+        action="append",
+        help="Add an item id to the campaign allow-list (repeatable).",
+    )
+    command.add_argument(
+        "--exclude-item",
+        action="append",
+        help="Add an item id to the campaign exclude-list (repeatable).",
+    )
+    command.add_argument("--refill-plan")
 
 
 def _overrides(args: argparse.Namespace) -> ProfileOverrides:
@@ -170,10 +190,83 @@ def _watch(
         sleep(poll_interval)
 
 
+def usage_payload(reading: UsageReading) -> dict[str, object]:
+    """The normalised meter reading ``autobuild usage --json`` prints."""
+
+    return {
+        "schema": "autobuild.usage.v1",
+        "meter_id": reading.meter_id,
+        "ok": reading.ok,
+        "error": reading.error or None,
+        "fetched_at": reading.fetched_at,
+        "extra_usage_enabled": reading.extra_usage_enabled,
+        "limits": [
+            {
+                "kind": limit.kind.value,
+                "scope": limit.scope,
+                "percent": limit.percent,
+                "resets_at": limit.resets_at,
+            }
+            for limit in reading.limits
+        ],
+    }
+
+
+def _usage(args: argparse.Namespace, read=read_usage) -> int:
+    """Print one meter reading; exit 0 when the meter answered and 1 when not."""
+
+    scratch = Path(args.scratch_root) if args.scratch_root else None
+    try:
+        reading = read(scratch)
+    except Exception as exc:
+        print(f"usage meter unavailable: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(usage_payload(reading), indent=2, sort_keys=True))
+    elif not reading.ok:
+        print(f"usage meter {reading.meter_id} unavailable: {reading.error}")
+    else:
+        print(f"usage meter {reading.meter_id} at {reading.fetched_at}:")
+        for limit in reading.limits:
+            print(f"  {limit.describe()}")
+        if reading.extra_usage_enabled is not None:
+            state = "enabled" if reading.extra_usage_enabled else "off"
+            print(f"  extra usage {state}")
+    return 0 if reading.ok else 1
+
+
+def _preflight(args: argparse.Namespace, report=preflight_report) -> int:
+    """Print the lane probes and the preflight; exit 0 when the launch would
+    pass, 1 when a check fails and 2 when the profile or runtime cannot load."""
+
+    try:
+        settings = load_settings(args.repository, args.profile, _overrides(args))
+        result = report(settings)
+    except Exception as exc:
+        print(f"AutoBuild preflight failed before completion: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        for lane in result["lanes"]:
+            state = "capable" if lane["capable"] else "not capable"
+            cooled = f"; cooled until {lane['cooled_until']}" if lane["cooled_until"] else ""
+            print(f"lane {lane['name']}: {state} ({lane['detail'] or lane['version']}){cooled}")
+        for probe in result["preflight"]:
+            print(f"preflight {probe['name']}: {probe['detail']}")
+        if result["error"]:
+            print(f"preflight failed: {result['error']}")
+    return 0 if result["ok"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "watch":
         return _watch(args)
+    if args.command == "usage":
+        return _usage(args)
+    if args.command == "preflight":
+        return _preflight(args)
     try:
         settings = load_settings(args.repository, args.profile, _overrides(args))
         result = run_campaign(

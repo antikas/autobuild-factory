@@ -1,6 +1,8 @@
 """Port bundle injected into the application layer by the composition root."""
 
-from dataclasses import dataclass, field
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from autobuild.ports import (
     CommandPort,
@@ -11,9 +13,10 @@ from autobuild.ports import (
     ProgressPort,
     RunRecordPort,
     TrackerPort,
+    UsageMeterPort,
     WorkspacePort,
 )
-from autobuild.domain import RunRecordRef
+from autobuild.domain import RunRecordRef, UsagePolicy
 
 
 class _NoOpProgressPort:
@@ -40,6 +43,18 @@ class Lane:
 
     name: str
     harness: HarnessPort
+    # The opaque usage meter id the lane's harness adapter declares, or None for
+    # an unmetered lane, and the adapter's own decision whether a meter scope
+    # label covers the model a seat of a given model class runs.
+    meter_id: str | None = None
+    meter_scope: Callable[[str, str], bool] | None = None
+
+    def meter_covers(self, scope: str | None, model_class: str) -> bool:
+        """A scoped limit without a label covers every seat on the lane."""
+
+        if scope is None:
+            return True
+        return self.meter_scope is not None and self.meter_scope(scope, model_class)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,3 +79,10 @@ class WorkflowPorts:
     # supplies at least one named lane.
     lanes: tuple[Lane, ...] = ()
     lane_state: LaneStatePort | None = None
+    # The usage meter and the profile's levels. Both are None when the profile has
+    # no ``[usage]`` table, and then no meter is ever read.
+    usage_meter: UsageMeterPort | None = None
+    usage_policy: UsagePolicy | None = None
+    # How a seat waits before it re-reads a meter that failed under the refuse
+    # policy. Tests inject a recorder so no test sleeps.
+    usage_retry_wait: Callable[[float], None] = time.sleep

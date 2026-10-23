@@ -21,7 +21,7 @@ Map the profile's semantic tools to Claude Code tools when a seat must be restri
 
 ## Meter
 
-Read the subscription meter before every seat and after every item, through the `/usage` view or a probe of the same figures. Record session, weekly-all and weekly-model percentages in the campaign record with each row.
+Read the subscription meter before every seat and after every item with `autobuild usage --json --scratch-root <campaign scratch>`, which prints the session, weekly-all and weekly-model percentages with their reset times, or through the `/usage` view. Record those percentages in the campaign record with each row. The command is read-only and exits 1 when the meter cannot be read; treat that as no signal and record it.
 
 ## Scratch
 

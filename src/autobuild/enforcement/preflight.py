@@ -13,13 +13,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from autobuild.domain import CommandRequest, LeaseSurface, PreflightError, PreflightProbe
+from autobuild.domain import (
+    CommandRequest,
+    LaneSignal,
+    LaneSignalKind,
+    LeaseSurface,
+    PreflightError,
+    PreflightProbe,
+    UsagePolicy,
+    UsageProbeFailure,
+)
 from autobuild.ports import (
     CommandPort,
     EnvironmentProbePort,
     FilesystemProbePort,
+    LaneStatePort,
     LeasePort,
     NetworkProbePort,
+    UsageMeterPort,
 )
 
 # Environment names that redirect trust or interception on a child process. The
@@ -64,6 +75,8 @@ class TransportCheck:
     harness: str
     max_argv_element: int
     delivered_by_file: bool
+    # A harness that runs the seat from inside the campaign process.
+    in_process: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +100,8 @@ class PreflightRequest:
     validator: ValidatorCheck
     briefs: tuple[BriefCheck, ...] = ()
     tracker_surface: LeaseSurface | None = None
+    # Environment names the harness removes from every seat child.
+    removed_environment: tuple[str, ...] = ()
     max_brief_bytes: int = 1_048_576
     max_argv_bytes: int = 8_192
 
@@ -113,6 +128,7 @@ def run_preflight(
     probes.append(_interception(request, environment))
     probes.append(_scratch(request, filesystem, lease))
     probes.append(_telemetry(request))
+    probes.append(_removed_environment(request, environment))
     probes.append(_validator_runnable(request, environment, filesystem, command))
     probes.append(_validator_offline(request, network, command, now))
     probes.append(_validator_budget(request))
@@ -218,6 +234,31 @@ def _telemetry(request: PreflightRequest) -> PreflightProbe:
         )
     disabled = ", ".join(f"{key}={value}" for key, value in request.telemetry.declared)
     return PreflightProbe(name, True, f"{request.telemetry.harness} telemetry off: {disabled}")
+
+
+def _removed_environment(
+    request: PreflightRequest, environment: EnvironmentProbePort
+) -> PreflightProbe:
+    """Warn, by name only, when the parent carries a variable the seats lose.
+
+    The value may be a credential, so the detail never includes it."""
+
+    name = "removed-environment"
+    present = [
+        variable
+        for variable in request.removed_environment
+        if environment.value(variable) is not None
+    ]
+    if not present:
+        listed = ", ".join(request.removed_environment) or "no names declared"
+        return PreflightProbe(name, True, f"none set in the parent environment: {listed}")
+    verb = "is" if len(present) == 1 else "are"
+    return PreflightProbe(
+        name,
+        True,
+        f"warning: {', '.join(present)} {verb} set in the parent environment "
+        f"and {verb} removed from every seat child",
+    )
 
 
 def _validator_runnable(
@@ -337,10 +378,11 @@ def _transport(request: PreflightRequest) -> PreflightProbe:
             f"{transport.harness} would place {transport.max_argv_element} bytes in one "
             f"argv element, over the {request.max_argv_bytes} byte limit",
         )
+    where = "runs seats in process and streams" if transport.in_process else "streams"
     return PreflightProbe(
         name,
         True,
-        f"{transport.harness} streams instructions by file; largest argv element "
+        f"{transport.harness} {where} instructions by file; largest argv element "
         f"is {transport.max_argv_element} bytes",
     )
 
@@ -358,6 +400,72 @@ def _briefs(request: PreflightRequest, filesystem: FilesystemProbePort) -> Prefl
             )
     checked = ", ".join(brief.item_id for brief in request.briefs) or "none ready"
     return PreflightProbe(name, True, f"brief files present and bounded: {checked}")
+
+
+@dataclass(frozen=True, slots=True)
+class UsageLane:
+    """One configured lane and the opaque meter id its harness declares."""
+
+    name: str
+    meter_id: str | None = None
+
+
+def run_usage_preflight(
+    policy: UsagePolicy,
+    lanes: tuple[UsageLane, ...],
+    *,
+    meter: UsageMeterPort,
+    lane_state: LaneStatePort,
+    campaign_id: str,
+) -> PreflightProbe:
+    """Check every configured lane's usage meter before any claim.
+
+    Each meter is read once. The launch is refused only when every configured
+    lane is metered and at its stop level, or when a meter cannot be read under
+    ``on_probe_failure = "refuse"``. Otherwise each metered lane at its stop level
+    is cooled until the latest binding reset, an unmetered lane is never cooled,
+    and the probe detail records warnings."""
+
+    name = "usage"
+    metered = [lane for lane in lanes if lane.meter_id]
+    if not metered:
+        return PreflightProbe(name, True, "no lane declares a usage meter")
+    assessments = {
+        meter_id: policy.assess_meter(meter.read, meter_id)
+        for meter_id in dict.fromkeys(lane.meter_id for lane in metered if lane.meter_id)
+    }
+    notes: list[str] = []
+    for meter_id, assessment in assessments.items():
+        if not assessment.failure:
+            continue
+        if policy.on_probe_failure is UsageProbeFailure.REFUSE:
+            raise _fail(name, f"usage meter {meter_id} is unavailable: {assessment.failure}")
+        notes.append(f"warning: usage meter {meter_id} is unavailable ({assessment.failure})")
+    stopped = [lane for lane in metered if assessments[lane.meter_id or ""].stops_lane]
+    if stopped and len(stopped) == len(lanes):
+        detail = "; ".join(
+            f"{lane.name}: {assessments[lane.meter_id or ''].describe_stop(policy)}"
+            for lane in stopped
+        )
+        raise _fail(name, f"every lane is at its usage stop level: {detail}")
+    for lane in stopped:
+        assessment = assessments[lane.meter_id or ""]
+        detail = assessment.describe_stop(policy)
+        lane_state.cool(
+            lane.name,
+            LaneSignal(LaneSignalKind.USAGE, reset_at=assessment.reset_at, detail=detail),
+            campaign_id,
+        )
+        notes.append(f"{lane.name} cooled until {assessment.reset_at}: {detail}")
+    for meter_id, assessment in assessments.items():
+        for limit in assessment.warnings:
+            notes.append(
+                f"warning: usage meter {meter_id} {limit.describe()} is at or above "
+                f"warn {policy.warn_percent:g}%"
+            )
+    return PreflightProbe(
+        name, True, "; ".join(notes) or "every metered lane is below its usage stop levels"
+    )
 
 
 def _last_output_line(reference: str) -> str:

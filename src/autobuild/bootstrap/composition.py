@@ -29,6 +29,11 @@ from autobuild.adapters import (
     StderrProgressAdapter,
     WindowsCommandAdapter,
 )
+from autobuild.adapters.claude_usage import (
+    CLAUDE_SUBSCRIPTION_METER,
+    ClaudeUsageMeterAdapter,
+    NullUsageMeterAdapter,
+)
 from autobuild.application import CampaignRunner, Lane, WorkflowPorts
 from autobuild.bootstrap.builtins import register_first_party_harnesses
 from autobuild.bootstrap.environment import configure_scratch_environment
@@ -45,6 +50,7 @@ from autobuild.domain import (
     LaneSignalKind,
     LeaseSurface,
     PortKind,
+    PreflightError,
     PreflightProbe,
     ProbeResult,
     RefillPlan,
@@ -52,8 +58,12 @@ from autobuild.domain import (
     SeatRequest,
     SurfaceKind,
     ToolPolicy,
+    UsageReading,
     WorkspaceRef,
 )
+from autobuild.domain.models import SeatTransport
+from autobuild.enforcement.preflight import UsageLane, run_usage_preflight
+from autobuild.ports.contracts import SeatTransportPort
 from autobuild.enforcement import (
     ApprovedValidator,
     BriefCheck,
@@ -112,6 +122,7 @@ def _build_lanes(
     scratch: Path,
     lane_state: FilesystemLaneStateAdapter,
     campaign_id: str,
+    probe_only: bool = False,
 ):
     """Build one harness per configured lane in preference order.
 
@@ -120,7 +131,10 @@ def _build_lanes(
     cooled. Each lane's adapter is then probed. A lane whose executable is
     missing, unauthenticated or lacking a required capability is cooled with the
     ``probe`` signature so the router skips it; the first capable lane is the
-    active lane for this launch. When no lane is capable the launch fails."""
+    active lane for this launch. When no lane is capable the launch fails.
+
+    With ``probe_only`` nothing is cooled and no capable lane is not an error:
+    the active lane is then None and the manifest carries each lane's result."""
 
     registry = AdapterRegistry()
     register_first_party_harnesses(registry)
@@ -139,6 +153,8 @@ def _build_lanes(
         }
         if single and settings.harness_command is not None:
             config["command"] = settings.harness_command
+        if lane.key_file is not None:
+            config["key_file"] = lane.key_file
         adapter = registry.create(PortKind.HARNESS, lane.name, config)
         _require_lane_efforts(lane, adapter)
         created.append((lane, adapter))
@@ -152,25 +168,77 @@ def _build_lanes(
         missing = _REQUIRED_HARNESS_CAPABILITIES - capabilities
         capable = probe.available and not missing
         version = probe.identity.version if probe.identity is not None else "unavailable"
+        detail = "; ".join(probe.diagnostics)
         if not capable:
-            detail = "; ".join(probe.diagnostics) or (
+            detail = detail or (
                 "missing capabilities: " + ", ".join(sorted(missing))
                 if missing
                 else "unavailable"
             )
             diagnostics.append(f"{lane.name}: {detail}")
-            lane_state.cool(
-                lane.name, LaneSignal(LaneSignalKind.PROBE, detail=detail), campaign_id
-            )
+            if not probe_only:
+                lane_state.cool(
+                    lane.name, LaneSignal(LaneSignalKind.PROBE, detail=detail), campaign_id
+                )
         elif active is None:
             active = (lane.name, adapter, probe.identity)
         lanes.append((lane.name, adapter))
         lane_manifest.append(
-            {"name": lane.name, "available": bool(capable), "version": version}
+            {"name": lane.name, "available": bool(capable), "version": version, "detail": detail}
         )
-    if active is None:
+    if active is None and not probe_only:
         raise RuntimeError("no capable harness lane: " + "; ".join(diagnostics))
     return lanes, active, lane_manifest
+
+
+def _command_adapter(scratch: Path):
+    return (
+        WindowsCommandAdapter(scratch / "commands")
+        if os.name == "nt"
+        else PosixCommandAdapter(scratch / "commands")
+    )
+
+
+def _usage_meter(settings: RunSettings, command: object, scratch: Path, lanes_raw):
+    """The usage meter for this run, or None when the profile has no ``[usage]``.
+
+    The meter is chosen by the meter ids the lane adapters declare; a declared id
+    no first-party meter serves gets the null meter, whose readings fail."""
+
+    if settings.usage is None:
+        return None
+    declared = {getattr(adapter, "meter_id", None) for _name, adapter in lanes_raw}
+    if declared & ClaudeUsageMeterAdapter.meter_ids:
+        return ClaudeUsageMeterAdapter(command, scratch / "usage")
+    return NullUsageMeterAdapter()
+
+
+def _usage_preflight(
+    settings: RunSettings, lanes_raw, meter, lane_state, campaign_id: str
+) -> PreflightProbe | None:
+    """Read every configured lane's meter before any claim; None without ``[usage]``."""
+
+    if settings.usage is None or meter is None:
+        return None
+    return run_usage_preflight(
+        settings.usage,
+        tuple(
+            UsageLane(name, getattr(adapter, "meter_id", None)) for name, adapter in lanes_raw
+        ),
+        meter=meter,
+        lane_state=lane_state,
+        campaign_id=campaign_id,
+    )
+
+
+def read_usage(
+    scratch_root: Path | None = None, meter_id: str = CLAUDE_SUBSCRIPTION_METER
+) -> UsageReading:
+    """One read-only meter reading for the ``autobuild usage`` command."""
+
+    scratch = configure_scratch_environment(scratch_root)
+    meter = ClaudeUsageMeterAdapter(_command_adapter(scratch), scratch / "usage")
+    return meter.read(meter_id)
 
 
 def _runtime(
@@ -179,12 +247,9 @@ def _runtime(
     delivery_mode: DeliveryMode,
     push_current_branch: bool,
     campaign_id: str,
+    probe_only: bool = False,
 ):
-    command = (
-        WindowsCommandAdapter(scratch / "commands")
-        if os.name == "nt"
-        else PosixCommandAdapter(scratch / "commands")
-    )
+    command = _command_adapter(scratch)
     push_primary = (
         delivery_mode is DeliveryMode.PROTECTED_DEFAULT or push_current_branch
     )
@@ -241,11 +306,15 @@ def _runtime(
         settings.lane_state_root or scratch, cool_seconds=settings.lane_cool_seconds
     )
     lanes_raw, active, lane_manifest = _build_lanes(
-        settings, command, scratch, lane_state, campaign_id
+        settings, command, scratch, lane_state, campaign_id, probe_only
     )
-    active_name, active_adapter, active_identity = active
+    if active is None:
+        active_name, active_adapter, harness_entry = "", None, ("harness", "none", "unavailable")
+    else:
+        active_name, active_adapter, active_identity = active
+        harness_entry = ("harness", active_identity.name, active_identity.version)
     manifest = [
-        ("harness", active_identity.name, active_identity.version),
+        harness_entry,
         _probe("tracker", tracker),
         _probe("workspace", workspace),
         _probe("command", command),
@@ -410,6 +479,7 @@ def _ports(
     lane_state,
     active_name,
     progress,
+    usage_meter=None,
 ) -> WorkflowPorts:
     policy = PolicyGateway(
         PolicyConfig(
@@ -425,9 +495,7 @@ def _ports(
             allow_protected_merge=delivery_mode is DeliveryMode.PROTECTED_DEFAULT,
         )
     )
-    wrapped_lanes = tuple(
-        Lane(name, policy.harness(adapter)) for name, adapter in lanes_raw
-    )
+    wrapped_lanes = tuple(_lane(name, policy.harness(adapter), adapter) for name, adapter in lanes_raw)
     active_harness = next(
         (lane.harness for lane in wrapped_lanes if lane.name == active_name),
         policy.harness(harness),
@@ -443,6 +511,21 @@ def _ports(
         lease=policy.lease(lease),
         lanes=wrapped_lanes,
         lane_state=lane_state,
+        usage_meter=usage_meter,
+        usage_policy=settings.usage if usage_meter is not None else None,
+    )
+
+
+def _lane(name: str, harness, adapter: object) -> Lane:
+    """Bind a lane to its policy-wrapped harness and the raw adapter's meter
+    declaration, which the policy wrapper does not carry."""
+
+    meter_id = getattr(adapter, "meter_id", None)
+    return Lane(
+        name,
+        harness,
+        meter_id=meter_id,
+        meter_scope=getattr(adapter, "meter_scope_covers", None) if meter_id else None,
     )
 
 
@@ -463,6 +546,27 @@ def _origin_https_target(repository: Path):
     if parsed.scheme != "https" or not parsed.hostname:
         return None
     return TlsTarget(parsed.hostname, parsed.port or 443)
+
+
+def _seat_transport(name: str, harness, request: SeatRequest) -> SeatTransport:
+    """How the active harness delivers a seat, for the preflight doctor.
+
+    A harness that declares its transport answers for itself; this is required
+    of an in-process harness. A command-line harness without the declaration is
+    read from the argument vector it would run."""
+
+    if isinstance(harness, SeatTransportPort):
+        return harness.seat_transport(request)
+    invocation = getattr(harness, "_invocation", None)
+    environment = getattr(harness, "_scratch_environment", None)
+    if invocation is None or environment is None:
+        raise ConfigurationError(f"harness {name} declares no seat transport for the preflight")
+    argv, _extra, stdin_ref = invocation(request, "preflight:doctor")
+    return SeatTransport(
+        max((len(part.encode("utf-8")) for part in argv), default=0),
+        stdin_ref is not None,
+        tuple(environment()),
+    )
 
 
 def _preflight(
@@ -487,12 +591,6 @@ def _preflight(
     if origin is not None and (origin.host, origin.port) not in seen:
         targets.append(origin)
 
-    telemetry = TelemetryCheck(
-        settings.harness,
-        tuple(harness.telemetry_environment),
-        tuple(harness._scratch_environment()),
-    )
-
     doctor_root = scratch / "harness" / "preflight"
     doctor_root.mkdir(parents=True, exist_ok=True)
     doctor_workspace = WorkspaceRef(doctor_root, "preflight", "base", "preflight")
@@ -508,9 +606,18 @@ def _preflight(
         "builder-report-v1",
         60,
     )
-    argv, _extra, stdin_ref = harness._invocation(synthetic, "preflight:doctor")
-    max_argv_element = max((len(part.encode("utf-8")) for part in argv), default=0)
-    transport = TransportCheck(settings.harness, max_argv_element, stdin_ref is not None)
+    seat_transport = _seat_transport(settings.harness, harness, synthetic)
+    telemetry = TelemetryCheck(
+        settings.harness,
+        tuple(getattr(harness, "telemetry_environment", ())),
+        seat_transport.child_environment,
+    )
+    transport = TransportCheck(
+        settings.harness,
+        seat_transport.max_argv_element,
+        seat_transport.delivered_by_file,
+        seat_transport.in_process,
+    )
 
     script_path = None
     if len(settings.validator_argv) >= 2:
@@ -547,6 +654,7 @@ def _preflight(
             validator=validator,
             briefs=briefs,
             tracker_surface=tracker_surface,
+            removed_environment=tuple(getattr(harness, "removed_environment", ())),
         ),
         network=SocketNetworkProbe(),
         environment=ProcessEnvironmentProbe(dict(os.environ)),
@@ -643,6 +751,91 @@ def _starting_lane_efforts(
     }
 
 
+def preflight_report(
+    settings: RunSettings, *, campaign_id: str | None = None
+) -> dict[str, Any]:
+    """Probe every lane and run the launch preflight, claiming nothing.
+
+    Lane probes cool nothing. The shared lane state is read for each lane's
+    current cooling and never written: a usage stop is assessed against a lane
+    state private to this command."""
+
+    scratch = configure_scratch_environment(settings.scratch_root)
+    effective_id = campaign_id or datetime.now(UTC).strftime("preflight-%Y%m%dT%H%M%SZ")
+    (
+        tracker,
+        _workspace,
+        harness,
+        command,
+        _knowledge,
+        lease,
+        tracker_surface,
+        _manifest,
+        repository,
+        lanes_raw,
+        lane_state,
+        lane_manifest,
+        active_name,
+    ) = _runtime(
+        settings, scratch, DeliveryMode.PROTECTED_DEFAULT, False, effective_id, True
+    )
+    lanes: list[dict[str, object]] = []
+    for entry in lane_manifest:
+        cooling = lane_state.active(str(entry["name"]))
+        lanes.append(
+            {
+                "name": entry["name"],
+                "capable": entry["available"],
+                "version": entry["version"],
+                "detail": entry["detail"],
+                "cooled_until": cooling.cooled_until if cooling is not None else None,
+                "cooled_signature": cooling.signature if cooling is not None else None,
+            }
+        )
+    probes: list[PreflightProbe] = []
+    error: str | None = None
+    if harness is None:
+        error = "no capable harness lane"
+    else:
+        campaign = CampaignRef(
+            effective_id,
+            settings.repository,
+            max_items=settings.max_items,
+            refill_enabled=settings.refill_plan is not None,
+            selection=settings.selection,
+        )
+        try:
+            probes.extend(
+                _preflight(
+                    settings, scratch, harness, command, tracker, lease,
+                    tracker_surface, campaign, repository,
+                )
+            )
+            meter = _usage_meter(settings, command, scratch, lanes_raw)
+            private_state = FilesystemLaneStateAdapter(
+                scratch / "preflight" / effective_id, cool_seconds=settings.lane_cool_seconds
+            )
+            usage_probe = _usage_preflight(settings, lanes_raw, meter, private_state, effective_id)
+            if usage_probe is not None:
+                probes.append(usage_probe)
+        except PreflightError as exc:
+            error = str(exc)
+    return {
+        "schema": "autobuild.preflight.v1",
+        "version": __version__,
+        "repository": str(settings.repository),
+        "scratch_root": str(scratch),
+        "ok": error is None,
+        "error": error,
+        "active_lane": active_name or None,
+        "lanes": lanes,
+        "preflight": [
+            {"name": probe.name, "passed": probe.passed, "detail": probe.detail}
+            for probe in probes
+        ],
+    }
+
+
 def run_campaign(
     settings: RunSettings,
     *,
@@ -703,6 +896,12 @@ def run_campaign(
         campaign,
         repository,
     )
+    usage_meter = _usage_meter(settings, command, scratch, lanes_raw)
+    usage_probe = _usage_preflight(
+        settings, lanes_raw, usage_meter, lane_state, effective_campaign_id
+    )
+    if usage_probe is not None:
+        preflight_probes = (*preflight_probes, usage_probe)
     lanes_metadata = _lanes_metadata(settings, lane_manifest, lane_state, active_name)
     records = LocalRunRecordAdapter(
         scratch / "runs",
@@ -723,6 +922,7 @@ def run_campaign(
         lane_state,
         active_name,
         _progress_port(settings),
+        usage_meter,
     )
     refill = settings.refill_plan or RefillPlan()
     target_branch = repository.current_branch or repository.default_branch

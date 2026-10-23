@@ -10,6 +10,7 @@ from autobuild.adapters import (
     CodexHarnessAdapter,
     CopilotCliHarnessAdapter,
 )
+from autobuild.adapters.claude_sdk_harness import ClaudeSdkHarnessAdapter
 from autobuild.bootstrap.registry import AdapterRegistry
 from autobuild.domain import PortKind
 
@@ -57,6 +58,17 @@ def register_first_party_harnesses(registry: AdapterRegistry) -> None:
             _models(config),
         )
 
+    def claude_sdk(config: Mapping[str, object]):
+        key_file = config.get("key_file")
+        if key_file is not None and not isinstance(key_file, (str, Path)):
+            raise TypeError("key_file must be a path")
+        return ClaudeSdkHarnessAdapter(
+            _required(config, "command_port"),
+            Path(_required(config, "output_root")),
+            Path(key_file) if key_file is not None else None,
+            _models(config),
+        )
+
     def copilot(config: Mapping[str, object]):
         return CopilotCliHarnessAdapter(
             _required(config, "command_port"),
@@ -66,5 +78,6 @@ def register_first_party_harnesses(registry: AdapterRegistry) -> None:
         )
 
     registry.register(PortKind.HARNESS, "claude-code", claude)
+    registry.register(PortKind.HARNESS, "claude-sdk", claude_sdk)
     registry.register(PortKind.HARNESS, "codex", codex)
     registry.register(PortKind.HARNESS, "github-copilot", copilot)
