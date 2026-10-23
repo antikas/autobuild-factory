@@ -371,6 +371,96 @@ def test_host_command_streams_declared_stdin_file(tmp_path: Path) -> None:
     assert Path(result.stdout_ref).read_text(encoding="utf-8").strip() == "200000"
 
 
+BILLING_VARIABLES = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+DUMP_ENVIRONMENT = "import json, os; print(json.dumps(dict(os.environ)))"
+
+
+def _child_environment(
+    tmp_path: Path, command_id: str, remove: tuple[str, ...]
+) -> dict[str, str]:
+    adapter = host_command_adapter(tmp_path / "commands")
+    result = adapter.run(
+        CommandRequest(
+            command_id,
+            (sys.executable, "-c", DUMP_ENVIRONMENT),
+            tmp_path,
+            environment=(("AUTOBUILD_TEST_VALUE", "declared"),),
+            timeout_seconds=10,
+            remove_environment=remove,
+        )
+    )
+    assert result.exit_code == 0
+    return json.loads(Path(result.stdout_ref).read_text(encoding="utf-8"))
+
+
+def test_host_command_removes_the_listed_variables_from_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = "sentinel-billing-value-7f3a"
+    for name in BILLING_VARIABLES:
+        monkeypatch.setenv(name, sentinel)
+
+    child = _child_environment(tmp_path, "removed", BILLING_VARIABLES)
+
+    expected = {
+        key: value for key, value in os.environ.items() if key not in BILLING_VARIABLES
+    }
+    expected["AUTOBUILD_TEST_VALUE"] = "declared"
+    assert not set(BILLING_VARIABLES) & set(child)
+    assert sentinel not in json.dumps(child)
+    assert child == expected
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="POSIX environment names are case-sensitive; only Windows matches them case-insensitively",
+)
+def test_host_command_removes_the_listed_variables_in_any_case_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = "sentinel-billing-value-7f3a"
+    monkeypatch.setenv("anthropic_api_key", sentinel)
+    monkeypatch.setenv("Anthropic_Auth_Token", sentinel)
+    monkeypatch.setenv("Autobuild_Mixed_Case_Marker", "kept")
+
+    child = _child_environment(
+        tmp_path, "removed-any-case", ("Anthropic_Api_Key", "anthropic_AUTH_token")
+    )
+
+    names = {key.upper(): value for key, value in child.items()}
+    assert not set(BILLING_VARIABLES) & set(names)
+    assert sentinel not in json.dumps(child)
+    assert names["AUTOBUILD_MIXED_CASE_MARKER"] == "kept"
+
+
+def test_host_command_environment_is_unchanged_when_the_listed_variables_are_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in BILLING_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+    with_removal = _child_environment(tmp_path, "with-removal", BILLING_VARIABLES)
+    without_removal = _child_environment(tmp_path, "without-removal", ())
+
+    expected = dict(os.environ)
+    expected["AUTOBUILD_TEST_VALUE"] = "declared"
+    assert with_removal == expected
+    assert without_removal == expected
+
+
+def test_command_request_refuses_a_variable_both_set_and_removed(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="both set and removed: SHARED"):
+        CommandRequest(
+            "conflict",
+            ("python",),
+            tmp_path,
+            environment=(("SHARED", "1"),),
+            remove_environment=("SHARED",),
+        )
+    with pytest.raises(ValueError, match="removed environment names must not be empty"):
+        CommandRequest("blank", ("python",), tmp_path, remove_environment=(" ",))
+
+
 # --- Stall deadline: the pure decision over sample tuples ----------------------
 
 

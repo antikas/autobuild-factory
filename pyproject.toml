@@ -1,12 +1,15 @@
 [project]
 name = "autobuild-factory"
-version = "0.7.0"
+version = "0.8.0"
 description = "The software factory's build cycle, harness-neutral: logic once, mechanisms behind adapters."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Georgios Antikatzidis" }]
 requires-python = ">=3.11"
 dependencies = []
+
+[project.optional-dependencies]
+sdk = ["claude-agent-sdk>=0.2.168,<0.2.169"]
 
 [project.urls]
 Repository = "https://github.com/antikas/autobuild-factory"

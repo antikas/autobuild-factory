@@ -226,9 +226,22 @@ class CliHarnessAdapter:
     # the Console Do Not Track standard (https://consoledonottrack.com/), honoured
     # by an increasing number of CLI tools. Subclasses add vendor-specific names.
     telemetry_environment: tuple[tuple[str, str], ...] = (("DO_NOT_TRACK", "1"),)
+    # API-billing credentials removed from every seat and probe child, so a
+    # subscription seat never bills an API key that happens to be set in the
+    # parent environment.
+    removed_environment: tuple[str, ...] = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
     # The effort levels this adapter can pass to its command. A seat asking for any
     # other level is refused, never run without its effort.
     effort_levels: frozenset[EffortLevel] = frozenset()
+    # The opaque id of the usage meter that measures this adapter's seats, or None
+    # when no meter does. A lane without a meter is never cooled by a meter.
+    meter_id: str | None = None
+
+    def meter_scope_covers(self, scope: str, model_class: str) -> bool:
+        """Whether the meter's scope label covers the model a seat of
+        ``model_class`` runs. An adapter without a meter covers nothing."""
+
+        return False
 
     def __init__(
         self,
@@ -276,6 +289,7 @@ class CliHarnessAdapter:
                 stdin_ref=stdin_ref,
                 progress_deadline_seconds=request.progress_deadline_seconds,
                 progress_digest=request.progress_digest,
+                remove_environment=self.removed_environment,
             )
         )
         outcome = SeatOutcome.SUCCEEDED
@@ -460,6 +474,7 @@ class CliHarnessAdapter:
                 self._output_root,
                 environment=self._scratch_environment(),
                 timeout_seconds=20,
+                remove_environment=self.removed_environment,
             )
         )
 

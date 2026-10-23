@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -112,13 +114,16 @@ class LaneSignalKind(str, Enum):
 
     ``rate_limit``, ``quota`` and ``auth`` come from the CLI's structured error
     fields; ``spawn`` is the executable exiting before any structured output;
-    ``probe`` is a launch-time preflight failure. Every kind cools its lane."""
+    ``probe`` is a launch-time preflight failure; ``usage`` is a usage meter
+    reading at the stop level. Every kind cools its lane."""
 
     RATE_LIMIT = "rate_limit"
     QUOTA = "quota"
     AUTH = "auth"
     SPAWN = "spawn"
     PROBE = "probe"
+    # A usage meter reading at or above the profile's stop level.
+    USAGE = "usage"
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +153,205 @@ class LaneCooling:
     signature: str
     last_failure_at: str
     campaign_id: str
+
+
+class UsageLimitKind(str, Enum):
+    """The limit classes a usage meter reports.
+
+    ``session`` is the short rolling window, ``weekly_all`` the weekly limit
+    across every model, and ``weekly_scoped`` a weekly limit for the models its
+    scope label names."""
+
+    SESSION = "session"
+    WEEKLY_ALL = "weekly_all"
+    WEEKLY_SCOPED = "weekly_scoped"
+
+
+@dataclass(frozen=True, slots=True)
+class UsageLimit:
+    """One normalised meter limit.
+
+    ``resets_at`` is an offset-aware UTC ISO 8601 instant, or None when the meter
+    gave no usable reset. ``scope`` is the meter's own opaque label for the models
+    a scoped limit covers; only the harness adapter interprets it."""
+
+    kind: UsageLimitKind
+    percent: float
+    resets_at: str | None = None
+    scope: str | None = None
+
+    def describe(self) -> str:
+        scope = f" [{self.scope}]" if self.scope else ""
+        reset = self.resets_at or "an unknown time"
+        return f"{self.kind.value}{scope} {_percent(self.percent)}%, resets {reset}"
+
+
+def _percent(value: float) -> str:
+    return f"{value:g}"
+
+
+@dataclass(frozen=True, slots=True)
+class UsageReading:
+    """One read-only reading of a usage meter.
+
+    A failed reading carries ``ok=False`` and a short error that names no
+    credential; its limits are empty. ``extra_usage_enabled`` is None when the
+    meter does not report the switch."""
+
+    meter_id: str
+    ok: bool
+    limits: tuple[UsageLimit, ...] = ()
+    error: str = ""
+    extra_usage_enabled: bool | None = None
+    fetched_at: str = ""
+
+    @classmethod
+    def failed(cls, meter_id: str, error: str, fetched_at: str = "") -> "UsageReading":
+        return cls(meter_id, False, (), error or "meter unavailable", None, fetched_at)
+
+
+class UsageProbeFailure(str, Enum):
+    """What a run does when the meter cannot be read."""
+
+    ALLOW = "allow"
+    REFUSE = "refuse"
+
+
+@dataclass(frozen=True, slots=True)
+class UsageAssessment:
+    """A usage reading judged against the profile's levels.
+
+    ``lane_stops`` are unscoped limits at their stop level: they stop the lane
+    until the latest of their resets. ``scoped_stops`` are model-scoped limits at
+    the stop level: they stop only the seats whose model the scope covers.
+    ``warnings`` are limits at or above the warning level. ``failure`` is empty
+    when the reading can be used, otherwise the reason it cannot."""
+
+    reading: UsageReading
+    lane_stops: tuple[UsageLimit, ...] = ()
+    scoped_stops: tuple[UsageLimit, ...] = ()
+    warnings: tuple[UsageLimit, ...] = ()
+    failure: str = ""
+
+    @property
+    def stops_lane(self) -> bool:
+        return not self.failure and bool(self.lane_stops)
+
+    @property
+    def reset_at(self) -> str | None:
+        """The latest reset among the binding unscoped limits."""
+
+        resets = [
+            (instant, limit.resets_at)
+            for limit in self.lane_stops
+            if limit.resets_at and (instant := _optional_instant(limit.resets_at)) is not None
+        ]
+        if not resets:
+            return None
+        return max(resets)[1]
+
+    def describe_stop(self, policy: "UsagePolicy") -> str:
+        return "; ".join(
+            f"{limit.describe()} (stop {_percent(policy.stop_for(limit.kind))}%)"
+            for limit in self.lane_stops
+        )
+
+
+def _optional_instant(moment: str | None) -> datetime | None:
+    """An offset-aware instant, or None for a missing, naive or unreadable one."""
+
+    if not moment:
+        return None
+    try:
+        parsed = datetime.fromisoformat(moment)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+@dataclass(frozen=True, slots=True)
+class UsagePolicy:
+    """The profile's usage levels: the single owner of the threshold rule.
+
+    ``five_hour_stop_percent`` binds the ``session`` limit; ``stop_percent``
+    binds ``weekly_all`` and ``weekly_scoped``. A limit binds at or above its
+    stop level and warns at or above ``warn_percent``."""
+
+    warn_percent: float = 80.0
+    stop_percent: float = 90.0
+    five_hour_stop_percent: float = 95.0
+    on_probe_failure: UsageProbeFailure = UsageProbeFailure.ALLOW
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("warn_percent", self.warn_percent),
+            ("stop_percent", self.stop_percent),
+            ("five_hour_stop_percent", self.five_hour_stop_percent),
+        ):
+            if not 0 < value <= 100:
+                raise ValueError(f"usage.{label} must be above 0 and at most 100")
+        if self.warn_percent > self.stop_percent:
+            raise ValueError("usage.warn_percent must not exceed usage.stop_percent")
+
+    def stop_for(self, kind: UsageLimitKind) -> float:
+        if kind is UsageLimitKind.SESSION:
+            return self.five_hour_stop_percent
+        return self.stop_percent
+
+    def assess_meter(
+        self, read: Callable[[str], UsageReading], meter_id: str
+    ) -> UsageAssessment:
+        """Read one meter and judge the reading, never raising: a meter or a
+        reading that raises becomes a meter failure naming only the error type."""
+
+        try:
+            reading = read(meter_id)
+        except Exception as exc:
+            reading = UsageReading.failed(meter_id, f"meter read failed: {type(exc).__name__}")
+        try:
+            return self.assess(reading)
+        except Exception as exc:
+            error = f"meter reading could not be judged: {type(exc).__name__}"
+            return UsageAssessment(UsageReading.failed(meter_id, error), failure=error)
+
+    def assess(self, reading: UsageReading) -> UsageAssessment:
+        if not reading.ok:
+            return UsageAssessment(reading, failure=reading.error or "meter unavailable")
+        lane_stops: list[UsageLimit] = []
+        scoped_stops: list[UsageLimit] = []
+        warnings: list[UsageLimit] = []
+        for limit in reading.limits:
+            if not math.isfinite(limit.percent):
+                return UsageAssessment(
+                    reading, failure=f"{limit.kind.value} has no finite percent"
+                )
+            if limit.percent >= self.warn_percent:
+                warnings.append(limit)
+            if limit.percent < self.stop_for(limit.kind):
+                continue
+            if limit.kind is UsageLimitKind.WEEKLY_SCOPED:
+                scoped_stops.append(limit)
+            else:
+                lane_stops.append(limit)
+        # A lane cooled without a future reset would fall back to the long
+        # default cooling window, so a binding limit whose reset is missing,
+        # unreadable or not after the reading is a meter failure, never a cooling.
+        failure = ""
+        fetched = _optional_instant(reading.fetched_at)
+        for limit in lane_stops:
+            reset = _optional_instant(limit.resets_at)
+            if reset is None:
+                failure = f"{limit.kind.value} is at its stop level with no usable reset time"
+                break
+            if fetched is not None and reset <= fetched:
+                failure = (
+                    f"{limit.kind.value} is at its stop level with a reset time "
+                    f"{limit.resets_at} that is not after the reading"
+                )
+                break
+        return UsageAssessment(
+            reading, tuple(lane_stops), tuple(scoped_stops), tuple(warnings), failure
+        )
 
 
 class DeliveryMode(str, Enum):
@@ -542,6 +746,22 @@ class SeatUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class SeatTransport:
+    """How a harness delivers one seat to its child process, for the preflight.
+
+    ``max_argv_element`` is the largest single argument in bytes,
+    ``delivered_by_file`` says the instructions travel by file or stdin rather
+    than argv, ``child_environment`` is the environment the harness adds for its
+    child, and ``in_process`` marks a harness that runs the seat from inside the
+    campaign process."""
+
+    max_argv_element: int
+    delivered_by_file: bool
+    child_environment: tuple[tuple[str, str], ...] = ()
+    in_process: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class BuilderReport:
     report_ref: str
     summary: str
@@ -601,6 +821,17 @@ class CommandRequest:
     # with only the wall-clock timeout, exactly as before.
     progress_deadline_seconds: float = 0.0
     progress_digest: Callable[[], str] | None = None
+    # Names the command adapter removes from the inherited environment before it
+    # applies ``environment``. A name absent from the parent is ignored.
+    remove_environment: tuple[str, ...] = ()
+    # Text the command adapter writes to the child's standard input through a
+    # pipe. It may carry a credential, so it is never written to disk and is left
+    # out of the request's repr.
+    stdin_text: str | None = field(default=None, repr=False)
+    # Values the command adapter replaces in the child's captured output before
+    # that output is written, so a credential echoed by the child never reaches
+    # disk. Honoured for a request that carries ``stdin_text``.
+    redact: tuple[str, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         if not self.command_id.strip() or not self.argv:
@@ -609,8 +840,21 @@ class CommandRequest:
             raise ValueError("command timeout must be positive")
         if self.stdin_ref is not None and not self.stdin_ref.strip():
             raise ValueError("command stdin_ref must not be empty")
+        if self.stdin_ref is not None and self.stdin_text is not None:
+            raise ValueError("command stdin comes from a file or from text, not both")
+        if self.redact and self.stdin_text is None:
+            raise ValueError("command output redaction needs stdin_text")
         if self.progress_deadline_seconds < 0:
             raise ValueError("command progress deadline must not be negative")
+        if any(not name.strip() for name in self.remove_environment):
+            raise ValueError("removed environment names must not be empty")
+        conflicting = sorted(
+            {key for key, _ in self.environment} & set(self.remove_environment)
+        )
+        if conflicting:
+            raise ValueError(
+                f"command environment names are both set and removed: {', '.join(conflicting)}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

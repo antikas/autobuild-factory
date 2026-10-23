@@ -2,6 +2,7 @@
 
 from autobuild.testing.fakes import (
     FakeAdapter,
+    FakeAgentSdkClient,
     FakeCommandAdapter,
     FakeEnvironmentProbe,
     FakeFilesystemProbe,
@@ -13,11 +14,13 @@ from autobuild.testing.fakes import (
     FakeProgressPort,
     FakeRunRecordAdapter,
     FakeTrackerAdapter,
+    FakeUsageMeter,
     FakeWorkspaceAdapter,
 )
 
 __all__ = [
     "FakeAdapter",
+    "FakeAgentSdkClient",
     "FakeCommandAdapter",
     "FakeEnvironmentProbe",
     "FakeFilesystemProbe",
@@ -29,5 +32,6 @@ __all__ = [
     "FakeProgressPort",
     "FakeRunRecordAdapter",
     "FakeTrackerAdapter",
+    "FakeUsageMeter",
     "FakeWorkspaceAdapter",
 ]

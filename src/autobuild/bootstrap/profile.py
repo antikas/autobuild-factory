@@ -15,6 +15,8 @@ from autobuild.domain import (
     Proposal,
     RefillPlan,
     Seat,
+    UsagePolicy,
+    UsageProbeFailure,
 )
 
 
@@ -56,6 +58,9 @@ class LaneProfile:
     builder_effort: EffortLevel | None = None
     reviewer_effort: EffortLevel | None = None
     specialist_effort: EffortLevel | None = None
+    # The file holding the lane's API key, for a lane whose adapter reads one.
+    # Only the path is held; the key itself is never read into the profile.
+    key_file: Path | None = None
 
     def efforts(self) -> dict[Seat, EffortLevel]:
         """The seats that set an effort on this lane, with their levels."""
@@ -103,6 +108,8 @@ class RunSettings:
     progress_file: bool
     progress_stderr: bool
     progress_command_timeout_seconds: float
+    # The ``[usage]`` levels, or None when the profile has no ``[usage]`` table.
+    usage: UsagePolicy | None = None
 
 
 def _table(document: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -254,7 +261,7 @@ _PROFILE_ALLOWED_KEYS: dict[str, frozenset[str]] = {
     "profile": frozenset(
         {
             "run", "models", "validator", "harness", "policy", "tracker", "preflight",
-            "refill", "knowledge", "selection", "progress", "lanes",
+            "refill", "knowledge", "selection", "progress", "lanes", "usage",
         }
     ),
     "run": frozenset(
@@ -274,7 +281,10 @@ _PROFILE_ALLOWED_KEYS: dict[str, frozenset[str]] = {
     "knowledge": frozenset({"command", "fog_ledger"}),
     "selection": frozenset({"allow", "exclude"}),
     "progress": frozenset({"command", "file", "stderr", "command_timeout_seconds"}),
-    "lanes.*": frozenset({"builder", "reviewer", "specialist", *_EFFORT_KEYS}),
+    "usage": frozenset(
+        {"warn_percent", "stop_percent", "five_hour_stop_percent", "on_probe_failure"}
+    ),
+    "lanes.*": frozenset({"builder", "reviewer", "specialist", "key_file", *_EFFORT_KEYS}),
 }
 
 
@@ -364,10 +374,11 @@ def _refuse_duplicate_lanes(order: list[str]) -> None:
         )
 
 
-def _lane_profile(lanes_table: Mapping[str, Any], name: str) -> LaneProfile:
+def _lane_profile(lanes_table: Mapping[str, Any], name: str, base: Path) -> LaneProfile:
     table = lanes_table.get(name)
     if not isinstance(table, Mapping):
         raise ConfigurationError(f"[lanes.{name}] must be a TOML table")
+    key_file = _optional_string(table.get("key_file"), f"lanes.{name}.key_file")
     builder = _optional_string(table.get("builder"), f"lanes.{name}.builder")
     reviewer = _optional_string(table.get("reviewer"), f"lanes.{name}.reviewer")
     specialist = _optional_string(table.get("specialist"), f"lanes.{name}.specialist")
@@ -388,6 +399,7 @@ def _lane_profile(lanes_table: Mapping[str, Any], name: str) -> LaneProfile:
         reviewer,
         specialist or reviewer,
         *_seat_efforts(table, f"lanes.{name}"),
+        key_file=_resolve_path(key_file, base) if key_file else None,
     )
 
 
@@ -397,7 +409,7 @@ def _validate_parked_lane(lanes_table: Mapping[str, Any], name: str) -> None:
     table = lanes_table[name]
     assert isinstance(table, Mapping)
     prefix = f"lanes.{name}"
-    for key in ("builder", "reviewer", "specialist"):
+    for key in ("builder", "reviewer", "specialist", "key_file"):
         if key in table:
             _optional_string(table[key], f"{prefix}.{key}")
     _seat_efforts(table, prefix)
@@ -409,6 +421,7 @@ def _lanes_and_validator(
     models: Mapping[str, Any],
     validator: Mapping[str, Any],
     overrides: ProfileOverrides,
+    base: Path,
 ) -> tuple[tuple[LaneProfile, ...], str]:
     """Build the ordered tier map and the validator id.
 
@@ -438,7 +451,7 @@ def _lanes_and_validator(
         for name in lanes_table:
             if name not in order:
                 _validate_parked_lane(lanes_table, name)
-        lanes = tuple(_lane_profile(lanes_table, name) for name in order)
+        lanes = tuple(_lane_profile(lanes_table, name, base) for name in order)
         if validator_id is None:
             raise ConfigurationError("missing required run configuration: validator.id")
         return lanes, validator_id
@@ -601,6 +614,39 @@ def _progress(table: Mapping[str, Any]) -> tuple[tuple[str, ...] | None, bool, b
     return command, file_enabled, stderr_enabled, float(timeout)
 
 
+def _usage_percent(table: Mapping[str, Any], key: str, default: float) -> float:
+    value = table.get(key, default)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ConfigurationError(f"usage.{key} must be a number")
+    return float(value)
+
+
+def _usage(document: Mapping[str, Any]) -> UsagePolicy | None:
+    """Validate the optional ``[usage]`` table.
+
+    Without the table no usage meter is read. Every key is optional; the levels
+    default to warn 80, stop 90 and five-hour stop 95, and ``on_probe_failure``
+    defaults to ``allow``."""
+
+    if "usage" not in document:
+        return None
+    table = _table(document, "usage")
+    defaults = UsagePolicy()
+    warn = _usage_percent(table, "warn_percent", defaults.warn_percent)
+    stop = _usage_percent(table, "stop_percent", defaults.stop_percent)
+    five_hour = _usage_percent(
+        table, "five_hour_stop_percent", defaults.five_hour_stop_percent
+    )
+    failure = table.get("on_probe_failure", defaults.on_probe_failure.value)
+    accepted = tuple(choice.value for choice in UsageProbeFailure)
+    if failure not in accepted:
+        raise ConfigurationError("usage.on_probe_failure must be one of: " + ", ".join(accepted))
+    try:
+        return UsagePolicy(warn, stop, five_hour, UsageProbeFailure(failure))
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
 def _budget_seconds(validator: Mapping[str, Any]) -> float | None:
     if "budget_seconds" not in validator:
         return None
@@ -675,7 +721,7 @@ def load_settings(
     progress = _table(document, "progress")
 
     lanes, validator_id = _lanes_and_validator(
-        document, run, models, validator, overrides
+        document, run, models, validator, overrides, base
     )
     primary = lanes[0]
     harness_name = primary.name
@@ -795,4 +841,5 @@ def load_settings(
         progress_file=progress_file,
         progress_stderr=progress_stderr,
         progress_command_timeout_seconds=progress_timeout,
+        usage=_usage(document),
     )

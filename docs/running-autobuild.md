@@ -97,10 +97,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.7.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.7.0). Install the released command from PyPI:
+Release 0.8.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.8.0). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.7.0
+uv tool install autobuild-factory==0.8.0
 ```
 
 AutoBuild 0.7.0 needs pinax-tracker 0.2.1 or later when the project uses Pinax. From 0.7.0 Pinax commits every tracker change itself and AutoBuild only verifies that commit; an earlier Pinax leaves the change uncommitted and AutoBuild stops at the first claim. Do not use AutoBuild 0.6.0 or earlier with pinax-tracker 0.2.1 or later: those versions commit the tracker change themselves and refuse a tracker that has already committed it.
@@ -134,7 +134,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.7.0
+uv tool install autobuild-factory==0.8.0
 autobuild --help
 ```
 
@@ -531,13 +531,79 @@ reviewer = "gpt-5.6"
 specialist = "gpt-5.6"
 ```
 
-`run.lanes` names the lanes in order of preference. Each name must have a `[lanes.<harness>]` table with `builder` and `reviewer` model names; `specialist` is optional and defaults to the reviewer model. A lane table whose name is absent from `run.lanes` is parked: its present model names and effort values are checked, but its missing model keys are allowed. A parked lane is not resolved, probed, or selected by `--harness`, so it has no effect on the active lane order. Each lane table also accepts the optional `builder_effort`, `reviewer_effort`, and `specialist_effort` keys, with the values and defaults described in "Model settings". Effort belongs to the lane: a seat runs at the effort its current lane sets, so a seat that moves to the next lane after a limit takes that lane's effort, and a lane without the key passes no effort and uses its harness default. In the example the `github-copilot` lane sets no effort. `[models]` is not read when `run.lanes` is set, so an effort key there stops the launch with an error that names the key and points to the lane tables. Before any active lane is probed, AutoBuild refuses to launch when it sets an effort its harness adapter cannot pass, and the error names the lane and the seat. A name listed twice in `run.lanes` also stops the launch, with an error that names it. Lane choice is made at launch: preflight probes every listed lane, cools any lane whose executable is missing, unauthenticated or lacking a required capability with the `probe` signature, and starts the first capable lane. Pass `--harness <name>` to move a listed lane to the front for one launch.
+`run.lanes` names the lanes in order of preference. Each name must have a `[lanes.<harness>]` table with `builder` and `reviewer` model names; `specialist` is optional and defaults to the reviewer model. A lane table whose name is absent from `run.lanes` is parked: its present model names and effort values are checked, but its missing model keys are allowed. A parked lane is not resolved, probed, or selected by `--harness`, so it has no effect on the active lane order. Each lane table also accepts the optional `builder_effort`, `reviewer_effort`, and `specialist_effort` keys, with the values and defaults described in "Model settings". Effort belongs to the lane: a seat runs at the effort its current lane sets, so a seat that moves to the next lane after a limit takes that lane's effort, and a lane without the key passes no effort and uses its harness default. In the example the `github-copilot` lane sets no effort. A lane table also accepts `key_file`, which only the `claude-sdk` lane reads, as described in "Run overflow seats on API credit". `[models]` is not read when `run.lanes` is set, so an effort key there stops the launch with an error that names the key and points to the lane tables. Before any active lane is probed, AutoBuild refuses to launch when it sets an effort its harness adapter cannot pass, and the error names the lane and the seat. A name listed twice in `run.lanes` also stops the launch, with an error that names it. Lane choice is made at launch: preflight probes every listed lane, cools any lane whose executable is missing, unauthenticated or lacking a required capability with the `probe` signature, and starts the first capable lane. Pass `--harness <name>` to move a listed lane to the front for one launch.
 
 When a seat hits a structural limit on the active lane, that lane cools and the seat re-runs on the next capable lane. A limit is read only from the harness CLI's exit code and structured error fields, never from words in the event stream, so a report that mentions "rate limit" in prose with a clean exit and a valid result never cools a lane. When the vendor supplies a reset time the lane cools until then; otherwise it cools for `run.lane_cool_seconds` (default 3600). When no capable lane remains, the item parks with the lane signature, its worktree evidence is kept, and the campaign stops with the `lanes_exhausted` reason.
 
 `run.lane_state_root` is where the machine-local `lanes.json` cooling file lives. It defaults to the scratch root. Concurrent campaigns on one machine share this file under a lock, so a lane one campaign cooled is skipped by the others until it recovers. Pass `--lane-state-root` to override it for one launch.
 
 The active lane is recorded on tracker and run events: the claim actor is `builder@<lane>`, a park reason is prefixed `<lane>:`, the close briefing names the lane per seat, and run event payloads carry the lane. The manifest records the lane order and the cooling state.
+
+## Stop seats at a usage level
+
+A subscription lane can stop taking seats before its plan limit is spent. A harness adapter may declare a usage meter for its lanes; the `claude-code` adapter declares the Claude subscription meter, and the `codex` and `github-copilot` adapters declare none. The optional `[usage]` table sets the levels:
+
+```toml
+[usage]
+warn_percent = 80
+stop_percent = 90
+five_hour_stop_percent = 95
+on_probe_failure = "allow"
+```
+
+Every key is optional, and the values above are the defaults. `stop_percent` binds the weekly limits; `five_hour_stop_percent` binds the five-hour session limit. A limit binds at or above its stop level. `warn_percent` must not exceed `stop_percent`, and every level is above 0 and at most 100. `on_probe_failure` is `allow` or `refuse`.
+
+Without a `[usage]` table AutoBuild never reads a meter, and runs behave exactly as before.
+
+With the table, AutoBuild reads the meter of every metered lane:
+
+- At launch, before any claim. The launch is refused, with a message that names the limit, its percent and its reset time, only when every configured lane is metered and at its stop level. Otherwise each metered lane at its stop level is cooled until its reset, and the campaign starts on the next lane. An unmetered lane is never cooled by the meter. The `usage` preflight probe records the readings and any warning.
+- Before every seat on a metered lane. A session or weekly limit at its stop level cools the lane in the shared lane state until the latest reset among the binding limits, and the seat runs on the next capable lane. When none remains, the item parks with the `usage` signature and the campaign stops with `lanes_exhausted`.
+- A weekly limit scoped to one model (for example a limit labelled `Fable`) never cools the lane. Only a seat whose model the label covers moves to the next lane; the other seats stay on the lane. The harness adapter decides whether a label covers a seat's model. When no other lane remains, the item parks with the `usage` signature.
+
+A limit at or above `warn_percent` records one `usage.warning` run event when it crosses the level, and another only after it falls below and crosses again. The other run events are `usage.stop`, `usage.seat_rerouted` and `usage.meter_failed`.
+
+The `claude-sdk` lane declares no meter. See "Run overflow seats on API credit" for a lane that takes over when the subscription lane stops.
+
+The meter reads an undocumented, unsupported endpoint that the Claude Code client uses for its own usage view; it can change without notice and can fail. AutoBuild treats it as a soft signal. With `on_probe_failure = "allow"` a failed reading records `usage.meter_failed`, cools nothing, and the seat proceeds. With `"refuse"` a failed reading at launch refuses the run; before a seat, AutoBuild waits 300 seconds and reads the meter again, up to three times, and then parks the item with the `usage_meter_unavailable` signature. A meter failure never cools a lane for `run.lane_cool_seconds`. A malformed meter response (a limit whose kind is not text, a percent that is not a finite number, or an unreadable reset time) is a meter failure, never an error that stops the run. A binding limit whose reset time is missing or not after the reading counts as a meter failure too.
+
+Read the meter once from a shell with:
+
+```text
+autobuild usage --json --scratch-root /path/to/local/scratch
+```
+
+The command is read-only. It prints the meter id, `ok`, an error when the meter failed, `extra_usage_enabled`, and each limit with its `kind` (`session`, `weekly_all` or `weekly_scoped`), `percent`, `resets_at` as a UTC time, and `scope` for a model-scoped limit. It exits 0 when the meter answered and 1 when it did not. AutoBuild reads the OAuth token from the Claude Code credentials file on each call and passes it to `curl -q --ssl-no-revoke` on standard input, without `SSLKEYLOGFILE`; `-q` stops curl reading a user `.curlrc`. The child's captured output is redacted before it is written. The token never appears on a command line, in a file AutoBuild writes, in a run record, or in an error message.
+
+The meter needs `curl` on `PATH` and Claude Code's `.credentials.json` file in its default configuration folder in your home directory. Where Claude Code keeps its credentials elsewhere, for example in the macOS Keychain or under a custom `CLAUDE_CONFIG_DIR`, every reading fails; with the default `allow` the stop levels then never act, so check `autobuild usage --json` once before relying on them. `--ssl-no-revoke` turns off certificate revocation checks in curl's Windows TLS backend, which on-access TLS inspection otherwise breaks; it has no effect on other platforms.
+
+## Run overflow seats on API credit
+
+The `claude-sdk` lane runs Claude Code seats through the Claude Agent SDK on an API key, so a campaign can keep building when the subscription lane is cooled. Install AutoBuild with the optional extra:
+
+```text
+uv tool install "autobuild-factory[sdk]==0.8.0"
+```
+
+Create an API key in the Console organisation whose credit should pay for the seats, save it alone in a file, and name the file in the lane table. Put the lane last so it is used only when the earlier lanes are cooled:
+
+```toml
+[run]
+lanes = ["claude-code", "claude-sdk"]
+
+[lanes.claude-code]
+builder = "claude-opus-5-5"
+reviewer = "fable"
+
+[lanes.claude-sdk]
+builder = "claude-opus-5-5"
+reviewer = "fable"
+key_file = "/path/to/secrets/anthropic-sdk.key"
+```
+
+`key_file` is read only by the `claude-sdk` lane. A relative path resolves against the profile's folder, but keep the key outside the repository and out of version control: an absolute path to a folder only you can read is the safe choice. Give the key its own Console workspace with a monthly spend limit, so the limit caps what the lane can spend. AutoBuild never reads the key into the profile, a run record or an environment: the SDK's CLI reads the file through an `apiKeyHelper` command, so commands inside the seat do not inherit the key. The seat loads no user settings, hooks or skills, and the variables `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_OAUTH_TOKEN` are empty in its child. A deny rule stops the seat's Read tool opening the key file, but the seat runs as your user, so a shell command inside it could still read the file; treat the key as available to any seat on that lane.
+
+A missing or empty key file, or an installation without the extra, makes the lane's probe fail; the lane is cooled and never falls back to subscription credentials. When the API reports that the credit balance is too low, or that the workspace spend limit is reached, the lane cools with the `quota` signal and the seat moves to the next lane or the item parks with `lanes_exhausted`. Neither counts as a builder failure.
 
 ## Choose the temporary work location
 
@@ -593,11 +659,13 @@ The probes are:
 - `interception`: refuses an unlisted proxy or certificate environment variable.
 - `scratch`: confirms the scratch root exists or can be created, is writable, holds no foreign lock, and is not held by a live tracker-root lease from another campaign.
 - `telemetry`: confirms the selected harness disables its telemetry in the child environment.
+- `removed-environment`: never stops the launch. When `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set in the parent environment, its detail is a warning that names the variable, never its value. The harness removes both from every seat and probe child, so a subscription seat does not bill the key.
 - `validator-runnable`: confirms the validator executable resolves, reports a version, and that a repository-relative script path exists.
 - `validator-offline`: runs the validator once in the primary checkout with proxies pointed at a closed port and offline flags set, so any dependency download fails at once.
 - `validator-budget`: confirms `command_timeout_seconds` is not below the declared validator budget.
-- `transport`: confirms the harness streams a large instruction through stdin or a prompt file and keeps every argv element small.
+- `transport`: confirms the harness streams a large instruction through stdin or a prompt file and keeps every argv element small. An in-process harness such as `claude-sdk` declares its own transport and child environment.
 - `briefs`: confirms the next ready item's brief file exists and is under 1 MiB.
+- `usage`: runs only when the profile has a `[usage]` table. It reads every metered lane's meter, cools a metered lane at its stop level, and refuses the launch when every lane is at its stop level, as described in "Stop seats at a usage level".
 
 Configure the doctor in the project profile:
 
@@ -618,6 +686,19 @@ names the interception variables this environment is allowed to carry; the docto
 records the accepted names and their presence and refuses any other interception
 variable. `budget_seconds` is the lane's expected wall-clock; the doctor refuses when
 `command_timeout_seconds` is below it and records the measured offline duration.
+
+Run the lane probes and the doctor without a campaign:
+
+```text
+autobuild preflight --json --repository .
+```
+
+The command takes the same profile and override options as `autobuild run`. It claims
+nothing, cools no lane in the shared lane state, and writes no tracker change. It reports
+each lane's probe result (`capable`, `version`, `detail`) and any current cooling, the
+active lane, and every preflight probe. A usage stop is reported but not recorded as a
+cooling. It exits 0 when the launch would pass, 1 when no lane is capable or a probe
+fails, and 2 when the profile or an adapter cannot load.
 
 ## Run a campaign
 

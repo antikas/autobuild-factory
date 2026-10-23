@@ -29,6 +29,7 @@ from autobuild.domain import (
     ItemOutcome,
     ItemState,
     LaneSignal,
+    LaneSignalKind,
     LanesExhausted,
     LeaseGrant,
     LeaseRequest,
@@ -47,6 +48,10 @@ from autobuild.domain import (
     SurfaceKind,
     ToolPolicy,
     TrackerStop,
+    UsageAssessment,
+    UsageLimit,
+    UsagePolicy,
+    UsageProbeFailure,
     ValidationEvidence,
     WorkspaceRef,
     review_verdict_rule_error,
@@ -101,6 +106,63 @@ def _stderr_ref(diagnostics: tuple[str, ...]) -> str:
     return ""
 
 
+# A seat whose meter cannot be read under the refuse policy waits this long
+# before the meter is read again, at most this many times, and then ends the
+# item with this signature. The lane is never cooled for a meter failure.
+USAGE_RETRY_SECONDS = 300.0
+USAGE_RETRY_ATTEMPTS = 3
+USAGE_UNAVAILABLE_SIGNATURE = "usage_meter_unavailable"
+
+
+def _limit_payload(limit: UsageLimit) -> dict[str, object]:
+    return {
+        "kind": limit.kind.value,
+        "scope": limit.scope,
+        "percent": limit.percent,
+        "resets_at": limit.resets_at,
+    }
+
+
+class _UsageGate:
+    """The per-campaign usage meter reader for metered lanes.
+
+    It holds the meter, the profile's levels and the warning state, so a limit
+    that crosses the warning level emits one ``usage.warning`` event and emits
+    again only after it has fallen below the level and crossed it once more."""
+
+    __slots__ = ("_meter", "policy", "wait", "_warned")
+
+    def __init__(self, meter, policy: UsagePolicy, wait) -> None:
+        self._meter = meter
+        self.policy = policy
+        self.wait = wait
+        self._warned: dict[str, frozenset[tuple[str, str | None]]] = {}
+
+    def assess(self, lane: Lane, emit) -> UsageAssessment:
+        meter_id = lane.meter_id or ""
+        assessment = self.policy.assess_meter(self._meter.read, meter_id)
+        if assessment.reading.ok:
+            self._warn(lane, meter_id, assessment, emit)
+        return assessment
+
+    def _warn(self, lane: Lane, meter_id: str, assessment: UsageAssessment, emit) -> None:
+        current = {(limit.kind.value, limit.scope): limit for limit in assessment.warnings}
+        before = self._warned.get(meter_id, frozenset())
+        for key, limit in current.items():
+            if key in before:
+                continue
+            emit(
+                "usage.warning",
+                {
+                    "lane": lane.name,
+                    "meter_id": meter_id,
+                    "warn_percent": self.policy.warn_percent,
+                    **_limit_payload(limit),
+                },
+            )
+        self._warned[meter_id] = frozenset(current)
+
+
 class _LaneRouter:
     """Ordered lane selection and cooling for one item run.
 
@@ -122,15 +184,26 @@ class _LaneRouter:
     def _cooled(self, name: str) -> bool:
         return self._state is not None and self._state.active(name) is not None
 
-    def current_lane(self) -> Lane:
+    def current_lane(self, skip: frozenset[str] = frozenset()) -> Lane:
+        """The first capable lane from the router's position.
+
+        ``skip`` names lanes one seat may not use (a model-scoped usage stop). A
+        skipped lane is passed for this seat only: the router's position never
+        moves past it, so the next seat starts from it again."""
+
         index = self._index
+        committed = True
         while index < len(self._lanes):
             lane = self._lanes[index]
-            if not self._cooled(lane.name):
-                self._index = index
+            if lane.name in skip:
+                committed = False
+            elif not self._cooled(lane.name):
+                if committed:
+                    self._index = index
                 return lane
             index += 1
-        raise LanesExhausted(self._last_signature, self._last_lane_name())
+        signature = LaneSignalKind.USAGE.value if skip else self._last_signature
+        raise LanesExhausted(signature, self._last_lane_name())
 
     def signal(self, lane: Lane, signal: LaneSignal) -> None:
         """Cool ``lane`` in the shared state and move past it in preference order."""
@@ -147,7 +220,10 @@ class _LaneRouter:
                 "reset_at": signal.reset_at,
             },
         )
-        self._index += 1
+        # Move past the lane only when it is the router's own position; a lane
+        # reached past a seat-skipped lane leaves the position on the skipped lane.
+        if self._index < len(self._lanes) and self._lanes[self._index].name == lane.name:
+            self._index += 1
 
     def _last_lane_name(self) -> str:
         return self._lanes[-1].name if self._lanes else ""
@@ -230,6 +306,13 @@ def unpublished_write(item_id: str, operation: str, note: str) -> RunEvent:
 class ItemWorkflow:
     def __init__(self, ports: WorkflowPorts, unpublished: list[str] | None = None) -> None:
         self._ports = ports
+        # The usage gate lives as long as the workflow, so warning crossings are
+        # tracked across every item of a campaign.
+        self._usage = (
+            _UsageGate(ports.usage_meter, ports.usage_policy, ports.usage_retry_wait)
+            if ports.usage_meter is not None and ports.usage_policy is not None
+            else None
+        )
         # Per-item lane routing state, reset at the start of every ``run``.
         self._router: _LaneRouter | None = None
         self._builder_lane: str | None = None
@@ -1000,11 +1083,16 @@ class ItemWorkflow:
         Every attempt is recorded as its own ``seat.completed`` event stamped with
         the lane it ran on and carries the effort that lane sets for the seat. A
         limit signal cools the lane and re-runs the same seat on the next capable
-        lane; when none remains ``current_lane`` raises ``LanesExhausted``."""
+        lane; when none remains ``current_lane`` raises ``LanesExhausted``. Before
+        each attempt on a metered lane the usage meter is read; see
+        ``_usage_admits``."""
 
         assert self._router is not None
+        skip: set[str] = set()
         while True:
-            lane = self._router.current_lane()
+            lane = self._router.current_lane(frozenset(skip))
+            if not self._usage_admits(record, lane, request, skip):
+                continue
             attempt = replace(request, effort=spec.seat_effort(request.seat, lane.name))
             result = lane.harness.invoke(attempt)
             if result.lane != lane.name:
@@ -1042,6 +1130,93 @@ class ItemWorkflow:
                 self._note_builder_lane(attempt, result)
                 return result
             self._router.signal(lane, signal)
+
+    def _usage_admits(
+        self, record: RunRecordRef, lane: Lane, request: SeatRequest, skip: set[str]
+    ) -> bool:
+        """Read the lane's usage meter before a seat starts on it.
+
+        An unmetered lane, or a run without ``[usage]``, is admitted with no
+        meter read. An unscoped limit at its stop level cools the lane through
+        the router until the latest binding reset. A model-scoped limit at its
+        stop level that covers this seat's model sends only this seat past the
+        lane: nothing is cooled and the router's position is unchanged. A meter
+        failure is admitted under ``allow``; under ``refuse`` the meter is read
+        again after a bounded wait, and a meter that stays unavailable ends the
+        item without cooling the lane."""
+
+        gate = self._usage
+        if gate is None or not lane.meter_id:
+            return True
+
+        def emit(event_type: str, payload: dict[str, object]) -> None:
+            self._event(record, event_type, request.item_id, payload=payload)
+
+        assessment = gate.assess(lane, emit)
+        attempt = 0
+        while assessment.failure:
+            refuse = gate.policy.on_probe_failure is UsageProbeFailure.REFUSE
+            if not refuse:
+                action = "allow"
+            elif attempt < USAGE_RETRY_ATTEMPTS:
+                action = "retry"
+            else:
+                action = "stop"
+            emit(
+                "usage.meter_failed",
+                {
+                    "lane": lane.name,
+                    "meter_id": lane.meter_id,
+                    "seat": request.seat.value,
+                    "error": assessment.failure,
+                    "action": action,
+                    "retry_seconds": USAGE_RETRY_SECONDS if action == "retry" else None,
+                },
+            )
+            if action == "allow":
+                return True
+            if action == "stop":
+                raise LanesExhausted(USAGE_UNAVAILABLE_SIGNATURE, lane.name)
+            attempt += 1
+            gate.wait(USAGE_RETRY_SECONDS)
+            assessment = gate.assess(lane, emit)
+        if assessment.stops_lane:
+            detail = assessment.describe_stop(gate.policy)
+            emit(
+                "usage.stop",
+                {
+                    "lane": lane.name,
+                    "meter_id": lane.meter_id,
+                    "seat": request.seat.value,
+                    "limits": [_limit_payload(limit) for limit in assessment.lane_stops],
+                    "reset_at": assessment.reset_at,
+                    "detail": detail,
+                },
+            )
+            self._router.signal(
+                lane,
+                LaneSignal(LaneSignalKind.USAGE, reset_at=assessment.reset_at, detail=detail),
+            )
+            return False
+        covering = [
+            limit
+            for limit in assessment.scoped_stops
+            if lane.meter_covers(limit.scope, request.model_class)
+        ]
+        if covering:
+            skip.add(lane.name)
+            emit(
+                "usage.seat_rerouted",
+                {
+                    "lane": lane.name,
+                    "meter_id": lane.meter_id,
+                    "seat": request.seat.value,
+                    "model_class": request.model_class,
+                    "limits": [_limit_payload(limit) for limit in covering],
+                },
+            )
+            return False
+        return True
 
     def _note_builder_lane(self, request: SeatRequest, result: SeatResult) -> None:
         if request.seat is Seat.BUILDER:

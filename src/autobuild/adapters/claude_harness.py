@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from uuid import uuid4
 
+from autobuild.adapters.claude_usage import CLAUDE_SUBSCRIPTION_METER
 from autobuild.adapters.harness_cli import CliHarnessAdapter, _safe_name, result_schema
 from autobuild.domain import EffortLevel, LaneSignal, Seat, SeatRequest, SeatResult
 from autobuild.ports import CommandPort
@@ -78,6 +80,18 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
     # A limit reported only in the ``result`` prose is deliberately not scanned.
     _limit_code_keys = ("code", "type", "subtype", "error_type", "error_code", "reason")
     effort_levels = frozenset(EffortLevel)
+    meter_id = CLAUDE_SUBSCRIPTION_METER
+
+    def meter_scope_covers(self, scope: str, model_class: str) -> bool:
+        """True when every word of the meter's model label (for example "Fable")
+        appears in the seat's model name. Version digits in the label are
+        ignored, so a label covers every version of its model family."""
+
+        words = re.findall(r"[a-z]+", scope.casefold())
+        if not words:
+            return False
+        tokens = set(re.findall(r"[a-z]+", self._model(model_class).casefold()))
+        return all(word in tokens for word in words)
 
     def classify_failure(self, result: SeatResult) -> LaneSignal | None:
         """Read a lane signal from Claude Code's structured result fields only."""

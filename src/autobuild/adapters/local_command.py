@@ -115,6 +115,13 @@ def _safe_name(value: str) -> str:
     return cleaned or "command"
 
 
+def _redacted(data: bytes, secrets: tuple[str, ...]) -> bytes:
+    for secret in secrets:
+        if secret:
+            data = data.replace(secret.encode("utf-8"), b"<redacted>")
+    return data
+
+
 class LocalCommandAdapter:
     host_family = "local"
 
@@ -142,6 +149,7 @@ class LocalCommandAdapter:
                     {
                         "argv",
                         "stdin-file",
+                        "stdin-text",
                         "timeout",
                         "cancel",
                         "process-tree",
@@ -158,8 +166,12 @@ class LocalCommandAdapter:
         stdout_path = command_root / "stdout.txt"
         stderr_path = command_root / "stderr.txt"
         environment = os.environ.copy()
+        for name in request.remove_environment:
+            environment.pop(self._environment_key(name), None)
         environment.update(dict(request.environment))
         argv = self._invocation(request)
+        if request.stdin_text is not None:
+            return self._run_piped(request, argv, environment, stdout_path, stderr_path)
         started = datetime.now(UTC).isoformat()
         timed_out = False
         stalled = False
@@ -210,6 +222,63 @@ class LocalCommandAdapter:
             cancelled=cancelled,
             stalled=stalled,
             stall_sample_times=stall_sample_times,
+        )
+
+    def _run_piped(
+        self,
+        request: CommandRequest,
+        argv: list[str] | str,
+        environment: dict[str, str],
+        stdout_path: Path,
+        stderr_path: Path,
+    ) -> CommandResult:
+        """Run a command whose stdin text may carry a credential.
+
+        The text goes to the child through a pipe, and the child's output is
+        held in memory and written only after every ``redact`` value has been
+        replaced, so no captured file ever holds the credential, even for a
+        moment. These commands are short; they use the wall-clock timeout only."""
+
+        started = datetime.now(UTC).isoformat()
+        timed_out = False
+        process = subprocess.Popen(
+            argv,
+            cwd=request.cwd,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            **self._spawn_options(),
+        )
+        with self._lock:
+            self._active[request.command_id] = process
+        try:
+            try:
+                stdout, stderr = process.communicate(
+                    input=(request.stdin_text or "").encode("utf-8"),
+                    timeout=request.timeout_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                self._terminate_tree(process)
+                stdout, stderr = process.communicate()
+        finally:
+            with self._lock:
+                self._active.pop(request.command_id, None)
+                cancelled = request.command_id in self._cancelled
+                self._cancelled.discard(request.command_id)
+        stdout_path.write_bytes(_redacted(stdout or b"", request.redact))
+        stderr_path.write_bytes(_redacted(stderr or b"", request.redact))
+        return CommandResult(
+            request.command_id,
+            process.returncode,
+            str(stdout_path),
+            str(stderr_path),
+            started,
+            datetime.now(UTC).isoformat(),
+            timed_out=timed_out,
+            cancelled=cancelled,
         )
 
     def _supervise(
@@ -278,6 +347,10 @@ class LocalCommandAdapter:
                 self._cancelled.add(command_id)
         if process is not None:
             self._terminate_tree(process)
+
+    @staticmethod
+    def _environment_key(name: str) -> str:
+        return name
 
     def _invocation(self, request: CommandRequest) -> list[str] | str:
         if request.shell is None:
@@ -374,6 +447,12 @@ class WindowsCommandAdapter(LocalCommandAdapter):
             return ((value.dwHighDateTime << 32) | value.dwLowDateTime) / 1e7
 
         return seconds(kernel) + seconds(user)
+
+    @staticmethod
+    def _environment_key(name: str) -> str:
+        # Windows environment names are case-insensitive and os.environ stores
+        # them upper-cased.
+        return name.upper()
 
     def _invocation(self, request: CommandRequest) -> list[str] | str:
         if request.shell is not None:
