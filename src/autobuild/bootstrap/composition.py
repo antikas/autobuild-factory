@@ -506,6 +506,34 @@ def _progress_port(settings: RunSettings) -> CompositeProgressAdapter:
     return CompositeProgressAdapter(tuple(adapters))
 
 
+def _policy_config(
+    settings: RunSettings, scratch: Path, delivery_mode: DeliveryMode
+) -> PolicyConfig:
+    """The run's policy: its roots, its one approved validator with the
+    profile's patient form, and the tools that include both executables."""
+
+    return PolicyConfig(
+        allowed_roots=(settings.repository, scratch, *settings.allowed_roots),
+        approved_validators=(
+            ApprovedValidator(
+                settings.validator_id,
+                settings.validator_argv,
+                patient_argv=settings.validator_patient_argv,
+            ),
+        ),
+        allowed_tools=settings.allowed_tools
+        | frozenset(
+            Path(argv[0]).name
+            for argv in (settings.validator_argv, settings.validator_patient_argv)
+            if argv
+        ),
+        max_command_timeout_seconds=settings.command_timeout_seconds,
+        max_seat_timeout_seconds=_max_seat_timeout(settings),
+        allow_repository_mutation=True,
+        allow_protected_merge=delivery_mode is DeliveryMode.PROTECTED_DEFAULT,
+    )
+
+
 def _ports(
     settings: RunSettings,
     scratch: Path,
@@ -523,20 +551,7 @@ def _ports(
     progress,
     usage_meter=None,
 ) -> WorkflowPorts:
-    policy = PolicyGateway(
-        PolicyConfig(
-            allowed_roots=(settings.repository, scratch, *settings.allowed_roots),
-            approved_validators=(
-                ApprovedValidator(settings.validator_id, settings.validator_argv),
-            ),
-            allowed_tools=settings.allowed_tools
-            | frozenset({Path(settings.validator_argv[0]).name}),
-            max_command_timeout_seconds=settings.command_timeout_seconds,
-            max_seat_timeout_seconds=_max_seat_timeout(settings),
-            allow_repository_mutation=True,
-            allow_protected_merge=delivery_mode is DeliveryMode.PROTECTED_DEFAULT,
-        )
-    )
+    policy = PolicyGateway(_policy_config(settings, scratch, delivery_mode))
     wrapped_lanes = tuple(_lane(name, policy.harness(adapter), adapter) for name, adapter in lanes_raw)
     active_harness = next(
         (lane.harness for lane in wrapped_lanes if lane.name == active_name),

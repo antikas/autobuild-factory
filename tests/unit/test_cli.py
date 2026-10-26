@@ -212,6 +212,47 @@ def test_item_class_sets_the_seat_timeout_and_raises_the_policy_ceiling(tmp_path
     assert _max_seat_timeout(settings) == 7200.0
 
 
+def test_the_composed_policy_admits_the_validator_and_its_patient_form_only(
+    tmp_path: Path,
+) -> None:
+    from autobuild.bootstrap.composition import _policy_config
+    from autobuild.domain import CommandRequest, CommandResult, PolicyViolation
+    from autobuild.enforcement import PolicyGateway
+
+    repository = tmp_path / "project"
+    repository.mkdir()
+    (repository / ".autobuild.toml").write_text(
+        PROFILE.replace(
+            'argv = ["uv", "run", "pytest", "-q"]',
+            'argv = ["uv", "run", "pytest", "-q"]\n'
+            'patient_argv = ["patient-runner", "pytest", "-q", "-p", "serial"]',
+        ),
+        encoding="utf-8",
+    )
+    args = arguments(repository)
+    settings = load_settings(repository, args.profile, _overrides(args))
+    fake = FakeCommandAdapter(
+        AdapterIdentity("command", "1", frozenset({"test"})),
+        scripted_results=[
+            CommandResult("run:item:tests", 0, "out", "err", "start", "end") for _ in range(2)
+        ],
+    )
+    port = PolicyGateway(
+        _policy_config(settings, tmp_path / "scratch", DeliveryMode.CURRENT_BRANCH_PR)
+    ).command(fake)
+    validator = ("uv", "run", "pytest", "-q")
+    patient = ("patient-runner", "pytest", "-q", "-p", "serial")
+
+    port.run(CommandRequest("run:item:tests", validator, repository))
+    port.run(CommandRequest("run:item:rerun:tests", patient, repository))
+    with pytest.raises(PolicyViolation, match="argv differs"):
+        port.run(CommandRequest("run:item:tests", ("uv", "run", "unittest"), repository))
+    with pytest.raises(PolicyViolation, match="one approved validator"):
+        port.run(CommandRequest("run:item:lint", validator, repository))
+
+    assert [request.argv for request in fake.requests] == [validator, patient]
+
+
 def test_seat_stall_seconds_defaults_and_reads_from_the_profile(tmp_path: Path) -> None:
     repository = tmp_path / "project"
     repository.mkdir()

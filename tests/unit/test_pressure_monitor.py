@@ -29,6 +29,7 @@ from autobuild.domain import (
     SurfaceKind,
 )
 from autobuild.domain.models import PressureLevel, PressurePolicy
+from autobuild.enforcement.policy import ApprovedValidator, EnforcedCommandPort, PolicyConfig
 from autobuild.enforcement.pressure import assess_pressure, initial_pressure, memory_lines
 from autobuild.testing import FakeClock, FakeCommandAdapter, FakeLeaseAdapter, FakeRunRecordAdapter
 from autobuild.testing.fakes import FakeHostResources
@@ -588,7 +589,7 @@ FAILED = CommandResult("command:item-r", 1, "out", "err", "start", "end")
 PASSED = CommandResult("command:item-r", 0, "out", "err", "start", "end")
 
 
-def rerun_case(first: CommandResult, pressure: bool):
+def rerun_case(first: CommandResult, pressure: bool, enforced: bool = False):
     clock = fake_clock()
     memory = {"gib": 20.0}
     host = FakeHostResources(identity("host"), script=lambda: reading(10.0, memory["gib"]))
@@ -596,7 +597,19 @@ def rerun_case(first: CommandResult, pressure: bool):
     commands = FakeCommandAdapter(
         identity("command"), results_by_item={"item-r": [first, PASSED]}
     )
-    ports = replace(ports, command=commands)
+    port = commands
+    if enforced:
+        # The live port: it admits a validator command only when the command
+        # id ends with the approved validator id.
+        port = EnforcedCommandPort(
+            commands,
+            PolicyConfig(
+                allowed_roots=(Path("/worktrees"),),
+                approved_validators=(ApprovedValidator("validator", ("python", "-m", "pytest")),),
+                allowed_tools=frozenset({"python"}),
+            ),
+        )
+    ports = replace(ports, command=port)
     items = ItemWorkflow(ports)
     seen: list[tuple[int, int]] = []
 
@@ -628,11 +641,22 @@ def test_a_timeout_overlapping_high_is_run_once_more_alone_and_that_verdict_stan
     levels = [event.payload["level"] for event in events(ports, "campaign.pressure_changed")]
     assert levels == ["high", "normal"]
     assert len(events(ports, "validation.load_rerun")) == 1
-    assert [request.command_id.endswith(":rerun") for request in commands.requests] == [False, True]
+    assert [":rerun:" in request.command_id for request in commands.requests] == [False, True]
+    assert all(request.command_id.endswith(":validator") for request in commands.requests)
     assert seen[1] == (1, 0)
     assert outcome.items[0].disposition is ItemDisposition.ACCEPTED
     assert [event.payload["exit_code"] for event in events(ports, "validation.completed")] == [0]
     assert commands.cancelled == [] and ports.harness.cancelled == []
+
+
+def test_a_load_rerun_passes_the_enforced_command_port() -> None:
+    ports, commands, outcome, _seen = rerun_case(TIMED_OUT, pressure=True, enforced=True)
+
+    assert len(events(ports, "validation.load_rerun")) == 1
+    assert len(commands.requests) == 2
+    assert commands.requests[1].command_id.endswith(":rerun:validator")
+    assert outcome.items[0].disposition is ItemDisposition.ACCEPTED, outcome.items[0].reason
+    assert [event.payload["exit_code"] for event in events(ports, "validation.completed")] == [0]
 
 
 def test_a_timeout_at_normal_is_not_run_again() -> None:

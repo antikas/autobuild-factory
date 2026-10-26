@@ -31,6 +31,7 @@ from autobuild.domain import (
 )
 from autobuild.domain.models import BatchValidationPolicy, HoldCondition
 from autobuild.enforcement.integration import package_key, revalidation_decision
+from autobuild.enforcement.policy import ApprovedValidator, EnforcedCommandPort, PolicyConfig
 from autobuild.enforcement.pressure import stretched_seat_cap
 from autobuild.testing import FakeClock
 
@@ -398,7 +399,9 @@ def _batch_context(every: int = 5, **changes) -> CampaignContext:
         validator_id="tests",
         target_branch="main",
         target_revision="base",
-        batch=BatchValidationPolicy(every=every, argv=("python", "-m", "pytest")),
+        batch=BatchValidationPolicy(
+            every=every, argv=("python", "-m", "pytest"), validator_id="tests"
+        ),
         **changes,
     )
 
@@ -446,6 +449,38 @@ def test_five_deliveries_validate_the_head_once_and_not_again_at_the_end() -> No
     )
 
     assert len(ports.command.requests) == 1
+
+
+def test_a_batch_validation_passes_the_enforced_command_port() -> None:
+    # The live port is the policy-wrapped one; it admits a validator command
+    # only when the command id ends with the approved validator id.
+    ports = _batch_ports(5, [command(suffix="b1")])
+    fake = ports.command
+    config = PolicyConfig(
+        allowed_roots=(Path("/fake/validation"),),
+        approved_validators=(ApprovedValidator("tests", ("python", "-m", "pytest")),),
+        allowed_tools=frozenset({"python"}),
+    )
+    ports = replace(ports, command=EnforcedCommandPort(fake, config))
+
+    CampaignRunner(ports, items=_Deliveries()).run(
+        campaign(max_items=5), lambda selected: spec(selected), context=_batch_context()
+    )
+
+    assert len(fake.requests) == 1
+    assert fake.requests[0].command_id.endswith(":tests")
+    assert ":batch:1:" in fake.requests[0].command_id
+    assert _batch_events(ports, "campaign.batch_validation_failed") == []
+    assert [entry["revision"] for entry in _batch_events(ports, "campaign.batch_validated")] == [
+        "head"
+    ]
+
+
+def test_a_batch_policy_without_a_validator_id_is_refused_at_construction() -> None:
+    with pytest.raises(TypeError, match="validator_id"):
+        BatchValidationPolicy(every=1, argv=("python", "-m", "pytest"))  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="validator id"):
+        BatchValidationPolicy(every=1, argv=("python", "-m", "pytest"), validator_id=" ")
 
 
 def test_without_a_batch_policy_no_batch_runs() -> None:

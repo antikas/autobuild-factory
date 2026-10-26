@@ -58,6 +58,7 @@ from autobuild.domain import (
     ValidationEvidence,
     WorkspaceRef,
     review_verdict_rule_error,
+    validator_command_id,
 )
 from autobuild.domain.models import BuilderContinuation, DeliveryParked, RevalidationDecision
 from autobuild.enforcement import classify_item_nature
@@ -1553,7 +1554,9 @@ class ItemWorkflow:
         load: it is run once more, alone, and that verdict stands."""
 
         request = CommandRequest(
-            command_id=f"{record.run_id}:{spec.item.item_id}:{spec.validator_id}",
+            command_id=validator_command_id(
+                record.run_id, spec.item.item_id, validator=spec.validator_id
+            ),
             argv=spec.validator_argv,
             cwd=workspace.root,
             environment=self._ports.item_environment(spec.item.item_id),
@@ -1575,8 +1578,15 @@ class ItemWorkflow:
                     "stderr_ref": command.stderr_ref,
                 },
             )
+            # The validator id stays the final segment: the enforced command
+            # port and the close evidence identify the validator by it.
             command, _pressured, patient = self._heavy_run(
-                replace(request, command_id=f"{request.command_id}:rerun"),
+                replace(
+                    request,
+                    command_id=validator_command_id(
+                        record.run_id, spec.item.item_id, "rerun", validator=spec.validator_id
+                    ),
+                ),
                 spec.validator_patient_argv,
                 exclusive=True,
             )

@@ -896,6 +896,23 @@ class SeatObservation:
     effort: EffortLevel | None = None
 
 
+def validator_command_id(*parts: str, validator: str) -> str:
+    """The command id of one validator run: ``parts`` joined by ``:`` with the
+    validator id as the final segment. The enforced command port and the close
+    evidence identify the validator by that final segment, so every validator
+    run builds its id here."""
+
+    if not validator.strip():
+        raise ValueError("a validator command id needs the validator id")
+    return ":".join((*parts, validator))
+
+
+def identifies_validator(command_id: str, validator_id: str) -> bool:
+    """True when ``command_id`` names ``validator_id`` as its final segment."""
+
+    return command_id.endswith(f":{validator_id}")
+
+
 @dataclass(frozen=True, slots=True)
 class CommandRequest:
     command_id: str
@@ -1099,15 +1116,18 @@ class BatchValidationPolicy:
 
     every: int
     argv: tuple[str, ...]
+    # Required: the enforced command port admits a validator run only by its id.
+    validator_id: str
     patient_argv: tuple[str, ...] = ()
     timeout_seconds: float = 600.0
-    validator_id: str = ""
 
     def __post_init__(self) -> None:
         if self.every < 1:
             raise ValueError("run.batch_validate_every must be a positive integer")
         if not self.argv:
             raise ValueError("batch validation needs the validator argv")
+        if not self.validator_id.strip():
+            raise ValueError("batch validation needs the validator id")
         if self.timeout_seconds <= 0:
             raise ValueError("batch validation timeout must be positive")
 

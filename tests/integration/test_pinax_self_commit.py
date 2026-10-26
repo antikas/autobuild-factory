@@ -84,10 +84,14 @@ if mode == "unreachable":
     sys.stderr.write("pinax: origin could not be reached, so nothing was appended.\\n")
     report(4, status="remote_unreachable", committed=False, appended=False, pushed=False,
            message="origin could not be reached, so nothing was appended")
+if mode == "push-rejected-after-pull":
+    # Pinax's pull fast-forwarded onto published commits before its own event.
+    git("merge", "--ff-only", "origin/main")
 append()
 if mode in {"commit", "commit-note", "commit-push", "branch-local", "two-commits",
-            "with-product", "exit-after-commit:3"}:
-    if mode == "with-product":
+            "with-product", "exit-after-commit:3", "push-rejected", "push-rejected-claim",
+            "push-rejected-with-product", "push-rejected-annulled", "push-rejected-after-pull"}:
+    if mode in {"with-product", "push-rejected-with-product"}:
         (root / "product-by-tracker.txt").write_text("leak\\n", encoding="utf-8")
         git("add", "product-by-tracker.txt")
     git("add", ".ergon")
@@ -112,6 +116,22 @@ if mode == "commit-note":
 if mode == "commit-push":
     git("push", "origin", "HEAD:main")
     git("fetch", "origin")
+if mode in {"push-rejected", "push-rejected-with-product", "push-rejected-after-pull"}:
+    # Pinax's push lost a race with a concurrent delivery and its pull did not
+    # complete: the event stays committed on the local branch, unpublished.
+    sys.stderr.write("pinax: the push to main was rejected after 1 attempts.\\n")
+    report(5, status="push_rejected", committed=True, pushed=False, attempts=1,
+           item_id="stub-1", git_output="! [rejected] main -> main (fetch first)",
+           message="the push to main was rejected and the event is not published")
+if mode == "push-rejected-uncommitted":
+    # The event was appended and never committed.
+    report(5, status="push_rejected", committed=False, pushed=False, attempts=1,
+           message="the push to main was rejected and the event is not published")
+if mode in {"push-rejected-claim", "push-rejected-annulled"}:
+    # A claim needs the remote: Pinax annuls its unpublished claim.
+    report(5, status="push_rejected", committed=True, pushed=False, attempts=1,
+           annulled={"reason": "the event could not be published"},
+           message="the push to main was rejected and the event is not published")
 print(json.dumps({"item_id": "stub-1", "id": "stub-1"}))
 '''
 
@@ -506,6 +526,151 @@ def test_a_primary_park_reports_whether_pinax_published_it(
     assert publication is not None
     assert publication.published is published
     assert ("recorded locally and not published" in publication.note) is not published
+
+
+def test_a_follow_up_whose_push_lost_a_race_is_kept_and_published_by_the_next_delivery(
+    tmp_path: Path, stub_pinax: list[tuple[str, ...]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent delivery pushed main first, so Pinax's push was rejected
+    with the follow-up committed on the local main. The proposal completes,
+    unpublished, and the next delivery's fetch-merge-push publishes it."""
+
+    repo = repository(tmp_path)
+    remote = tmp_path / "remote.git"
+    other = tmp_path / "other"
+    subprocess.run(
+        ["git", "clone", "-b", "main", str(remote), str(other)], check=True, capture_output=True
+    )
+    git(other, "config", "user.name", "Concurrent Delivery")
+    git(other, "config", "user.email", "delivery@example.invalid")
+    (other / "delivered.txt").write_text("delivered concurrently\n", encoding="utf-8")
+    git(other, "add", "delivered.txt")
+    git(other, "commit", "-m", "ADDED: concurrent delivery")
+    git(other, "push", "origin", "HEAD:main")
+    tracker = PinaxTrackerAdapter(repo)
+    before = git(repo, "rev-parse", "HEAD")
+    monkeypatch.setenv("STUB_PINAX_MODE", "push-rejected")
+
+    ref = tracker.propose(
+        Proposal("Follow-up: tst-1 F1", "What next?", "non-blocking finding", "docs/brief.md"),
+        "coordinator@proof",
+    )
+
+    assert ref.proposal_id == "stub-1"
+    assert ref.runnable is False
+    assert ref.published is False
+    assert "push_rejected" in ref.publication_note
+    assert "next push" in ref.publication_note
+    shard = (repo / ".ergon" / "log" / "stub.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["type"] for line in shard] == ["add", "block", "note"]
+    follow_up = git(repo, "rev-parse", "HEAD")
+    assert git(repo, "rev-list", "--count", f"{before}..{follow_up}") == "3"
+    assert git(repo, "status", "--porcelain") == ""
+
+    monkeypatch.setenv("STUB_PINAX_MODE", "commit")
+    workspace_adapter = GitWorkspaceAdapter(tmp_path / "scratch", tracker_commits_itself=True)
+    workspace = workspace_adapter.create_isolated(CampaignRef("campaign", repo), ITEM)
+    (workspace.root / "product.txt").write_text("accepted\n", encoding="utf-8")
+    evidence = close_evidence(workspace_adapter, workspace)
+    item_commit = workspace_adapter.commit_item(
+        workspace, FinaliseRequest(ITEM.item_id, evidence, "ADDED: product")
+    )
+    tracker.close(evidence, item_commit, workspace, "coordinator@proof")
+    tracker_commit = workspace_adapter.commit_tracker(workspace, ITEM.item_id, item_commit)
+    result = workspace_adapter.deliver(
+        workspace,
+        DeliveryRequest(
+            ITEM.item_id,
+            item_commit,
+            tracker_commit,
+            DeliveryMode.PROTECTED_DEFAULT,
+            "main",
+            git(repo, "rev-parse", "HEAD"),
+        ),
+    )
+    workspace_adapter.release(workspace)
+
+    assert result.pushed is True
+    # The remote now holds the follow-up and the concurrent delivery.
+    git(remote, "merge-base", "--is-ancestor", follow_up, "main")
+    assert "delivered.txt" in git(remote, "ls-tree", "--name-only", "main")
+
+
+def test_a_claim_whose_push_was_rejected_still_stops(
+    tmp_path: Path, stub_pinax: list[tuple[str, ...]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = repository(tmp_path)
+    monkeypatch.setenv("STUB_PINAX_MODE", "push-rejected-claim")
+
+    with pytest.raises(TrackerStop) as raised:
+        PinaxTrackerAdapter(repo).claim(ITEM, "builder@proof")
+
+    assert raised.value.code == 5
+    assert "push_rejected" in str(raised.value)
+
+
+@pytest.mark.parametrize("operation", ("park", "propose"))
+@pytest.mark.parametrize(
+    ("mode", "stop", "message"),
+    (
+        ("push-rejected-with-product", EvidenceError, "non-tracker paths: product-by-tracker.txt"),
+        ("push-rejected-annulled", TrackerStop, "push_rejected"),
+        ("push-rejected-uncommitted", TrackerStop, "push_rejected"),
+    ),
+)
+def test_a_rejected_push_that_fails_a_guard_still_stops(
+    tmp_path: Path,
+    stub_pinax: list[tuple[str, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    mode: str,
+    stop: type[Exception],
+    message: str,
+) -> None:
+    repo = repository(tmp_path)
+    tracker = PinaxTrackerAdapter(repo)
+    monkeypatch.setenv("STUB_PINAX_MODE", mode)
+
+    with pytest.raises(stop, match=message):
+        if operation == "park":
+            tracker.park("tst-1", "reason", "coordinator@proof")
+        else:
+            tracker.propose(
+                Proposal("Follow-up: tst-1 F1", "What next?", "finding", "docs/brief.md"),
+                "coordinator@proof",
+            )
+
+
+def test_a_rejected_push_after_a_pull_onto_published_commits_stands_unpublished(
+    tmp_path: Path, stub_pinax: list[tuple[str, ...]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinax fast-forwarded onto a published product commit, appended its event
+    and lost the push race. The published commit is not the write's own."""
+
+    repo = repository(tmp_path)
+    remote = tmp_path / "remote.git"
+    other = tmp_path / "other"
+    subprocess.run(
+        ["git", "clone", "-b", "main", str(remote), str(other)], check=True, capture_output=True
+    )
+    git(other, "config", "user.name", "Concurrent Delivery")
+    git(other, "config", "user.email", "delivery@example.invalid")
+    (other / "delivered.txt").write_text("delivered concurrently\n", encoding="utf-8")
+    git(other, "add", "delivered.txt")
+    git(other, "commit", "-m", "ADDED: concurrent delivery")
+    git(other, "push", "origin", "HEAD:main")
+    delivered = git(other, "rev-parse", "HEAD")
+    git(repo, "fetch", "origin")
+    monkeypatch.setenv("STUB_PINAX_MODE", "push-rejected-after-pull")
+
+    publication = PinaxTrackerAdapter(repo).park("tst-1", "reason", "coordinator@proof")
+
+    assert publication is not None
+    assert publication.published is False
+    assert "push_rejected" in publication.note
+    assert git(repo, "rev-parse", "HEAD^") == delivered
+    assert git(repo, "log", "-1", "--format=%s") == "stub pinax park"
+    assert git(repo, "status", "--porcelain") == ""
 
 
 def test_trackers_declare_whether_they_commit_themselves() -> None:

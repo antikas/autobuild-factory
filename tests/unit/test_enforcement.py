@@ -129,6 +129,25 @@ def test_command_rejects_validator_argv_that_differs_from_approval(tmp_path: Pat
     assert fake.requests == []
 
 
+def test_command_admits_the_approved_patient_argv_and_nothing_else(tmp_path: Path) -> None:
+    patient = ("python", "-m", "pytest", "-p", "serial")
+    config = PolicyConfig(
+        allowed_roots=(tmp_path,),
+        approved_validators=(
+            ApprovedValidator("tests", ("python", "-m", "pytest"), patient_argv=patient),
+        ),
+        allowed_tools=frozenset({"python"}),
+    )
+    result = CommandResult("run:item:tests", 0, "stdout", "stderr", "start", "end")
+    fake = FakeCommandAdapter(identity("command"), scripted_results=[result])
+    port = PolicyGateway(config).command(fake)
+
+    assert port.run(CommandRequest("run:item:tests", patient, tmp_path)) == result
+    with pytest.raises(PolicyViolation, match="argv differs"):
+        port.run(CommandRequest("run:item:tests", ("python", "-m", "unittest"), tmp_path))
+    assert [request.argv for request in fake.requests] == [patient]
+
+
 def test_command_rejects_undeclared_validator_stdin(tmp_path: Path) -> None:
     fake = FakeCommandAdapter(identity("command"))
     port = PolicyGateway(policy(tmp_path)).command(fake)
