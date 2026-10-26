@@ -55,13 +55,31 @@ def require_no_foreign_changes(git: Git, root: Path, tracker_paths: tuple[str, .
         )
 
 
+def published_head(git: Git, root: Path, remote: str) -> str:
+    """The remote-tracking head of the checked-out branch, or "" when the branch
+    is detached or has no remote-tracking ref. Read before a tracker command so
+    that published commits the command fast-forwards onto are not its own."""
+
+    try:
+        branch = git(root, "symbolic-ref", "--short", "-q", "HEAD")
+        return git(root, "rev-parse", "--verify", "-q", f"refs/remotes/{remote}/{branch}")
+    except AdapterError:
+        return ""
+
+
 def require_committed(
-    git: Git, root: Path, before: str, tracker_paths: tuple[str, ...]
+    git: Git,
+    root: Path,
+    before: str,
+    tracker_paths: tuple[str, ...],
+    published: str = "",
 ) -> str:
     """The command committed its change: no tracker path is left uncommitted,
     HEAD moved, and every non-merge commit the command added on the first-parent
     chain touches tracker paths only. A merge the command made to take another
-    writer's published work is not the command's own change and is not checked.
+    writer's published work is not the command's own change and is not checked,
+    and neither is a commit reachable from ``published``, the remote-tracking
+    head read before the command, which a pull fast-forwards onto.
     Returns the new HEAD. HEAD unmoved with tracker files changed is a tracker
     that does not commit its own changes, which stops the campaign."""
 
@@ -77,7 +95,10 @@ def require_committed(
         )
     if head == before:
         raise EvidenceError("tracker command produced no commit")
-    own = git(root, "rev-list", "--first-parent", "--no-merges", f"{before}..{head}").split()
+    excluded = (f"^{published}",) if published else ()
+    own = git(
+        root, "rev-list", "--first-parent", "--no-merges", f"{before}..{head}", *excluded
+    ).split()
     if not own:
         raise EvidenceError(f"tracker command added no commit of its own after {before}")
     for commit in own:
