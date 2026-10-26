@@ -322,7 +322,17 @@ class GitWorkspaceAdapter:
                     f"reported {label} commit is absent from the repository: {commit}"
                 )
         if result.merged_commit and target_branch.strip():
-            if not self._is_ancestor(primary, result.merged_commit, target_branch):
+            # A pushed delivery is proven by the remote branch; the local branch
+            # may not have moved onto it yet.
+            reached = self._is_ancestor(primary, result.merged_commit, target_branch) or (
+                result.pushed
+                and self._is_ancestor(
+                    primary,
+                    result.merged_commit,
+                    f"refs/remotes/{lease.repository.remote}/{target_branch}",
+                )
+            )
+            if not reached:
                 raise EvidenceError(
                     "merged commit is not reachable from the delivery target branch: "
                     f"merged {result.merged_commit}, branch {target_branch}"
@@ -547,15 +557,22 @@ class GitWorkspaceAdapter:
                 )
             if ready is not None and self._push(lease, workspace, target, ready, rejections):
                 pushed = ready
-                self._on_clean_primary(
-                    lambda: self._settle_target(lease, workspace, target, pushed)
-                )
+                notes = (f"remote {repository.remote}/{target} verified",)
+                # The remote holds the item now, so it is delivered even when the
+                # local target cannot move; the next delivery's merge of the
+                # fetched remote catches the local target up.
+                try:
+                    self._on_clean_primary(
+                        lambda: self._settle_target(lease, workspace, target, pushed)
+                    )
+                except AdapterError as error:
+                    notes += (f"local {target} not advanced after the push: {error}",)
                 return FinaliseResult(
                     request.item_commit,
                     request.tracker_commit,
                     ready,
                     True,
-                    (f"remote {repository.remote}/{target} verified",),
+                    notes,
                 )
             spent += 1
             if spent >= DELIVERY_ATTEMPTS:

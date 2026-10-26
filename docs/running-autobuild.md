@@ -97,10 +97,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.9.1 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.9.1). Install the released command from PyPI:
+Release 0.9.2 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.9.2). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.9.1
+uv tool install autobuild-factory==0.9.2
 ```
 
 AutoBuild 0.7.0 needs pinax-tracker 0.2.1 or later when the project uses Pinax. From 0.7.0 Pinax commits every tracker change itself and AutoBuild only verifies that commit; an earlier Pinax leaves the change uncommitted and AutoBuild stops at the first claim. Do not use AutoBuild 0.6.0 or earlier with pinax-tracker 0.2.1 or later: those versions commit the tracker change themselves and refuse a tracker that has already committed it.
@@ -134,7 +134,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.9.1
+uv tool install autobuild-factory==0.9.2
 autobuild --help
 ```
 
@@ -682,7 +682,7 @@ The meter needs `curl` on `PATH` and Claude Code's `.credentials.json` file in i
 The `claude-sdk` lane runs Claude Code seats through the Claude Agent SDK on an API key, so a campaign can keep building when the subscription lane is cooled. Install AutoBuild with the optional extra:
 
 ```text
-uv tool install "autobuild-factory[sdk]==0.9.1"
+uv tool install "autobuild-factory[sdk]==0.9.2"
 ```
 
 Create an API key in the Console organisation whose credit should pay for the seats, save it alone in a file, and name the file in the lane table. Put the lane last so it is used only when the earlier lanes are cooled:

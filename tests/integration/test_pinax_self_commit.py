@@ -613,6 +613,48 @@ def test_a_merge_of_another_writers_product_change_does_not_refuse_the_claim(
         require_committed(git, repo, after_merge, (".ergon",))
 
 
+def test_a_pull_onto_an_already_pushed_item_commit_does_not_refuse_the_park(
+    tmp_path: Path,
+) -> None:
+    from autobuild.adapters.tracker_commits import require_committed
+
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    git(repo, "config", "user.name", "AutoBuild Test")
+    git(repo, "config", "user.email", "autobuild@example.invalid")
+    (repo / ".ergon").mkdir()
+    (repo / ".ergon" / "log.jsonl").write_text("seed\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "initial")
+    before = git(repo, "rev-parse", "HEAD")
+    # The delivery pushed the item commit; the local branch never moved onto it.
+    git(repo, "checkout", "-b", "item")
+    (repo / "src.py").write_text("item\n", encoding="utf-8")
+    git(repo, "add", "src.py")
+    git(repo, "commit", "-m", "ADDED: item")
+    published = git(repo, "rev-parse", "HEAD")
+    git(repo, "update-ref", "refs/remotes/origin/main", published)
+    git(repo, "checkout", "main")
+    # The tracker command pulls (a fast-forward onto the pushed item) and commits.
+    git(repo, "merge", "--ff-only", published)
+    (repo / ".ergon" / "log.jsonl").write_text("seed\npark\n", encoding="utf-8")
+    git(repo, "commit", "-am", "pinax: item.parked tst-1")
+
+    with pytest.raises(EvidenceError, match="non-tracker paths: src.py"):
+        require_committed(git, repo, before, (".ergon",))
+    assert require_committed(git, repo, before, (".ergon",), published) == git(
+        repo, "rev-parse", "HEAD"
+    )
+
+    # The exclusion never hides the command's own product change.
+    after = git(repo, "rev-parse", "HEAD")
+    (repo / "src.py").write_text("swept\n", encoding="utf-8")
+    (repo / ".ergon" / "log.jsonl").write_text("seed\npark\nmore\n", encoding="utf-8")
+    git(repo, "commit", "-am", "pinax: item.noted tst-1")
+    with pytest.raises(EvidenceError, match="non-tracker paths: src.py"):
+        require_committed(git, repo, after, (".ergon",), published)
+
+
 PINAX_SCRIPT = '''
 import sys
 from pathlib import Path

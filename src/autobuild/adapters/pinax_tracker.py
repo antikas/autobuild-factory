@@ -37,6 +37,7 @@ from autobuild.domain.models import HoldCondition, SkippedItem, TrackerRecovery
 from autobuild.adapters.tracker_commits import (
     head_on_remote,
     only_tracker_changes,
+    published_head,
     require_committed,
     require_no_foreign_changes,
 )
@@ -645,6 +646,7 @@ class PinaxTrackerAdapter:
 
         command = args[0]
         before = self._git(root, "rev-parse", "HEAD")
+        published = published_head(self._git, root, _REMOTE)
         completed = self._run(root, *args)
         code = completed.returncode
         report = self._last_json(completed.stdout)
@@ -655,7 +657,7 @@ class PinaxTrackerAdapter:
         if code == 3 and command == "claim":
             raise ClaimTaken(args[1], cause or "claim superseded")
         if code == 4 and command == "claim" and self._branch_local_claim(report):
-            require_committed(self._git, root, before, _TRACKER_PATHS)
+            require_committed(self._git, root, before, _TRACKER_PATHS, published)
             return report, TrackerPublication(False, cause)
         status = str(report.get("status", "")).strip()
         label = f"pinax {command} exit {code}" + (f" ({status})" if status else "")
@@ -671,7 +673,7 @@ class PinaxTrackerAdapter:
             raise TrackerStop(f"{label}: {cause}", code=code, environment=False)
         if code != 0:
             raise AdapterError(f"{label}: {cause}")
-        require_committed(self._git, root, before, _TRACKER_PATHS)
+        require_committed(self._git, root, before, _TRACKER_PATHS, published)
         payload = self._parse(command, completed.stdout)
         pushed = payload.get("pushed")
         published = pushed if isinstance(pushed, bool) else head_on_remote(self._git, root)

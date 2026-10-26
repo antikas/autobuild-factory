@@ -325,6 +325,27 @@ def test_b_an_unchanged_base_validates_once_and_pushes_the_validated_tree(tmp_pa
     assert git(origin.repo, "show", f"{pushed}:feature.txt") + "\n" == validator.features[0]
 
 
+def test_b1_a_pushed_item_whose_local_branch_cannot_move_is_delivered_not_parked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origin = pinax_origin(tmp_path)
+    tracker, workspace = default_adapters(origin)
+
+    def refuse(*_args: object) -> None:
+        raise AdapterError("primary checkout must be clean before delivery")
+
+    monkeypatch.setattr(workspace, "_settle_target", refuse)
+
+    outcome, _ = run_item(
+        origin, workspace, tracker, scripted_harness(origin.items[0]), ValidatorRuns()
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED, outcome.reason
+    assert origin.head() == outcome.finalise.merged_commit
+    assert outcome.finalise.pushed
+    assert any("not advanced after the push" in note for note in outcome.finalise.diagnostics)
+
+
 # --- (b2) Only a tracker commit moved the base -----------------------------
 
 
