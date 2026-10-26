@@ -316,6 +316,22 @@ def test_a_seat_past_its_timeout_is_stopped_and_cools_nothing(tmp_path: Path) ->
     assert adapter.classify_failure(result) is None
 
 
+def test_a_seat_reads_its_stretched_cap_on_every_poll(tmp_path: Path) -> None:
+    client = FakeAgentSdkClient(block_until_cancelled=True)
+    adapter = adapter_for(tmp_path, client)
+    reads: list[int] = []
+
+    def extension() -> float:
+        reads.append(1)
+        # Pressure stretches the cap for the first polls, then lifts.
+        return 3600.0 if len(reads) <= 3 else 0.0
+
+    result = adapter.invoke(seat(tmp_path, timeout_seconds=0.3, timeout_extension=extension))
+
+    assert result.outcome is SeatOutcome.TIMED_OUT
+    assert len(reads) >= 4
+
+
 def test_a_seat_without_progress_past_its_stall_deadline_is_stalled(tmp_path: Path) -> None:
     adapter = adapter_for(tmp_path, FakeAgentSdkClient(block_until_cancelled=True))
 

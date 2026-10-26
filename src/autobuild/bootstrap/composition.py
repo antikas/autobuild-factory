@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import urllib.parse
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ from autobuild.adapters import (
     StderrProgressAdapter,
     WindowsCommandAdapter,
 )
+from autobuild.adapters.harness_cli import item_scratch_environment
 from autobuild.adapters.claude_usage import (
     CLAUDE_SUBSCRIPTION_METER,
     ClaudeUsageMeterAdapter,
@@ -61,9 +64,9 @@ from autobuild.domain import (
     UsageReading,
     WorkspaceRef,
 )
-from autobuild.domain.models import SeatTransport
+from autobuild.domain.models import BatchValidationPolicy, HostReading, SeatTransport
 from autobuild.enforcement.preflight import UsageLane, run_usage_preflight
-from autobuild.ports.contracts import SeatTransportPort
+from autobuild.ports.contracts import SeatTransportPort, TrackerProjectionPort
 from autobuild.enforcement import (
     ApprovedValidator,
     BriefCheck,
@@ -85,6 +88,20 @@ def _max_seat_timeout(settings: RunSettings) -> float:
     declared item class, so a class deadline is never refused by the ceiling."""
 
     return max([settings.seat_timeout_seconds, *settings.item_classes.values()])
+
+
+def primary_checkout_lock() -> threading.Lock:
+    """The one primary-checkout lock of a campaign.
+
+    Composition creates it once and hands the same instance to the tracker
+    adapter and the workspace adapter, so every local mutation of the primary
+    checkout (a claim, park or proposal, a worktree add or remove, the delivery
+    catch-up before its push and fast-forward after it) runs one at a time.
+    Each adapter holds it only for that local mutation: never across its own
+    fetch or push, a validator run, or a merge in an item worktree other than
+    the delivery's tracker-only catch-up merge."""
+
+    return threading.Lock()
 
 
 def _probe(name: str, adapter: object) -> tuple[str, str, str]:
@@ -241,24 +258,31 @@ def read_usage(
     return meter.read(meter_id)
 
 
-def _runtime(
+def _repository_adapters(
     settings: RunSettings,
     scratch: Path,
     delivery_mode: DeliveryMode,
     push_current_branch: bool,
-    campaign_id: str,
-    probe_only: bool = False,
 ):
-    command = _command_adapter(scratch)
+    """The tracker and workspace adapters, sharing one primary-checkout lock.
+
+    Returns ``(pinax, backlog, tracker, workspace, tracker_paths)``; ``tracker``
+    is whichever of the two the profile or the probes chose."""
+
     push_primary = (
         delivery_mode is DeliveryMode.PROTECTED_DEFAULT or push_current_branch
     )
+    primary_lock = primary_checkout_lock()
     pinax = PinaxTrackerAdapter(
         settings.repository,
         accept_unpublished_claims=delivery_mode is DeliveryMode.CURRENT_BRANCH_PR,
+        primary_lock=primary_lock,
     )
     backlog = BacklogTrackerAdapter(
-        settings.repository, settings.backlog_path, push_primary=push_primary
+        settings.repository,
+        settings.backlog_path,
+        push_primary=push_primary,
+        primary_lock=primary_lock,
     )
     if settings.tracker_kind == "pinax":
         tracker = pinax
@@ -279,6 +303,29 @@ def _runtime(
         if isinstance(tracker, BacklogTrackerAdapter)
         else (Path(".ergon"),)
     )
+    workspace = GitWorkspaceAdapter(
+        scratch / "workspace",
+        tracker_paths=tracker_paths,
+        tracker_commits_itself=tracker.commits_itself,
+        primary_lock=primary_lock,
+        projection=tracker if isinstance(tracker, TrackerProjectionPort) else None,
+        tracker_recovery=tracker.recover if tracker is pinax else None,
+    )
+    return pinax, backlog, tracker, workspace, tracker_paths
+
+
+def _runtime(
+    settings: RunSettings,
+    scratch: Path,
+    delivery_mode: DeliveryMode,
+    push_current_branch: bool,
+    campaign_id: str,
+    probe_only: bool = False,
+):
+    command = _command_adapter(scratch)
+    tracker, workspace = _repository_adapters(
+        settings, scratch, delivery_mode, push_current_branch
+    )[2:4]
     tracker_surface = LeaseSurface(
         settings.backlog_path.parent
         if isinstance(tracker, BacklogTrackerAdapter)
@@ -286,11 +333,6 @@ def _runtime(
         SurfaceKind.TRACKER,
     )
     lease = FilesystemLeaseAdapter(scratch, stale_seconds=settings.lease_stale_seconds)
-    workspace = GitWorkspaceAdapter(
-        scratch / "workspace",
-        tracker_paths=tracker_paths,
-        tracker_commits_itself=tracker.commits_itself,
-    )
     if settings.refill_plan is not None:
         for proposal in settings.refill_plan.proposals:
             tracker.validate_proposal(proposal)
@@ -513,7 +555,16 @@ def _ports(
         lane_state=lane_state,
         usage_meter=usage_meter,
         usage_policy=settings.usage if usage_meter is not None else None,
+        item_environment=_item_environment(scratch),
+        host=host_resource_adapter(),
     )
+
+
+def _item_environment(scratch: Path):
+    """Map each item to its own temporary directories under ``<scratch>/items``."""
+
+    root = scratch / "items"
+    return lambda item_id: item_scratch_environment(root, item_id)
 
 
 def _lane(name: str, harness, adapter: object) -> Lane:
@@ -633,16 +684,12 @@ def _preflight(
         budget_seconds=settings.validator_budget_seconds,
     )
 
-    briefs: tuple[BriefCheck, ...] = ()
-    try:
-        peeked = tracker.next_item(campaign)
-    except Exception:
-        peeked = None
-    if peeked is not None:
-        brief_path = Path(peeked.brief_ref).expanduser()
+    briefs: list[BriefCheck] = []
+    for launch_item in _launch_items(tracker, campaign):
+        brief_path = Path(launch_item.brief_ref).expanduser()
         if not brief_path.is_absolute():
             brief_path = repository.root / brief_path
-        briefs = (BriefCheck(peeked.item_id, brief_path),)
+        briefs.append(BriefCheck(launch_item.item_id, brief_path))
 
     return run_preflight(
         PreflightRequest(
@@ -652,7 +699,7 @@ def _preflight(
             telemetry=telemetry,
             transport=transport,
             validator=validator,
-            briefs=briefs,
+            briefs=tuple(briefs),
             tracker_surface=tracker_surface,
             removed_environment=tuple(getattr(harness, "removed_environment", ())),
         ),
@@ -662,6 +709,77 @@ def _preflight(
         command=command,
         lease=lease,
     )
+
+
+def _launch_items(tracker, campaign: CampaignRef) -> tuple:
+    """The items whose briefs the launch preflight checks.
+
+    A serial campaign checks the item it would build first, as it always has.
+    A campaign that builds more than one item at a time checks every ready
+    item inside the selection fence, because any of them can be admitted at
+    launch. A tracker that cannot be read here yields none; the campaign then
+    meets the same tracker error at its first selection."""
+
+    try:
+        if campaign.concurrency == 1:
+            peeked = tracker.next_item(campaign)
+            return (peeked,) if peeked is not None else ()
+        return tuple(
+            item
+            for item in tracker.ready_items(campaign)
+            if campaign.selection.permits(item.item_id)
+        )
+    except Exception:
+        return ()
+
+
+# The host sample, in seconds, an automatic item concurrency is derived from.
+AUTO_CONCURRENCY_SAMPLE_SECONDS = 0.5
+
+
+def item_concurrency(settings: RunSettings, tracker, host=None) -> tuple[int, str]:
+    """How many items this campaign builds at once, and where the value came from.
+
+    An explicit ``run.concurrency`` wins (``profile``); ``1`` is the serial
+    setting. A ``BACKLOG.md`` tracker cannot express dependencies, so it builds
+    one item at a time unless the profile names an integer (``backlog``).
+    Otherwise ``auto``, the default, reads the host once and applies the
+    capacity rule (``auto``)."""
+
+    items, source, _reading = _items_and_reading(settings, tracker, host)
+    return items, source
+
+
+def _items_and_reading(settings: RunSettings, tracker, host=None):
+    from autobuild.enforcement.capacity import derive_capacity
+
+    policy = settings.capacity
+    if policy.concurrency is not None:
+        return policy.concurrency, "profile", None
+    if isinstance(tracker, BacklogTrackerAdapter):
+        return 1, "backlog", None
+    reading = (host or host_resource_adapter()).read(AUTO_CONCURRENCY_SAMPLE_SECONDS)
+    return derive_capacity(reading, policy).items, "auto", reading
+
+
+def campaign_concurrency(settings: RunSettings, tracker, host=None) -> tuple[int, str, int]:
+    """The item concurrency, its source and the heavy-command limit.
+
+    The heavy limit comes from the capacity rule with the item value fixed, so
+    it never exceeds it. A serial campaign has a limit of 1 and reads nothing
+    for it; an explicit ``run.heavy_concurrency`` needs no host reading."""
+
+    from autobuild.enforcement.capacity import derive_capacity
+
+    items, source, reading = _items_and_reading(settings, tracker, host)
+    if items == 1:
+        return items, source, 1
+    policy = replace(settings.capacity, concurrency=items)
+    if reading is None and policy.heavy_concurrency is None:
+        reading = (host or host_resource_adapter()).read(AUTO_CONCURRENCY_SAMPLE_SECONDS)
+    if reading is None:
+        reading = HostReading.unmeasured("heavy concurrency is set by the profile")
+    return items, source, derive_capacity(reading, policy).heavy
 
 
 def _read_brief_text(repository: Path, brief_path: Path) -> str:
@@ -700,6 +818,7 @@ def _specification(
             brief_text=brief_text,
             validator_id=settings.validator_id,
             validator_argv=settings.validator_argv,
+            validator_patient_argv=settings.validator_patient_argv,
             tool_policy=ToolPolicy(
                 settings.allowed_tools,
                 (settings.repository, *settings.allowed_roots),
@@ -803,6 +922,7 @@ def preflight_report(
             max_items=settings.max_items,
             refill_enabled=settings.refill_plan is not None,
             selection=settings.selection,
+            concurrency=item_concurrency(settings, tracker)[0],
         )
         try:
             probes.extend(
@@ -878,12 +998,15 @@ def run_campaign(
         settings, scratch, delivery_mode, push_current_branch, effective_campaign_id
     )
     _require_delivery_shape(delivery_mode, repository, allow_current_branch_default)
+    concurrency, concurrency_source, heavy = campaign_concurrency(settings, tracker)
     campaign = CampaignRef(
         effective_campaign_id,
         settings.repository,
         max_items=settings.max_items,
         refill_enabled=settings.refill_plan is not None,
         selection=settings.selection,
+        concurrency=concurrency,
+        heavy_concurrency=heavy,
     )
     preflight_probes = _preflight(
         settings,
@@ -903,10 +1026,13 @@ def run_campaign(
     if usage_probe is not None:
         preflight_probes = (*preflight_probes, usage_probe)
     lanes_metadata = _lanes_metadata(settings, lane_manifest, lane_state, active_name)
-    records = LocalRunRecordAdapter(
-        scratch / "runs",
-        metadata=_runtime_metadata(settings, manifest, preflight_probes, lanes_metadata),
-    )
+    metadata = _runtime_metadata(settings, manifest, preflight_probes, lanes_metadata)
+    metadata["concurrency"] = {
+        "items": concurrency,
+        "source": concurrency_source,
+        "heavy": heavy,
+    }
+    records = LocalRunRecordAdapter(scratch / "runs", metadata=metadata)
     ports = _ports(
         settings,
         scratch,
@@ -942,6 +1068,16 @@ def run_campaign(
         push_current_branch=push_current_branch,
         allow_current_branch_default=allow_current_branch_default,
         tracker_surface=tracker_surface,
+        lease_heartbeat_seconds=settings.lease_stale_seconds / 3,
+        pressure=settings.pressure,
+        hold_limit_seconds=settings.hold_limit_seconds,
+        batch=BatchValidationPolicy(
+            every=settings.batch_validate_every,
+            argv=settings.validator_argv,
+            patient_argv=settings.validator_patient_argv,
+            timeout_seconds=settings.command_timeout_seconds,
+            validator_id=settings.validator_id,
+        ),
     )
     outcome = CampaignRunner(ports).run(
         campaign,
@@ -977,6 +1113,14 @@ def run_campaign(
         "report_ref": outcome.report_ref,
         "repository_report_ref": outcome.repository_report_ref,
         "progress_ref": outcome.progress_ref,
+        "schedule": {
+            "concurrency": concurrency,
+            "concurrency_source": concurrency_source,
+            "heavy_concurrency": heavy,
+            "peak_concurrency": outcome.peak_concurrency,
+            "makespan_seconds": round(outcome.makespan_seconds, 3),
+            "item_seconds": round(outcome.item_seconds, 3),
+        },
         "items": [
             {
                 "item_id": item.item_id,
@@ -991,3 +1135,40 @@ def run_campaign(
             for item in outcome.items
         ],
     }
+
+
+def host_resource_adapter():
+    """The host resource adapter for the current Python host, chosen as the
+    command adapter is chosen."""
+
+    import sys
+
+    from autobuild.adapters.host_resources import (
+        Kernel32HostResourceAdapter,
+        PortableHostResourceAdapter,
+        ProcHostResourceAdapter,
+    )
+
+    if os.name == "nt":
+        return Kernel32HostResourceAdapter()
+    if sys.platform.startswith("linux"):
+        return ProcHostResourceAdapter()
+    return PortableHostResourceAdapter()
+
+
+def host_capacity(
+    repository: str | Path,
+    profile_path: str | Path | None,
+    sample_seconds: float,
+    adapter=None,
+):
+    """One host reading and the capacity it gives with the profile applied,
+    for the ``autobuild host`` command. Returns the reading, the profile's
+    capacity policy and the derived capacity."""
+
+    from autobuild.bootstrap.profile import read_capacity_policy
+    from autobuild.enforcement.capacity import derive_capacity
+
+    policy = read_capacity_policy(repository, profile_path)
+    reading = (adapter or host_resource_adapter()).read(sample_seconds)
+    return reading, policy, derive_capacity(reading, policy)

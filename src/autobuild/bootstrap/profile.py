@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from autobuild.domain import (
     CampaignSelection,
+    CapacityPolicy,
     EffortLevel,
     FogRecord,
     Proposal,
@@ -18,6 +19,7 @@ from autobuild.domain import (
     UsagePolicy,
     UsageProbeFailure,
 )
+from autobuild.domain.models import PressurePolicy
 
 
 class ConfigurationError(ValueError):
@@ -110,6 +112,29 @@ class RunSettings:
     progress_command_timeout_seconds: float
     # The ``[usage]`` levels, or None when the profile has no ``[usage]`` table.
     usage: UsagePolicy | None = None
+    # ``[run] concurrency`` and ``heavy_concurrency`` with the ``[capacity]`` terms.
+    capacity: CapacityPolicy = CapacityPolicy()
+    # The ``[pressure]`` thresholds of the host pressure monitor.
+    pressure: PressurePolicy = PressurePolicy()
+    # ``[run] hold_limit_seconds``: how long one hold on admissions may last.
+    hold_limit_seconds: float = 21600.0
+    # ``[run] batch_validate_every``: deliveries between batch validations.
+    batch_validate_every: int = 5
+    # ``[validator] patient_argv``: the validator argv under recent host pressure.
+    validator_patient_argv: tuple[str, ...] = ()
+
+
+def _batch_validate_every(run: Mapping[str, Any]) -> int:
+    value = run.get("batch_validate_every", 5)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigurationError("run.batch_validate_every must be a positive integer")
+    return value
+
+
+def _patient_argv(validator: Mapping[str, Any]) -> tuple[str, ...]:
+    if "patient_argv" not in validator:
+        return ()
+    return _string_list(validator["patient_argv"], "validator.patient_argv")
 
 
 def _table(document: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -138,6 +163,16 @@ def _string_list(value: object, label: str) -> tuple[str, ...]:
 def _resolve_path(value: str | Path, base: Path) -> Path:
     path = Path(value).expanduser()
     return (base / path).resolve(strict=False) if not path.is_absolute() else path.resolve(strict=False)
+
+
+def _selected_profile(repository: Path, profile_path: str | Path | None) -> Path | None:
+    """The explicit profile, else the repository's ``.autobuild.toml`` when it
+    exists, else None."""
+
+    if profile_path is not None:
+        return Path(profile_path).expanduser()
+    default_profile = repository / ".autobuild.toml"
+    return default_profile if default_profile.is_file() else None
 
 
 def _load_document(profile_path: Path | None) -> tuple[Mapping[str, Any], Path | None]:
@@ -256,12 +291,32 @@ def _effort(value: object, label: str) -> EffortLevel | None:
 
 _EFFORT_KEYS = ("builder_effort", "reviewer_effort", "specialist_effort")
 
+# Each ``[pressure]`` key and the ``PressurePolicy`` field it sets. Memory keys
+# end in ``_gb`` as the ``[capacity]`` keys do and are binary gigabytes.
+_PRESSURE_KEYS = {
+    "sample_seconds": "sample_seconds",
+    "read_seconds": "read_seconds",
+    "window_seconds": "window_seconds",
+    "calm_seconds": "calm_seconds",
+    "high_cpu_percent": "high_cpu_percent",
+    "calm_cpu_percent": "calm_cpu_percent",
+    "high_memory_percent": "high_memory_percent",
+    "high_memory_gb": "high_memory_gib",
+    "critical_memory_percent": "critical_memory_percent",
+    "critical_memory_gb": "critical_memory_gib",
+    "high_commit_percent": "high_commit_percent",
+    "calm_memory_gb": "calm_memory_gib",
+    "decrease_seconds": "decrease_seconds",
+    "increase_seconds": "increase_seconds",
+}
+
 
 _PROFILE_ALLOWED_KEYS: dict[str, frozenset[str]] = {
     "profile": frozenset(
         {
             "run", "models", "validator", "harness", "policy", "tracker", "preflight",
             "refill", "knowledge", "selection", "progress", "lanes", "usage",
+            "capacity", "pressure",
         }
     ),
     "run": frozenset(
@@ -269,10 +324,11 @@ _PROFILE_ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "harness", "max_items", "seat_timeout_seconds", "seat_stall_seconds",
             "lease_stale_seconds", "command_timeout_seconds", "item_classes", "scratch_root",
             "lanes", "lane_state_root", "lane_cool_seconds",
+            "concurrency", "heavy_concurrency", "hold_limit_seconds", "batch_validate_every",
         }
     ),
     "models": frozenset({"builder", "reviewer", "specialist", *_EFFORT_KEYS}),
-    "validator": frozenset({"id", "argv", "budget_seconds"}),
+    "validator": frozenset({"id", "argv", "budget_seconds", "patient_argv"}),
     "harness": frozenset({"command"}),
     "policy": frozenset({"allowed_tools", "allowed_roots"}),
     "tracker": frozenset({"kind", "path"}),
@@ -285,6 +341,8 @@ _PROFILE_ALLOWED_KEYS: dict[str, frozenset[str]] = {
         {"warn_percent", "stop_percent", "five_hour_stop_percent", "on_probe_failure"}
     ),
     "lanes.*": frozenset({"builder", "reviewer", "specialist", "key_file", *_EFFORT_KEYS}),
+    "capacity": frozenset({"reserve_gb", "per_item_gb", "max_concurrency"}),
+    "pressure": frozenset(_PRESSURE_KEYS),
 }
 
 
@@ -647,6 +705,86 @@ def _usage(document: Mapping[str, Any]) -> UsagePolicy | None:
         raise ConfigurationError(str(exc)) from exc
 
 
+# ``run.concurrency`` when the profile does not name it: as many items as the
+# host allows. ``1`` is the serial setting.
+DEFAULT_ITEM_CONCURRENCY: int | str = "auto"
+
+
+def _pressure(document: Mapping[str, Any]) -> PressurePolicy:
+    """Validate the optional ``[pressure]`` table; every key is optional and
+    defaults to the documented threshold. ``PressurePolicy`` owns the ranges;
+    the profile checks only the TOML types."""
+
+    table = _table(document, "pressure")
+    values: dict[str, float] = {}
+    for key, name in _PRESSURE_KEYS.items():
+        if key not in table:
+            continue
+        value = table[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ConfigurationError(f"pressure.{key} must be a number")
+        values[name] = float(value)
+    try:
+        return PressurePolicy(**values)
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
+def _concurrency(run: Mapping[str, Any], key: str, default: int | str = "auto") -> int | None:
+    value = run.get(key, default)
+    if value == "auto":
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ConfigurationError(f'run.{key} must be "auto" or a positive integer')
+    return value
+
+
+def _capacity_number(table: Mapping[str, Any], key: str, default: float) -> float:
+    value = table.get(key, default)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ConfigurationError(f"capacity.{key} must be a number of GiB")
+    return float(value)
+
+
+def _capacity(document: Mapping[str, Any]) -> CapacityPolicy:
+    """Validate ``[run] concurrency``, ``[run] heavy_concurrency`` and the
+    optional ``[capacity]`` table; every key is optional and defaults to auto
+    with the documented terms."""
+
+    run = _table(document, "run")
+    table = _table(document, "capacity")
+    defaults = CapacityPolicy()
+    max_concurrency = table.get("max_concurrency", defaults.max_concurrency)
+    if not isinstance(max_concurrency, int) or isinstance(max_concurrency, bool):
+        raise ConfigurationError("capacity.max_concurrency must be a positive integer")
+    # CapacityPolicy owns the ranges; the profile checks only the TOML types.
+    try:
+        return CapacityPolicy(
+            concurrency=_concurrency(run, "concurrency", DEFAULT_ITEM_CONCURRENCY),
+            heavy_concurrency=_concurrency(run, "heavy_concurrency"),
+            reserve_gib=_capacity_number(table, "reserve_gb", defaults.reserve_gib),
+            per_item_gib=_capacity_number(table, "per_item_gb", defaults.per_item_gib),
+            max_concurrency=max_concurrency,
+        )
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
+def read_capacity_policy(
+    repository: str | Path, profile_path: str | Path | None
+) -> CapacityPolicy:
+    """Read only the concurrency settings, after the closed key-list check.
+
+    A profile that would not pass full validation for a launch (for example one
+    without models) still yields its capacity settings, so ``autobuild host``
+    works from any repository. Unknown fields are refused as at launch."""
+
+    resolved_repository = Path(repository).expanduser().resolve(strict=False)
+    document, _resolved = _load_document(_selected_profile(resolved_repository, profile_path))
+    _validate_profile_fields(document)
+    return _capacity(document)
+
+
 def _budget_seconds(validator: Mapping[str, Any]) -> float | None:
     if "budget_seconds" not in validator:
         return None
@@ -674,15 +812,9 @@ def read_run_scratch_root(
     if override:
         return Path(override).expanduser().resolve(strict=False)
     resolved_repository = Path(repository).expanduser().resolve(strict=False)
-    default_profile = resolved_repository / ".autobuild.toml"
-    selected_profile = (
-        Path(profile_path).expanduser()
-        if profile_path is not None
-        else default_profile
-        if default_profile.is_file()
-        else None
+    document, resolved_profile = _load_document(
+        _selected_profile(resolved_repository, profile_path)
     )
-    document, resolved_profile = _load_document(selected_profile)
     base = resolved_profile.parent if resolved_profile is not None else resolved_repository
     run = _table(document, "run")
     scratch_value = _optional_string(run.get("scratch_root"), "run.scratch_root")
@@ -697,15 +829,9 @@ def load_settings(
     resolved_repository = Path(repository).expanduser().resolve(strict=True)
     if not resolved_repository.is_dir():
         raise ConfigurationError(f"repository is not a directory: {resolved_repository}")
-    default_profile = resolved_repository / ".autobuild.toml"
-    selected_profile = (
-        Path(profile_path).expanduser()
-        if profile_path is not None
-        else default_profile
-        if default_profile.is_file()
-        else None
+    document, resolved_profile = _load_document(
+        _selected_profile(resolved_repository, profile_path)
     )
-    document, resolved_profile = _load_document(selected_profile)
     _validate_profile_fields(document)
     base = resolved_profile.parent if resolved_profile is not None else resolved_repository
     run = _table(document, "run")
@@ -744,12 +870,14 @@ def load_settings(
     seat_stall = float(run.get("seat_stall_seconds", 900))
     lease_stale = float(run.get("lease_stale_seconds", 1800))
     command_timeout = float(run.get("command_timeout_seconds", 600))
+    hold_limit = float(run.get("hold_limit_seconds", 21600))
     if (
         max_items < 1
         or seat_timeout <= 0
         or seat_stall <= 0
         or lease_stale <= 0
         or command_timeout <= 0
+        or hold_limit <= 0
     ):
         raise ConfigurationError("run bounds and timeouts must be positive")
     item_classes = _item_classes(run)
@@ -842,4 +970,9 @@ def load_settings(
         progress_stderr=progress_stderr,
         progress_command_timeout_seconds=progress_timeout,
         usage=_usage(document),
+        capacity=_capacity(document),
+        pressure=_pressure(document),
+        hold_limit_seconds=hold_limit,
+        batch_validate_every=_batch_validate_every(run),
+        validator_patient_argv=_patient_argv(validator),
     )

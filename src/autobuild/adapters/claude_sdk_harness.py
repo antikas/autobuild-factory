@@ -314,8 +314,12 @@ class ClaudeSdkHarnessAdapter(ClaudeCodeHarnessAdapter):
             "permissions": {"deny": [f"Read({posix})", f"Read(//{posix.lstrip('/')})"]},
         }
 
-    def _child_environment(self, config_dir: Path | None) -> tuple[tuple[str, str], ...]:
-        environment = dict(self._scratch_environment())
+    def _child_environment(
+        self, config_dir: Path | None, item_id: str | None = None
+    ) -> tuple[tuple[str, str], ...]:
+        environment = dict(
+            self._seat_environment(item_id) if item_id is not None else self._scratch_environment()
+        )
         if config_dir is not None:
             environment["CLAUDE_CONFIG_DIR"] = str(config_dir)
         for name in self.removed_environment:
@@ -362,7 +366,7 @@ class ClaudeSdkHarnessAdapter(ClaudeCodeHarnessAdapter):
             effort=values.get("--effort"),
             flags=tuple(flags),
             settings=self._settings() if self._key_file is not None else {},
-            environment=self._child_environment(config_dir),
+            environment=self._child_environment(config_dir, request.item_id),
         )
 
     def seat_transport(self, request: SeatRequest) -> SeatTransport:
@@ -477,7 +481,7 @@ class ClaudeSdkHarnessAdapter(ClaudeCodeHarnessAdapter):
                 now = self._clock()
                 if cancelled.is_set():
                     stopped = SeatOutcome.CANCELLED
-                elif now - started > request.timeout_seconds:
+                elif now - started > request.current_timeout_seconds():
                     stopped = SeatOutcome.TIMED_OUT
                 elif request.progress_deadline_seconds > 0:
                     current = request.progress_digest() if request.progress_digest else None

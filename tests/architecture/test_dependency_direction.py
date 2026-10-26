@@ -7,11 +7,13 @@ from pathlib import Path
 
 SRC = Path(__file__).parents[2] / "src" / "autobuild"
 
+HOST_MECHANISMS = ("ctypes", "platform", "subprocess")
+
 FORBIDDEN_IMPORTS = {
-    "domain": ("autobuild.adapters", "autobuild.application", "autobuild.bootstrap", "autobuild.enforcement", "autobuild.ports", "platform", "subprocess"),
-    "ports": ("autobuild.adapters", "autobuild.application", "autobuild.bootstrap", "autobuild.enforcement", "platform", "subprocess"),
-    "application": ("autobuild.adapters", "autobuild.bootstrap", "platform", "subprocess"),
-    "enforcement": ("autobuild.adapters", "autobuild.application", "autobuild.bootstrap"),
+    "domain": ("autobuild.adapters", "autobuild.application", "autobuild.bootstrap", "autobuild.enforcement", "autobuild.ports", *HOST_MECHANISMS),
+    "ports": ("autobuild.adapters", "autobuild.application", "autobuild.bootstrap", "autobuild.enforcement", *HOST_MECHANISMS),
+    "application": ("autobuild.adapters", "autobuild.bootstrap", *HOST_MECHANISMS),
+    "enforcement": ("autobuild.adapters", "autobuild.application", "autobuild.bootstrap", *HOST_MECHANISMS),
 }
 FORBIDDEN_LOGIC_WORDS = {"claude", "codex", "copilot", "windows", "darwin", "linux"}
 
@@ -53,3 +55,25 @@ def test_tripwire_detects_a_mechanism_leak(tmp_path: Path) -> None:
     found = violations(tmp_path)
     assert any("forbidden import subprocess" in violation for violation in found)
     assert any("provider/host word 'codex'" in violation for violation in found)
+
+
+def test_tripwire_detects_a_host_mechanism_in_a_logic_layer(tmp_path: Path) -> None:
+    enforcement = tmp_path / "enforcement"
+    enforcement.mkdir()
+    (enforcement / "capacity.py").write_text(
+        "import ctypes\nfrom ctypes import wintypes\nimport platform\nimport subprocess\n",
+        encoding="utf-8",
+    )
+    domain = tmp_path / "domain"
+    domain.mkdir()
+    (domain / "models.py").write_text("import ctypes.util\n", encoding="utf-8")
+
+    found = sorted(violation.replace("\\", "/") for violation in violations(tmp_path))
+
+    assert found == [
+        "domain/models.py:1: forbidden import ctypes.util",
+        "enforcement/capacity.py:1: forbidden import ctypes",
+        "enforcement/capacity.py:2: forbidden import ctypes",
+        "enforcement/capacity.py:3: forbidden import platform",
+        "enforcement/capacity.py:4: forbidden import subprocess",
+    ]

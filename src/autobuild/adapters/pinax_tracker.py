@@ -1,5 +1,7 @@
 """Pinax tracker adapter. Pinax commits every mutation itself and publishes it
-from the checked-out remote default branch."""
+from the checked-out remote default branch. When Pinax appends an event and
+its commit is refused, the adapter commits exactly the tracker files Pinax
+left behind and publishes them as Pinax would have."""
 
 from __future__ import annotations
 
@@ -8,12 +10,16 @@ import re
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from threading import Lock
 
 from autobuild.domain import (
     AdapterError,
     AdapterIdentity,
+    AutoBuildError,
     CampaignRef,
     ClaimReceipt,
     ClaimTaken,
@@ -27,19 +33,40 @@ from autobuild.domain import (
     WorkItem,
     WorkspaceRef,
 )
+from autobuild.domain.models import HoldCondition, SkippedItem, TrackerRecovery
 from autobuild.adapters.tracker_commits import (
     head_on_remote,
+    only_tracker_changes,
     require_committed,
     require_no_foreign_changes,
 )
 
 _TRACKER_PATHS = (".ergon",)
+_REMOTE = "origin"
 
 # Pinax exit codes for a mutating command. 0 is committed and 3 on a claim is
 # a superseded claim; both are handled by the adapter. 4 is an environment
 # stop and the rest are refusals; every stop carries Pinax's own explanation.
 _ENVIRONMENT_EXITS = frozenset({4})
 _REFUSED_EXITS = frozenset({1, 2, 5, 6, 7})
+# Exit 7 with one of these report statuses: Pinax appended its event and its
+# staging or commit was refused, so the event is left uncommitted and Pinax
+# asks the caller to commit the shard and the projection.
+_PARTIAL_WRITE_EXIT = 7
+_PARTIAL_WRITE_STATUSES = frozenset({"commit_refused", "stage_failed"})
+# The waits before each retry of a partial write's recovery commit, and of its
+# publishing push. The first attempt runs at once.
+RECOVERY_WAITS = (2.0, 5.0, 10.0)
+_RECOVERY_SUBJECT = "pinax: commit the appended tracker event"
+
+
+class _PartialWrite(TrackerStop):
+    """Pinax appended its event and did not commit it. ``report`` is Pinax's
+    own JSON report, which names the commit subject and the remote branch."""
+
+    def __init__(self, message: str, report: dict[str, object]) -> None:
+        super().__init__(message, code=_PARTIAL_WRITE_EXIT, environment=False)
+        self.report = report
 
 
 class PinaxTrackerAdapter:
@@ -52,15 +79,35 @@ class PinaxTrackerAdapter:
         repository: Path,
         proposal_prefix: str = "abp",
         accept_unpublished_claims: bool = False,
+        primary_lock: AbstractContextManager[object] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         """``accept_unpublished_claims`` accepts a claim Pinax committed but
         did not publish because the checked-out branch is not the remote
         default branch; the claim then travels with the branch's pull request.
-        Every other unpublished claim stops the campaign."""
+        Every other unpublished claim stops the campaign.
 
+        ``primary_lock`` is the primary-checkout lock composition shares with
+        the workspace adapter. Each Pinax command on the primary checkout is one
+        indivisible call (it fetches, commits and pushes itself), so the lock is
+        held for that one call and the checks of its own commit, and nothing
+        else. A partial write's recovery holds it for one commit attempt at a
+        time, never across a retry wait or a push. ``sleep`` is the wait
+        between recovery attempts; tests inject a recorder."""
+
+        self._primary_lock = primary_lock if primary_lock is not None else Lock()
         self._repository = repository.resolve(strict=False)
         self._proposal_prefix = proposal_prefix
         self._accept_unpublished_claims = accept_unpublished_claims
+        self._sleep = sleep
+        # The report of the last partial write on the primary checkout whose
+        # recovery did not succeed, so a later ``recover`` commits it with
+        # Pinax's own subject. The guard covers only this reference.
+        self._pending: dict[str, object] | None = None
+        # Ready items passed over for want of a brief, by item id. The same
+        # guard covers it.
+        self._skipped: dict[str, SkippedItem] = {}
+        self._pending_guard = Lock()
 
     def probe(self) -> ProbeResult:
         executable = shutil.which("pinax")
@@ -98,14 +145,12 @@ class PinaxTrackerAdapter:
         if payload.get("item_id") is None:
             return None
         item_id = str(payload["item_id"])
-        title = str(payload["title"])
-        brief_ref, caption = self._brief_note(root, item_id)
-        return WorkItem(
-            item_id,
-            title,
-            brief_ref,
-            (caption or f"Measurable acceptance is defined by {brief_ref}",),
-        )
+        head = self._fenced_item(campaign, root, item_id, str(payload["title"]))
+        if head is not None:
+            return head
+        # The head is outside the selection fence or has no brief: the next
+        # item is the first ready one inside the fence that has a brief.
+        return next(iter(self.ready_items(campaign)), None)
 
     def ready_items(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
         root = campaign.repository.resolve(strict=False)
@@ -140,16 +185,34 @@ class PinaxTrackerAdapter:
                 continue
             if not item_id:
                 continue
-            brief_ref, caption = self._brief_note(root, item_id)
-            items.append(
-                WorkItem(
-                    item_id,
-                    title,
-                    brief_ref,
-                    (caption or f"Measurable acceptance is defined by {brief_ref}",),
-                )
-            )
+            item = self._fenced_item(campaign, root, item_id, title)
+            if item is not None:
+                items.append(item)
         return tuple(items)
+
+    def _fenced_item(
+        self, campaign: CampaignRef, root: Path, item_id: str, title: str
+    ) -> WorkItem | None:
+        """The ready item as a ``WorkItem``, or None when it is not runnable
+        in this campaign. An item outside the allow and exclude lists is never
+        brief-checked. An admissible item without an approved brief, for
+        example a proposal another thread is still adding and gating, is
+        recorded as skipped so the campaign reports it."""
+
+        if not campaign.selection.permits(item_id):
+            return None
+        try:
+            brief_ref, caption = self._brief_note(root, item_id)
+        except EvidenceError:
+            with self._pending_guard:
+                self._skipped.setdefault(item_id, SkippedItem(item_id, "no_brief"))
+            return None
+        return WorkItem(
+            item_id,
+            title or item_id,
+            brief_ref,
+            (caption or f"Measurable acceptance is defined by {brief_ref}",),
+        )
 
     @staticmethod
     def _titles(root: Path) -> dict[str, str]:
@@ -219,12 +282,19 @@ class PinaxTrackerAdapter:
         return front
 
     def claim(self, item: WorkItem, actor: str) -> ClaimReceipt:
-        if self._git(
-            self._repository, "status", "--porcelain", "--untracked-files=all"
-        ).strip():
-            raise AdapterError("primary checkout must be clean before a tracker claim")
-        _, publication = self._mutate(
-            self._repository, "claim", item.item_id, "--actor", actor, "--json"
+        def clean() -> None:
+            # A write left uncommitted by an earlier command or run is
+            # committed first, under this same lock hold; the claim's own push
+            # publishes it.
+            if only_tracker_changes(self._git, self._repository, _TRACKER_PATHS):
+                self._commit_leftover(self._repository, self._pending_subject())
+            if self._git(
+                self._repository, "status", "--porcelain", "--untracked-files=all"
+            ).strip():
+                raise AdapterError("primary checkout must be clean before a tracker claim")
+
+        _, publication = self._on_primary(
+            clean, "claim", item.item_id, "--actor", actor, "--json"
         )
         return ClaimReceipt(
             item.item_id,
@@ -244,7 +314,7 @@ class PinaxTrackerAdapter:
         briefing = workspace.root / f".autobuild-{evidence.item_id}-briefing.md"
         briefing.write_text(self._briefing(evidence, item_commit), encoding="utf-8")
         try:
-            self._mutate(
+            self._in_worktree(
                 workspace.root,
                 "done",
                 evidence.item_id,
@@ -261,21 +331,20 @@ class PinaxTrackerAdapter:
         self, item_id: str, reason: str, actor: str, workspace: WorkspaceRef | None = None
     ) -> TrackerPublication | None:
         if workspace is not None:
-            self._mutate(
+            self._in_worktree(
                 workspace.root, "park", item_id, "--reason", reason, "--actor", actor, "--json"
             )
             return None
-        require_no_foreign_changes(self._git, self._repository, _TRACKER_PATHS)
-        _, publication = self._mutate(
-            self._repository, "park", item_id, "--reason", reason, "--actor", actor, "--json"
+        _, publication = self._on_primary(
+            self._no_foreign_changes,
+            "park", item_id, "--reason", reason, "--actor", actor, "--json",
         )
         return publication
 
     def propose(self, proposal: Proposal, actor: str) -> ProposalRef:
         self.validate_proposal(proposal)
-        require_no_foreign_changes(self._git, self._repository, _TRACKER_PATHS)
-        created, added = self._mutate(
-            self._repository,
+        created, added = self._on_primary(
+            self._no_foreign_changes,
             "add",
             "--title",
             proposal.title,
@@ -289,8 +358,8 @@ class PinaxTrackerAdapter:
         proposal_id = str(created.get("item_id") or created.get("id") or "")
         if not proposal_id:
             raise AdapterError("pinax add did not return a proposal id")
-        _, blocked = self._mutate(
-            self._repository,
+        _, blocked = self._on_primary(
+            None,
             "block",
             proposal_id,
             "--gate",
@@ -300,8 +369,8 @@ class PinaxTrackerAdapter:
             "--json",
         )
         caption = f"{proposal.question} {proposal.rationale}"[:200]
-        _, noted = self._mutate(
-            self._repository,
+        _, noted = self._on_primary(
+            None,
             "note",
             "add",
             proposal_id,
@@ -320,6 +389,26 @@ class PinaxTrackerAdapter:
             published=all(write.published for write in writes),
             publication_note=next((write.note for write in writes if not write.published), ""),
         )
+
+    @staticmethod
+    def is_projection(path: str) -> bool:
+        """True for a file Pinax generates from its log: the board and the
+        per-item pages. The ``.jsonl`` log shards are the source, never a
+        projection."""
+
+        normal = path.replace("\\", "/")
+        return normal == ".ergon/board.md" or (
+            normal.startswith(".ergon/items/") and normal.endswith(".md")
+        )
+
+    def regenerate_projection(self, root: Path) -> None:
+        """Rebuild the projection in ``root`` from its log. Pinax writes the
+        files; the caller stages and commits them."""
+
+        completed = self._run(root.resolve(strict=False), "verify", "--fix")
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise AdapterError(f"pinax verify --fix exit {completed.returncode}: {detail}")
 
     @staticmethod
     def validate_proposal(proposal: Proposal) -> None:
@@ -378,15 +467,167 @@ class PinaxTrackerAdapter:
             f"## Changed paths\n\n{changed or '- None'}\n"
         )
 
+    def recover(self) -> TrackerRecovery:
+        """Commit a partial write left on the primary checkout, publish it,
+        and check that the remote answers. One attempt; the campaign repeats
+        it while it holds admissions."""
+
+        try:
+            with self._primary_lock:
+                committed = self._commit_leftover(self._repository, self._pending_subject())
+        except Exception as exc:
+            return TrackerRecovery(False, HoldCondition.TRACKER_PENDING, str(exc))
+        try:
+            default_branch = self._remote_default_branch()
+        except AdapterError as exc:
+            return TrackerRecovery(False, HoldCondition.TRACKER_UNREACHABLE, str(exc))
+        if committed is not None:
+            self._publish(self._repository, default_branch)
+        return TrackerRecovery()
+
+    def skipped_items(self) -> tuple[SkippedItem, ...]:
+        with self._pending_guard:
+            return tuple(self._skipped.values())
+
+    def _pending_subject(self) -> str:
+        """Pinax's own commit subject for the pending partial write, when one
+        is known."""
+
+        with self._pending_guard:
+            pending = self._pending
+        return str((pending or {}).get("commit_message") or _RECOVERY_SUBJECT)
+
+    def _no_foreign_changes(self) -> None:
+        require_no_foreign_changes(self._git, self._repository, _TRACKER_PATHS)
+
+    def _on_primary(
+        self, check: Callable[[], None] | None, *args: str
+    ) -> tuple[dict[str, object], TrackerPublication]:
+        """Run one mutating command on the primary checkout under the lock,
+        after ``check``. A partial write is recovered after the lock is let go."""
+
+        try:
+            with self._primary_lock:
+                if check is not None:
+                    check()
+                return self._mutate(self._repository, *args)
+        except _PartialWrite as partial:
+            return self._finish_partial(self._repository, partial)
+
+    def _in_worktree(self, root: Path, *args: str) -> None:
+        """Run one mutating command in an item worktree, which only its item
+        writes, recovering a partial write there."""
+
+        try:
+            self._mutate(root, *args)
+        except _PartialWrite as partial:
+            self._finish_partial(root, partial)
+
+    def _finish_partial(
+        self, root: Path, partial: _PartialWrite
+    ) -> tuple[dict[str, object], TrackerPublication]:
+        """Do what Pinax would have done after its refused commit: commit the
+        tracker paths it left behind, with its own subject, then publish from
+        the primary checkout when the remote default branch is checked out.
+
+        Each commit attempt holds the primary-checkout lock (for the primary)
+        for that attempt alone; the waits between attempts and the push run
+        outside it. When every attempt fails the write stays pending, the
+        error is raised as the original refusal, and ``recover`` retries it."""
+
+        primary = root == self._repository
+        subject = str(partial.report.get("commit_message") or _RECOVERY_SUBJECT)
+        failure = ""
+        for wait in (0.0, *RECOVERY_WAITS):
+            if wait:
+                self._sleep(wait)
+            try:
+                with self._primary_lock if primary else nullcontext():
+                    self._commit_leftover(root, subject)
+            except AutoBuildError as exc:
+                failure = str(exc)
+                continue
+            break
+        else:
+            if primary:
+                with self._pending_guard:
+                    self._pending = partial.report
+            raise TrackerStop(
+                f"{partial}; recovery of the appended event failed: {failure}",
+                code=partial.code,
+                environment=False,
+            )
+        if not primary:
+            return partial.report, TrackerPublication(False, "")
+        published = self._publish(root, str(partial.report.get("remote_branch") or ""))
+        note = "" if published else (
+            "the recovered tracker commit was not pushed; it goes out with the next push of its branch"
+        )
+        return partial.report, TrackerPublication(published, note)
+
+    def _commit_leftover(self, root: Path, subject: str) -> str | None:
+        """Commit the tracker files left uncommitted in ``root``; the caller
+        holds the lock that covers ``root``. Returns the new commit, or None
+        when nothing is left (another tracker commit already took it in). The
+        projection is regenerated first when it no longer matches the log, and
+        the commit must touch tracker paths only."""
+
+        leftover = self._git(
+            root, "status", "--porcelain", "--untracked-files=all", "--", *_TRACKER_PATHS
+        ).strip()
+        if not leftover:
+            return None
+        if self._run(root, "verify").returncode != 0:
+            self.regenerate_projection(root)
+        before = self._git(root, "rev-parse", "HEAD")
+        self._git(root, "add", "-A", "--", *_TRACKER_PATHS)
+        self._git(root, "commit", "-m", subject, "--", *_TRACKER_PATHS)
+        head = require_committed(self._git, root, before, _TRACKER_PATHS)
+        if root == self._repository:
+            with self._pending_guard:
+                self._pending = None
+        return head
+
+    def _publish(self, root: Path, branch: str) -> bool:
+        """Push the primary checkout's head to ``branch`` on the remote when
+        that branch is checked out, as Pinax publishes. A failed push is tried
+        again after each recovery wait. Returns whether the remote took it."""
+
+        if not branch or self._git(root, "branch", "--show-current") != branch:
+            return False
+        head = self._git(root, "rev-parse", "HEAD")
+        for wait in (0.0, *RECOVERY_WAITS):
+            if wait:
+                self._sleep(wait)
+            try:
+                self._git(root, "push", _REMOTE, f"{head}:refs/heads/{branch}")
+            except AdapterError:
+                continue
+            return True
+        return False
+
+    def _remote_default_branch(self) -> str:
+        """The remote's default branch, read from the remote itself, so a
+        remote that does not answer raises."""
+
+        listing = self._git(self._repository, "ls-remote", "--symref", _REMOTE, "HEAD")
+        for line in listing.splitlines():
+            reference, _, name = line.partition("\t")
+            if name == "HEAD" and reference.startswith("ref: refs/heads/"):
+                return reference.removeprefix("ref: refs/heads/")
+        return ""
+
     def _mutate(
         self, root: Path, *args: str
     ) -> tuple[dict[str, object], TrackerPublication]:
         """Run one mutating Pinax command and confirm it committed its event.
 
         Pinax appends, commits and, on the checked-out remote default branch,
-        pushes in the one command, so the adapter never stages or commits
-        tracker files. A nonzero exit is mapped to a typed stop that carries
-        Pinax's own report. Returns the command's JSON and its publication."""
+        pushes in the one command, so the adapter stages or commits tracker
+        files only to finish a write Pinax appended and could not commit
+        (``_PartialWrite``, finished by the caller). A nonzero exit is mapped
+        to a typed stop that carries Pinax's own report. Returns the command's
+        JSON and its publication."""
 
         command = args[0]
         before = self._git(root, "rev-parse", "HEAD")
@@ -404,6 +645,12 @@ class PinaxTrackerAdapter:
             return report, TrackerPublication(False, cause)
         status = str(report.get("status", "")).strip()
         label = f"pinax {command} exit {code}" + (f" ({status})" if status else "")
+        if (
+            code == _PARTIAL_WRITE_EXIT
+            and report.get("committed") is False
+            and status in _PARTIAL_WRITE_STATUSES
+        ):
+            raise _PartialWrite(f"{label}: {cause}", report)
         if code in _ENVIRONMENT_EXITS:
             raise TrackerStop(f"{label}: {cause}", code=code, environment=True)
         if code in _REFUSED_EXITS:

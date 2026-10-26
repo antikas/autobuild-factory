@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 from collections.abc import Mapping
 from dataclasses import replace
@@ -133,6 +135,58 @@ def scratch_environment(root: Path) -> tuple[tuple[str, str], ...]:
         if key != "NO_COLOR":
             value.mkdir(parents=True, exist_ok=True)
     return tuple((key, str(value)) for key, value in values.items())
+
+
+_TEMPORARY_VARIABLES = ("TMPDIR", "TEMP", "TMP")
+
+
+def item_scratch_environment(root: Path, item_id: str) -> tuple[tuple[str, str], ...]:
+    """The temporary environment for one item's commands and seats.
+
+    Only the temporary directory variables point under the item's own directory
+    below ``root``, and ``PYTEST_ADDOPTS`` carries a pytest base temporary
+    directory beside them, so two items never share, or clear, each other's
+    temporary trees. Package caches are not set here: they stay the shared
+    campaign values, which their tools lock themselves. The inherited pytest
+    options are kept except any ``--basetemp``, which this one replaces. The
+    process environment is read and never changed."""
+
+    item_root = root / _item_directory(item_id)
+    temporary = item_root / "tmp"
+    temporary.mkdir(parents=True, exist_ok=True)
+    values = {name: str(temporary) for name in _TEMPORARY_VARIABLES}
+    values["PYTEST_ADDOPTS"] = _with_basetemp(
+        os.environ.get("PYTEST_ADDOPTS", ""), item_root / "pytest"
+    )
+    return tuple(values.items())
+
+
+def _item_directory(item_id: str) -> str:
+    # The cleaned id stays readable; the hash of the raw id keeps two ids that
+    # clean to the same name apart.
+    digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()[:8]
+    return f"{_safe_name(item_id)}-{digest}"
+
+
+def _with_basetemp(inherited: str, basetemp: Path) -> str:
+    # pytest splits PYTEST_ADDOPTS with POSIX shell rules, so the path is written
+    # with forward slashes, which pytest accepts on every platform.
+    option = f"--basetemp={basetemp.as_posix()}"
+    try:
+        tokens = shlex.split(inherited)
+    except ValueError:
+        # pytest refuses an unparseable value itself; it is passed on unchanged.
+        return f"{inherited} {shlex.quote(option)}"
+    kept: list[str] = []
+    skip_value = False
+    for token in tokens:
+        if skip_value:
+            skip_value = False
+        elif token == "--basetemp":
+            skip_value = True
+        elif not token.startswith("--basetemp="):
+            kept.append(token)
+    return shlex.join((*kept, option))
 
 
 def _safe_name(value: str) -> str:
@@ -284,12 +338,13 @@ class CliHarnessAdapter:
                 command_id=run_ref,
                 argv=invocation,
                 cwd=request.workspace.root,
-                environment=self._scratch_environment(),
+                environment=self._seat_environment(request.item_id),
                 timeout_seconds=request.timeout_seconds,
                 stdin_ref=stdin_ref,
                 progress_deadline_seconds=request.progress_deadline_seconds,
                 progress_digest=request.progress_digest,
                 remove_environment=self.removed_environment,
+                timeout_extension=request.timeout_extension,
             )
         )
         outcome = SeatOutcome.SUCCEEDED
@@ -480,6 +535,14 @@ class CliHarnessAdapter:
 
     def _scratch_environment(self) -> tuple[tuple[str, str], ...]:
         return (*scratch_environment(self._output_root / "scratch"), *self.telemetry_environment)
+
+    def _seat_environment(self, item_id: str) -> tuple[tuple[str, str], ...]:
+        """The adapter's child environment with the temporary directories of
+        ``item_id``, so concurrent seats of different items never share them."""
+
+        environment = dict(self._scratch_environment())
+        environment.update(item_scratch_environment(self._output_root / "scratch", item_id))
+        return tuple(environment.items())
 
     def _model(self, model_class: str) -> str:
         return self._model_map.get(model_class, model_class)

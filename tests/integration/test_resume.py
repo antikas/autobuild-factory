@@ -196,3 +196,132 @@ def test_a_second_campaign_resumes_a_built_worktree_and_delivers(tmp_path: Path)
         for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert any(event["event_type"] == "item.resumed" for event in events)
+
+
+def test_a_finalised_worktree_whose_head_is_an_integration_merge_resumes_and_delivers(
+    tmp_path: Path,
+) -> None:
+    """A run killed after delivery merged the target branch into the item
+    branch leaves a worktree whose head is that integration merge. The marker
+    pinned the tracker commit; the resume steps over the merge, validates the
+    integrated candidate once, and delivers it."""
+
+    from autobuild.adapters.git_workspace import INTEGRATION_SUBJECT
+    from autobuild.domain import (
+        CloseEvidence,
+        FinaliseRequest,
+        ValidationEvidence,
+    )
+
+    repo = _repo(tmp_path)
+    remote = tmp_path / "remote.git"
+    scratch = tmp_path / "scratch"
+    campaign = CampaignRef("resume-merge", repo, max_items=3)
+    item = WorkItem("TST-001", "Resume me", "docs/brief.md", ("Product reaches the default branch.",))
+
+    # --- The interrupted first run: claim, build, commit, close, then the
+    # delivery merged origin/main into the item branch and the run was killed.
+    tracker_setup = BacklogTrackerAdapter(repo)
+    workspace_setup = GitWorkspaceAdapter(scratch, tracker_paths=("BACKLOG.md",))
+    records_setup = LocalRunRecordAdapter(scratch / "runs")
+    tracker_setup.claim(item, "builder@lane-one")
+    workspace = workspace_setup.create_isolated(campaign, item)
+    (workspace.root / "product.txt").write_text("built by the killed run\n", encoding="utf-8")
+    diff = workspace_setup.diff(workspace)
+    command = CommandResult("run:TST-001:tests", 0, "stdout", "stderr", "start", "end")
+    evidence = CloseEvidence(
+        "TST-001",
+        diff.workspace_revision,
+        diff,
+        ValidationEvidence("tests", diff.workspace_revision, command, diff.changed_paths),
+        ReviewVerdict("TST-001", ReviewDecision.PASS, (), "review"),
+        "trajectory",
+    )
+    item_commit = workspace_setup.commit_item(
+        workspace, FinaliseRequest("TST-001", evidence, "ADDED: Resume me")
+    )
+    tracker_setup.close(evidence, item_commit, workspace, "coordinator@autobuild")
+    tracker_commit = workspace_setup.commit_tracker(workspace, "TST-001", item_commit)
+    other = tmp_path / "other"
+    run("git", "clone", "--quiet", str(remote), str(other))
+    git(other, "config", "user.name", "Upstream Writer")
+    git(other, "config", "user.email", "upstream@example.invalid")
+    (other / "upstream.txt").write_text("another writer\n", encoding="utf-8")
+    git(other, "add", "upstream.txt")
+    git(other, "commit", "-m", "upstream change")
+    git(other, "push", "origin", "HEAD:main")
+    git(workspace.root, "fetch", "origin")
+    git(
+        workspace.root,
+        "merge",
+        "--no-ff",
+        "-m",
+        f"{INTEGRATION_SUBJECT} origin/main into {workspace.branch}",
+        "origin/main",
+    )
+    merge_head = git(workspace.root, "rev-parse", "HEAD")
+    assert merge_head != tracker_commit
+    record = records_setup.create(campaign)
+    marker = {
+        "schema": "autobuild.item-phase.v1",
+        "item_id": "TST-001",
+        "state": "finalised",
+        "worktree_root": str(workspace.root),
+        "branch": workspace.branch,
+        "head_commit": tracker_commit,
+        "workspace_revision": diff.workspace_revision,
+        "correction_count": 0,
+        "timestamp": "2026-09-04T00:00:00+00:00",
+    }
+    records_setup.write_evidence_file(
+        record, "TST-001-phase.json", json.dumps(marker).encode("utf-8")
+    )
+
+    # --- The second campaign resumes the finalised worktree and delivers it.
+    tracker = BacklogTrackerAdapter(repo)
+    workspace_adapter = GitWorkspaceAdapter(scratch, tracker_paths=("BACKLOG.md",))
+    records = LocalRunRecordAdapter(scratch / "runs")
+    harness = FakeHarnessAdapter(AdapterIdentity("harness", "1", frozenset({"test"})))
+    validator = FakeCommandAdapter(
+        AdapterIdentity("command", "1", frozenset({"test"})),
+        scripted_results=[
+            CommandResult("cmd:TST-001:tests", 0, "stdout", "stderr", "start", "end")
+        ],
+    )
+    knowledge = FakeKnowledgeAdapter(AdapterIdentity("knowledge", "1", frozenset({"test"})))
+    ports = WorkflowPorts(
+        tracker,
+        workspace_adapter,
+        harness,
+        validator,
+        records,
+        knowledge,
+        lease=FilesystemLeaseAdapter(scratch),
+    )
+    context = CampaignContext(
+        harness="",
+        models={},
+        delivery_mode=DeliveryMode.PROTECTED_DEFAULT,
+        validator_id="tests",
+        target_branch="main",
+        target_revision=git(repo, "rev-parse", "HEAD"),
+    )
+
+    outcome = CampaignRunner(ports).run(
+        campaign, _spec_for(repo, git(repo, "rev-parse", "HEAD")), context=context
+    )
+
+    assert [entry.item_id for entry in outcome.items] == ["TST-001"]
+    assert outcome.items[0].disposition is ItemDisposition.ACCEPTED, outcome.items[0].reason
+    assert harness.requests == []
+    # The merge brought another writer's product in, so the integrated
+    # candidate was validated exactly once more before it was pushed.
+    assert len(validator.requests) == 1
+    # The campaign report is committed on top of the delivered commit.
+    pushed = git(repo, "ls-remote", str(remote), "refs/heads/main").split()[0]
+    assert git(repo, "rev-parse", f"{pushed}^") == outcome.items[0].finalise.merged_commit
+    assert git(repo, "merge-base", "--is-ancestor", merge_head, pushed) == ""
+    assert git(repo, "show", f"{pushed}:product.txt") == "built by the killed run"
+    assert git(repo, "show", f"{pushed}:upstream.txt") == "another writer"
+    assert "| TST-001 | Resume me | Done (" in git(repo, "show", f"{pushed}:BACKLOG.md")
+    assert workspace.root.exists() is False

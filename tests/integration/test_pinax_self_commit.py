@@ -469,6 +469,27 @@ def test_a_tracker_commit_that_sweeps_in_a_product_file_is_refused(
         PinaxTrackerAdapter(repo).park(ITEM.item_id, "reason", "coordinator@proof", workspace)
 
 
+def test_a_primary_park_checks_only_its_own_commit_and_refuses_a_product_path(
+    tmp_path: Path, stub_pinax: list[tuple[str, ...]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delivered product commit before the park is outside the park's own
+    range; the park's commit that sweeps in a product file is refused."""
+
+    repo = repository(tmp_path)
+    (repo / "delivered.txt").write_text("delivered before the park\n", encoding="utf-8")
+    git(repo, "add", "delivered.txt")
+    git(repo, "commit", "-m", "ADDED: delivered item")
+    tracker = PinaxTrackerAdapter(repo)
+
+    tracker.park("tst-1", "reason", "coordinator@proof")
+    monkeypatch.setenv("STUB_PINAX_MODE", "with-product")
+    with pytest.raises(EvidenceError) as raised:
+        tracker.park("tst-2", "reason", "coordinator@proof")
+
+    assert "non-tracker paths: product-by-tracker.txt" in str(raised.value)
+    assert "delivered.txt" not in str(raised.value)
+
+
 @pytest.mark.parametrize(("mode", "published"), (("commit-push", True), ("commit-note", False)))
 def test_a_primary_park_reports_whether_pinax_published_it(
     tmp_path: Path,

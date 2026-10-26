@@ -549,6 +549,23 @@ def test_host_command_times_out_and_terminates_the_process_tree(tmp_path: Path) 
     assert result.exit_code is not None
 
 
+def test_a_supervised_command_runs_past_its_cap_while_the_cap_is_stretched(tmp_path: Path) -> None:
+    adapter = host_command_adapter(tmp_path / "commands")
+    request = CommandRequest(
+        "stretched",
+        (sys.executable, "-c", "import time; time.sleep(1)"),
+        tmp_path,
+        timeout_seconds=0.2,
+        progress_deadline_seconds=60,
+        timeout_extension=lambda: 30.0,
+    )
+
+    result = adapter.run(request)
+
+    assert result.timed_out is False
+    assert result.exit_code == 0
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows command wrapper proof")
 def test_windows_command_resolves_a_cmd_shim_without_enabling_general_shell_mode(tmp_path: Path) -> None:
     shim = tmp_path / "shim.cmd"

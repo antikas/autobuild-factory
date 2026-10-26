@@ -328,6 +328,18 @@ class EnforcedWorkspacePort:
         _require_workspace(workspace, self._config)
         self._port.release(workspace)
 
+    def open_validation_checkout(
+        self, repository: Path, branch: str | None, refresh: bool = False
+    ):
+        _require_path(repository, self._config, "campaign repository")
+        checkout = self._port.open_validation_checkout(repository, branch, refresh)
+        _require_path(checkout.root, self._config, "validation checkout")
+        return checkout
+
+    def close_validation_checkout(self, checkout) -> None:
+        _require_path(checkout.root, self._config, "validation checkout")
+        self._port.close_validation_checkout(checkout)
+
 
 class EnforcedTrackerPort:
     def __init__(self, port: TrackerPort, config: PolicyConfig) -> None:
@@ -389,6 +401,14 @@ class EnforcedTrackerPort:
         if result.runnable:
             raise PolicyViolation("workflow proposals must remain non-runnable")
         return result
+
+    def recover(self):
+        if not self._config.allow_repository_mutation:
+            raise PolicyViolation("tracker recovery has no repository-mutation gate")
+        return self._port.recover()
+
+    def skipped_items(self):
+        return self._port.skipped_items()
 
 
 class EnforcedRunRecordPort:

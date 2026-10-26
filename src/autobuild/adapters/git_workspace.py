@@ -7,9 +7,12 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
+from typing import TypeVar
 from uuid import uuid4
 
 from autobuild.domain import (
@@ -33,7 +36,38 @@ from autobuild.domain import (
     WorktreeSnapshot,
     WorktreeStatus,
 )
-from autobuild.adapters.tracker_commits import require_one_tracker_commit
+from autobuild.domain.models import DeliveryParked, DeliveryParkReason, ValidationCheckout
+from autobuild.adapters.tracker_commits import (
+    only_tracker_changes,
+    require_one_tracker_commit,
+)
+from autobuild.enforcement.integration import revalidation_decision
+from autobuild.ports.contracts import TrackerProjectionPort
+
+# The subject every delivery integration merge carries. A head invariant steps
+# over a two-parent commit with this subject to reach the tracker commit.
+INTEGRATION_SUBJECT = "MERGED: integrate"
+# Source moves of the target branch and rejected pushes, together, allowed per
+# delivery before the item parks as contended.
+DELIVERY_ATTEMPTS = 3
+# Fetches tried per attempt when a concurrent writer holds a remote-tracking ref.
+FETCH_ATTEMPTS = 3
+_REF_LOCK_SIGNS = ("cannot lock ref", "unable to create", "unable to lock")
+# A push that lost a race to another writer: the remote refused a non-fast-forward
+# update, or its server-side ref lock was held by a concurrent push. A hook,
+# protected-branch or unpacker refusal is not a race and is raised.
+_PUSH_REJECTED_SIGNS = ("[rejected]", "non-fast-forward", "fetch first", "cannot lock ref")
+_ABSENT_REMOTE_REF_SIGN = "couldn't find remote ref"
+_MAX_INTEGRATION_MERGES = 64
+# Tracker recoveries one locked delivery step may run when it finds the primary
+# checkout dirty with tracker files only.
+LEFTOVER_RECOVERIES = 3
+_T = TypeVar("_T")
+
+
+class _TrackerLeftover(AdapterError):
+    """The primary checkout is dirty with tracker files only: a tracker write
+    was appended and not committed. The tracker's recovery can finish it."""
 
 
 def _slug(value: str) -> str:
@@ -54,7 +88,24 @@ class GitWorkspaceAdapter:
         remote: str = "origin",
         tracker_paths: tuple[Path | str, ...] = (".ergon",),
         tracker_commits_itself: bool = False,
+        primary_lock: AbstractContextManager[object] | None = None,
+        projection: TrackerProjectionPort | None = None,
+        tracker_recovery: Callable[[], object] | None = None,
     ) -> None:
+        """``primary_lock`` is the one lock every local mutation of the primary
+        checkout holds; composition shares it with the tracker adapter. It covers
+        a worktree add or remove, the delivery fast-forward and the report commit,
+        never a fetch, a push or a validator run. ``projection`` lets delivery
+        regenerate a conflicted tracker projection from the merged log.
+        ``tracker_recovery`` is the tracker's own recovery of a write it
+        appended and did not commit; a locked delivery or report step that
+        finds the primary dirty with tracker files only lets the lock go, runs
+        it and tries again. It takes the primary-checkout lock itself, so it is
+        never called under it."""
+
+        self._primary_lock = primary_lock if primary_lock is not None else Lock()
+        self._projection = projection
+        self._tracker_recovery = tracker_recovery
         self._scratch_root = scratch_root.resolve(strict=False)
         self._remote = remote
         self._tracker_commits_itself = tracker_commits_itself
@@ -104,8 +155,13 @@ class GitWorkspaceAdapter:
         worktree_root.parent.mkdir(parents=True, exist_ok=True)
         self._require_scratch_path(worktree_root)
         branch = f"autobuild/{_slug(campaign.campaign_id)}/{_slug(item.item_id)}-{lease_id[:8]}"
-        self._git(repository.root, "worktree", "add", "-b", branch, str(worktree_root), repository.revision)
-        workspace = WorkspaceRef(worktree_root, branch, repository.revision, lease_id)
+        with self._primary_lock:
+            # The start revision is read under the lock, so the worktree starts
+            # from the primary head no concurrent claim is moving.
+            revision = self._git(repository.root, "rev-parse", "HEAD")
+            self._git(repository.root, "worktree", "add", "-b", branch, str(worktree_root), revision)
+        repository = replace(repository, revision=revision)
+        workspace = WorkspaceRef(worktree_root, branch, revision, lease_id)
         with self._lock:
             self._leases[lease_id] = _Lease(repository, workspace)
         return workspace
@@ -130,7 +186,13 @@ class GitWorkspaceAdapter:
                 continue
             changed = self._changed_against(path, head)
             statuses.append(
-                WorktreeStatus(path, branch, head, self._revision_digest(head, changed))
+                WorktreeStatus(
+                    path,
+                    branch,
+                    head,
+                    self._revision_digest(head, changed),
+                    self._integration_base(path, head),
+                )
             )
         return tuple(statuses)
 
@@ -154,8 +216,11 @@ class GitWorkspaceAdapter:
 
     def resume_delivery_commits(self, workspace: WorkspaceRef) -> tuple[str | None, str]:
         self._require_lease(workspace)
-        tracker_commit = self._git(workspace.root, "rev-parse", "HEAD")
-        parent = self._git(workspace.root, "rev-parse", "--verify", "--quiet", "HEAD^", check=False)
+        head = self._git(workspace.root, "rev-parse", "HEAD")
+        tracker_commit = self._integration_base(workspace.root, head)
+        parent = self._git(
+            workspace.root, "rev-parse", "--verify", "--quiet", f"{tracker_commit}^", check=False
+        )
         return (parent.strip() or None, tracker_commit)
 
     def diff(self, workspace: WorkspaceRef) -> DiffEvidence:
@@ -258,23 +323,7 @@ class GitWorkspaceAdapter:
                     f"reported {label} commit is absent from the repository: {commit}"
                 )
         if result.merged_commit and target_branch.strip():
-            ancestry = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(primary),
-                    "merge-base",
-                    "--is-ancestor",
-                    result.merged_commit,
-                    target_branch,
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-            if ancestry.returncode != 0:
+            if not self._is_ancestor(primary, result.merged_commit, target_branch):
                 raise EvidenceError(
                     "merged commit is not reachable from the delivery target branch: "
                     f"merged {result.merged_commit}, branch {target_branch}"
@@ -318,6 +367,10 @@ class GitWorkspaceAdapter:
 
     def snapshot(self, workspace: WorkspaceRef) -> WorktreeSnapshot:
         self._require_lease(workspace)
+        head = self._git(workspace.root, "rev-parse", "HEAD")
+        base = self._integration_base(workspace.root, head)
+        if base != head:
+            return self._committed_snapshot(workspace, base)
         changed = self._changed_paths(workspace)
         untracked = {
             path
@@ -358,10 +411,65 @@ class GitWorkspaceAdapter:
             files.append(SnapshotFile(posix, content, entry.digest or ""))
         return WorktreeSnapshot(workspace.start_commit, patch, tuple(files), changed)
 
+    def _committed_snapshot(self, workspace: WorkspaceRef, base: str) -> WorktreeSnapshot:
+        """The snapshot of a worktree whose head is an integration merge: only
+        the item's own change, from the start commit to ``base`` (the commit
+        beneath the merges), never what the merged target brought in. A
+        completed merge leaves nothing uncommitted, so there are no loose files."""
+
+        root = workspace.root
+        raw = self._git(
+            root, "diff", "--name-status", "-z", "--no-renames", workspace.start_commit, base
+        )
+        fields = [field for field in raw.split("\0") if field]
+        changed: list[ChangedPath] = []
+        for status, value in zip(fields[0::2], fields[1::2]):
+            if not self._is_product_path(value):
+                continue
+            if status.startswith("D"):
+                changed.append(ChangedPath(Path(value), ChangeKind.DELETED, None))
+                continue
+            kind = ChangeKind.ADDED if status.startswith("A") else ChangeKind.MODIFIED
+            blob = self._git_bytes(root, "cat-file", "blob", f"{base}:{value}")
+            changed.append(ChangedPath(Path(value), kind, hashlib.sha256(blob).hexdigest()))
+        changed.sort(key=lambda entry: entry.path.as_posix())
+        patch = b""
+        if changed:
+            patch = self._git_bytes(
+                root,
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                workspace.start_commit,
+                base,
+                "--",
+                *(entry.path.as_posix() for entry in changed),
+            )
+        return WorktreeSnapshot(workspace.start_commit, patch, (), tuple(changed))
+
     def deliver(self, workspace: WorkspaceRef, request: DeliveryRequest) -> FinaliseResult:
+        """Deliver one item branch: integrate, revalidate when the base moved,
+        push, and only then move the local target.
+
+        Each attempt fetches the remote target (outside the lock) and merges the
+        fetched remote target and the local target head into the item branch in
+        the worktree. A merge that changed a product path is put to the
+        revalidation rule in ``enforcement.integration`` with the item commit's
+        own paths and the declared paths; only an overlap is validated again
+        through ``request.revalidate``, and every decision goes to
+        ``request.note_revalidation``. Under the lock the local
+        target must be an ancestor of the candidate; a gap confined to the
+        tracker paths is merged in there, a gap in any other path starts the
+        next attempt. The lock is released and the candidate pushed by refspec
+        from the worktree. Only after the remote accepted and showed it does the
+        lock fast-forward the local target to it, so the local target never
+        holds an undelivered item commit. A source move or a rejected push uses
+        one of ``DELIVERY_ATTEMPTS``. Without a push, the fast-forward is the
+        delivery and runs in the same hold as the catch-up."""
+
         lease = self._require_lease(workspace)
         head = self._git(workspace.root, "rev-parse", "HEAD")
-        if head != request.tracker_commit:
+        if self._integration_base(workspace.root, head) != request.tracker_commit:
             raise EvidenceError("delivery head does not match the tracker commit")
         parent = self._git(workspace.root, "rev-parse", f"{request.tracker_commit}^")
         if request.item_commit is None:
@@ -369,97 +477,341 @@ class GitWorkspaceAdapter:
                 raise EvidenceError("parked tracker commit is not based on the starting commit")
         elif parent != request.item_commit:
             raise EvidenceError("tracker commit is not immediately after the item commit")
+        repository = lease.repository
         if request.mode is DeliveryMode.CURRENT_BRANCH_PR:
-            return self._deliver_current_branch(lease, workspace, request)
-        if request.mode is not DeliveryMode.PROTECTED_DEFAULT:
+            if request.target_branch != repository.current_branch:
+                raise EvidenceError(
+                    "current-branch delivery target differs from the invoking branch"
+                )
+            if (
+                request.target_branch == repository.default_branch
+                and not request.allow_current_branch_default
+            ):
+                raise AdapterError(
+                    "current-branch-pr delivery refuses the detected default branch; "
+                    "pass --allow-current-branch-default after human approval"
+                )
+            target = request.target_branch
+            pushing = request.push_current_branch
+        elif request.mode is DeliveryMode.PROTECTED_DEFAULT:
+            target = repository.default_branch
+            pushing = True
+        else:
             raise EvidenceError(f"unsupported delivery mode: {request.mode}")
+        # The commit whose product tree last passed the validator. A park carries
+        # no validated product change and is never validated again.
+        validated = request.item_commit if request.revalidate is not None else None
+        own = (
+            tuple(
+                self._product_changes(
+                    workspace.root, f"{request.item_commit}^", request.item_commit
+                )
+            )
+            if validated is not None
+            else ()
+        )
+        spent = 0
+        rejections: list[str] = []
+        while True:
+            candidate = self._integrate(lease, workspace, target)
+            if validated is not None:
+                incoming = self._product_changes(workspace.root, validated, candidate)
+                if incoming:
+                    decision = revalidation_decision(incoming, own, request.declared_paths)
+                    if request.note_revalidation is not None:
+                        request.note_revalidation(decision)
+                    if decision.run:
+                        assert request.revalidate is not None
+                        if not request.revalidate():
+                            raise DeliveryParked(
+                                DeliveryParkReason.REVALIDATION_FAILED,
+                                f"integrated candidate {candidate} failed the validator",
+                            )
+                        validated = candidate
+
+            def catch_up() -> str | None:
+                ready = self._catch_up(
+                    lease, workspace, request, target, candidate, validated, own
+                )
+                if ready is not None and not pushing:
+                    self._fast_forward_target(lease, target, ready)
+                return ready
+
+            ready = self._on_clean_primary(catch_up)
+            if ready is not None and not pushing:
+                return FinaliseResult(
+                    request.item_commit,
+                    request.tracker_commit,
+                    ready,
+                    False,
+                    (f"local branch {target} updated without push",),
+                )
+            if ready is not None and self._push(lease, workspace, target, ready, rejections):
+                pushed = ready
+                self._on_clean_primary(
+                    lambda: self._settle_target(lease, workspace, target, pushed)
+                )
+                return FinaliseResult(
+                    request.item_commit,
+                    request.tracker_commit,
+                    ready,
+                    True,
+                    (f"remote {repository.remote}/{target} verified",),
+                )
+            spent += 1
+            if spent >= DELIVERY_ATTEMPTS:
+                cause = (
+                    "the target branch moved outside the tracker paths"
+                    if ready is None
+                    else "the push was rejected"
+                )
+                detail = f": {rejections[-1]}" if ready is not None and rejections else ""
+                raise DeliveryParked(
+                    DeliveryParkReason.CONTENDED,
+                    f"{cause} on the last of {DELIVERY_ATTEMPTS} delivery attempts{detail}",
+                )
+
+    def _integrate(self, lease: _Lease, workspace: WorkspaceRef, target: str) -> str:
+        """Fetch the remote target and merge it, then the local target head, into
+        the item branch. Returns the integrated head. The local head carries
+        claims and tracker writes not yet published, which go out with this push."""
+
+        remote_head = self._fetch_target(workspace.root, lease.repository.remote, target)
+        local_head = self._git(workspace.root, "rev-parse", "--verify", f"refs/heads/{target}")
+        for label, commit in (
+            (f"{lease.repository.remote}/{target}", remote_head),
+            (target, local_head),
+        ):
+            if commit is not None:
+                self._merge_into_item(workspace, commit, label)
+        return self._git(workspace.root, "rev-parse", "HEAD")
+
+    def _fetch_target(self, root: Path, remote: str, target: str) -> str | None:
+        """The remote head of ``target``, or None when the remote has no such
+        branch (a pushing delivery then creates it). A remote-tracking ref held
+        by a concurrent writer is retried up to ``FETCH_ATTEMPTS`` times."""
+
+        refspec = f"+refs/heads/{target}:refs/remotes/{remote}/{target}"
+        for attempt in range(FETCH_ATTEMPTS):
+            try:
+                self._git(root, "fetch", remote, refspec)
+            except AdapterError as exc:
+                detail = str(exc).casefold()
+                if _ABSENT_REMOTE_REF_SIGN in detail:
+                    return None
+                if attempt < FETCH_ATTEMPTS - 1 and any(
+                    sign in detail for sign in _REF_LOCK_SIGNS
+                ):
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                raise
+            return self._git(root, "rev-parse", "--verify", f"refs/remotes/{remote}/{target}")
+        raise AdapterError(f"fetch of {remote}/{target} did not complete")  # pragma: no cover
+
+    def _merge_into_item(self, workspace: WorkspaceRef, commit: str, label: str) -> None:
+        """Merge ``commit`` into the item branch with a recorded integration merge.
+
+        A conflict confined to tracker projection files is settled by
+        regenerating the projection from the merged log. Any other conflicted
+        path aborts the merge and parks the delivery as a conflict."""
+
+        root = workspace.root
+        if self._is_ancestor(root, commit, "HEAD"):
+            return
+        before = self._git(root, "rev-parse", "HEAD")
+        self._git(
+            root,
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "-m",
+            f"{INTEGRATION_SUBJECT} {label} into {workspace.branch}",
+            commit,
+            check=False,
+        )
+        merging = bool(
+            self._git(root, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).strip()
+        )
+        if not merging and self._git(root, "rev-parse", "HEAD") != before:
+            return
+        conflicted = sorted(
+            path
+            for path in self._git(
+                root, "diff", "--name-only", "-z", "--diff-filter=U", check=False
+            ).split("\0")
+            if path
+        )
+        if (
+            merging
+            and conflicted
+            and self._projection is not None
+            and all(self._projection.is_projection(path) for path in conflicted)
+        ):
+            self._git(root, "checkout", "--ours", "--", *conflicted)
+            self._projection.regenerate_projection(root)
+            self._git(root, "add", "-A", "--", *self._tracker_paths)
+            unresolved = self._git(
+                root, "diff", "--name-only", "--diff-filter=U", check=False
+            ).strip()
+            if not unresolved:
+                self._git(root, "commit", "--no-edit")
+                return
+        if merging:
+            self._git(root, "merge", "--abort")
+        if conflicted:
+            raise DeliveryParked(
+                DeliveryParkReason.CONFLICT,
+                f"integrating {label} conflicted in " + ", ".join(conflicted),
+            )
+        raise AdapterError(f"integration merge of {label} did not complete")
+
+    def _merge_tracker_gap(self, workspace: WorkspaceRef, local_head: str, target: str) -> None:
+        """Merge a local target head whose only new changes are tracker state
+        into the item branch. It runs inside the primary-checkout lock so no
+        further tracker write lands between this check and the next step."""
+
+        self._merge_into_item(workspace, local_head, target)
+
+    def _tracker_only_gap(self, root: Path, candidate: str, local_head: str) -> bool:
+        """True when the local target head adds nothing outside the tracker
+        paths that ``candidate`` lacks."""
+
+        gap = self._git(
+            root, "diff", "--name-only", "-z", "--no-renames", f"{candidate}...{local_head}"
+        )
+        return not any(self._is_product_path(path) for path in gap.split("\0") if path)
+
+    def _catch_up(
+        self,
+        lease: _Lease,
+        workspace: WorkspaceRef,
+        request: DeliveryRequest,
+        target: str,
+        candidate: str,
+        validated: str | None,
+        own: tuple[str, ...] = (),
+    ) -> str | None:
+        """The pre-push check; the caller holds the primary-checkout lock. It
+        changes only the item branch, never the local target. Returns the
+        candidate to push, or None when the local target gained a change outside
+        the tracker paths and the delivery must integrate again. A candidate
+        that differs from the validated tree in a path the revalidation rule
+        says overlaps the item is refused."""
+
+        primary = lease.repository.root
+        root = workspace.root
+        self._require_clean_primary(primary, "before delivery")
+        if request.mode is DeliveryMode.CURRENT_BRANCH_PR:
+            if self._git(primary, "branch", "--show-current") != target:
+                raise AdapterError("primary checkout no longer has the captured target branch")
+            if not self._is_ancestor(primary, request.target_revision, "HEAD"):
+                raise AdapterError(
+                    "captured target revision is no longer in the current branch history"
+                )
+        local_head = self._git(root, "rev-parse", "--verify", f"refs/heads/{target}")
+        if not self._is_ancestor(root, local_head, candidate):
+            if not self._tracker_only_gap(root, candidate, local_head):
+                return None
+            self._merge_tracker_gap(workspace, local_head, target)
+            candidate = self._git(root, "rev-parse", "HEAD")
+        if validated is not None:
+            differing = self._product_changes(root, validated, candidate)
+            if differing and revalidation_decision(
+                differing, own, request.declared_paths
+            ).run:
+                raise EvidenceError(
+                    "delivery candidate differs from the validated tree in a path "
+                    "that overlaps the item"
+                )
+        return candidate
+
+    def _settle_target(
+        self, lease: _Lease, workspace: WorkspaceRef, target: str, pushed: str
+    ) -> None:
+        """Move the local target onto a commit the remote has accepted; the
+        caller holds the primary-checkout lock. Tracker-only commits that landed
+        on the local target since the catch-up are merged on top in the item
+        branch first; they go out with the next push of the branch."""
+
+        root = workspace.root
+        local_head = self._git(root, "rev-parse", "--verify", f"refs/heads/{target}")
+        commit = pushed
+        if not self._is_ancestor(root, local_head, pushed):
+            if not self._tracker_only_gap(root, pushed, local_head):
+                raise AdapterError(
+                    f"local {target} gained a product change after {pushed} was pushed"
+                )
+            self._merge_tracker_gap(workspace, local_head, target)
+            commit = self._git(root, "rev-parse", "HEAD")
+        self._fast_forward_target(lease, target, commit)
+
+    def _fast_forward_target(self, lease: _Lease, target: str, commit: str) -> None:
+        """Fast-forward the primary checkout's target branch to ``commit``; the
+        caller holds the primary-checkout lock."""
+
         primary = lease.repository.root
         self._require_clean_primary(primary, "before delivery")
-        self._git(primary, "checkout", lease.repository.default_branch)
-        self._git(primary, "merge", "--no-ff", "--no-edit", workspace.branch)
-        merged_commit = self._git(primary, "rev-parse", "HEAD")
-        self._git(primary, "push", lease.repository.remote, lease.repository.default_branch)
-        remote_line = self._git(
-            primary,
-            "ls-remote",
-            lease.repository.remote,
-            f"refs/heads/{lease.repository.default_branch}",
-        )
-        remote_revision = remote_line.split()[0] if remote_line.split() else ""
-        if remote_revision != merged_commit:
-            raise AdapterError("remote verification did not observe the delivered commit")
-        return FinaliseResult(
-            request.item_commit,
-            request.tracker_commit,
-            merged_commit,
-            True,
-            (f"remote {lease.repository.remote}/{lease.repository.default_branch} verified",),
-        )
+        if self._git(primary, "branch", "--show-current") != target:
+            self._git(primary, "checkout", target)
+        self._git(primary, "merge", "--ff-only", commit)
+        if self._git(primary, "rev-parse", "HEAD") != commit:
+            raise AdapterError("target branch did not fast-forward to the delivery candidate")
+        self._require_clean_primary(primary, "after delivery")
 
-    def _deliver_current_branch(
-        self, lease: _Lease, workspace: WorkspaceRef, request: DeliveryRequest
-    ) -> FinaliseResult:
-        repository = lease.repository
-        if request.target_branch != repository.current_branch:
-            raise EvidenceError("current-branch delivery target differs from the invoking branch")
-        if (
-            request.target_branch == repository.default_branch
-            and not request.allow_current_branch_default
-        ):
-            raise AdapterError(
-                "current-branch-pr delivery refuses the detected default branch; "
-                "pass --allow-current-branch-default after human approval"
-            )
-        primary = repository.root
-        self._require_clean_primary(primary, "before delivery")
-        if self._git(primary, "branch", "--show-current") != request.target_branch:
-            raise AdapterError("primary checkout no longer has the captured target branch")
-        ancestry = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(primary),
-                "merge-base",
-                "--is-ancestor",
-                request.target_revision,
-                "HEAD",
-            ],
+    def _push(
+        self,
+        lease: _Lease,
+        workspace: WorkspaceRef,
+        target: str,
+        commit: str,
+        rejections: list[str] | None = None,
+    ) -> bool:
+        """Push exactly ``commit`` to the remote target and verify it there.
+        Returns False when the remote rejected it because another writer won a
+        race, appending the push's own message to ``rejections``."""
+
+        remote = lease.repository.remote
+        try:
+            self._git(workspace.root, "push", remote, f"{commit}:refs/heads/{target}")
+        except AdapterError as exc:
+            if any(sign in str(exc).casefold() for sign in _PUSH_REJECTED_SIGNS):
+                if rejections is not None:
+                    rejections.append(str(exc))
+                return False
+            raise
+        remote_line = self._git(workspace.root, "ls-remote", remote, f"refs/heads/{target}")
+        remote_revision = remote_line.split()[0] if remote_line.split() else ""
+        if remote_revision != commit:
+            raise AdapterError("remote verification did not observe the delivered commit")
+        return True
+
+    def _product_changes(self, root: Path, base: str, head: str) -> list[str]:
+        raw = self._git(root, "diff", "--name-only", "-z", "--no-renames", base, head)
+        return [path for path in raw.split("\0") if path and self._is_product_path(path)]
+
+    def _is_ancestor(self, root: Path, commit: str, descendant: str) -> bool:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", commit, descendant],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
         )
-        if ancestry.returncode != 0:
-            raise AdapterError("captured target revision is no longer in the current branch history")
-        self._git(primary, "merge", "--no-ff", "--no-edit", workspace.branch)
-        merged_commit = self._git(primary, "rev-parse", "HEAD")
-        self._require_clean_primary(primary, "after delivery")
-        if not request.push_current_branch:
-            return FinaliseResult(
-                request.item_commit,
-                request.tracker_commit,
-                merged_commit,
-                False,
-                (f"local branch {request.target_branch} updated without push",),
-            )
-        self._git(primary, "push", repository.remote, request.target_branch)
-        remote_line = self._git(
-            primary,
-            "ls-remote",
-            repository.remote,
-            f"refs/heads/{request.target_branch}",
-        )
-        remote_revision = remote_line.split()[0] if remote_line.split() else ""
-        if remote_revision != merged_commit:
-            raise AdapterError("remote verification did not observe the delivered commit")
-        return FinaliseResult(
-            request.item_commit,
-            request.tracker_commit,
-            merged_commit,
-            True,
-            (f"remote {repository.remote}/{request.target_branch} verified",),
-        )
+        return completed.returncode == 0
+
+    def _integration_base(self, root: Path, commit: str) -> str:
+        """``commit`` with every recorded integration merge stepped over along
+        the first-parent chain: the commit the item's own history ends at."""
+
+        for _ in range(_MAX_INTEGRATION_MERGES):
+            line = self._git(root, "log", "-1", "--format=%P%x00%s", commit)
+            parents, _, subject = line.partition("\0")
+            parent_list = parents.split()
+            if len(parent_list) < 2 or not subject.startswith(INTEGRATION_SUBJECT):
+                return commit
+            commit = parent_list[0]
+        raise EvidenceError(f"more than {_MAX_INTEGRATION_MERGES} integration merges on one item")
 
     def deliver_report(self, request: CampaignReport) -> FinaliseResult:
         repository = self.identify(request.repository)
@@ -480,25 +832,20 @@ class GitWorkspaceAdapter:
             branch = repository.default_branch
         else:
             raise EvidenceError(f"unsupported delivery mode: {request.mode}")
-        self._require_clean_primary(primary, "before report")
-        if self._git(primary, "branch", "--show-current") != branch:
-            self._git(primary, "checkout", branch)
         target = primary / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(request.content, encoding="utf-8")
-        self._git(primary, "add", "-A", "--", relative)
-        self._git(
-            primary,
-            "commit",
-            "-m",
-            f"ADDED: campaign {request.campaign_id} report",
-            "--",
-            relative,
-        )
-        report_commit = self._git(primary, "rev-parse", "HEAD")
-        self._require_clean_primary(primary, "after report")
+        message = f"ADDED: campaign {request.campaign_id} report"
         pushed = request.mode is DeliveryMode.PROTECTED_DEFAULT or request.push_current_branch
         if not pushed:
+            # Without a push the local commit is the delivery itself.
+            def commit_locally() -> str:
+                self._require_clean_primary(primary, "before report")
+                if self._git(primary, "branch", "--show-current") != branch:
+                    self._git(primary, "checkout", branch)
+                commit = self._commit_report(primary, relative, request.content, message)
+                self._require_clean_primary(primary, "after report")
+                return commit
+
+            report_commit = self._on_clean_primary(commit_locally)
             return FinaliseResult(
                 None,
                 report_commit,
@@ -506,20 +853,106 @@ class GitWorkspaceAdapter:
                 False,
                 (f"report committed locally on {branch}", str(target)),
             )
-        self._git(primary, "push", repository.remote, branch)
-        remote_line = self._git(
-            primary, "ls-remote", repository.remote, f"refs/heads/{branch}"
-        )
-        remote_revision = remote_line.split()[0] if remote_line.split() else ""
-        if remote_revision != report_commit:
-            raise AdapterError("remote verification did not observe the delivered report")
-        return FinaliseResult(
-            None,
-            report_commit,
-            report_commit,
-            True,
-            (f"remote {repository.remote}/{branch} verified", str(target)),
-        )
+        # A pushed report is committed in a detached scratch worktree and pushed
+        # from there, so the local branch only ever moves onto a commit the
+        # remote has accepted.
+        report_root = self._scratch_root / "reports" / f"{_slug(request.campaign_id)}-{uuid4().hex[:8]}"
+        report_root.parent.mkdir(parents=True, exist_ok=True)
+        self._require_scratch_path(report_root)
+        def add_report_worktree() -> None:
+            self._require_clean_primary(primary, "before report")
+            base = self._git(primary, "rev-parse", "--verify", f"refs/heads/{branch}")
+            self._git(primary, "worktree", "add", "--detach", str(report_root), base)
+
+        self._on_clean_primary(add_report_worktree)
+        try:
+            report_commit = self._commit_report(report_root, relative, request.content, message)
+            self._git(
+                report_root, "push", repository.remote, f"{report_commit}:refs/heads/{branch}"
+            )
+            remote_line = self._git(
+                report_root, "ls-remote", repository.remote, f"refs/heads/{branch}"
+            )
+            remote_revision = remote_line.split()[0] if remote_line.split() else ""
+            if remote_revision != report_commit:
+                raise AdapterError("remote verification did not observe the delivered report")
+            diagnostics = [f"remote {repository.remote}/{branch} verified", str(target)]
+            with self._primary_lock:
+                local_head = self._git(primary, "rev-parse", "--verify", f"refs/heads/{branch}")
+                if self._is_ancestor(primary, local_head, report_commit):
+                    if self._git(primary, "branch", "--show-current") != branch:
+                        self._git(primary, "checkout", branch)
+                    self._git(primary, "merge", "--ff-only", report_commit)
+                    self._require_clean_primary(primary, "after report")
+                else:
+                    diagnostics.append(
+                        f"local {branch} moved during the report push; the report is on the remote"
+                    )
+        finally:
+            with self._primary_lock:
+                self._git(primary, "worktree", "remove", "--force", str(report_root), check=False)
+        return FinaliseResult(None, report_commit, report_commit, True, tuple(diagnostics))
+
+    def open_validation_checkout(
+        self, repository: Path, branch: str | None, refresh: bool = False
+    ) -> ValidationCheckout:
+        """A detached scratch worktree at the local head of ``branch`` (the
+        default branch when None). With ``refresh`` the remote branch is
+        fetched first, outside the lock, and the local branch is fast-forwarded
+        to it when the local head is its ancestor: the remote head is already
+        delivered, so the local target still never holds an undelivered
+        commit. The lock covers only that fast-forward, reading the head and
+        adding the worktree."""
+
+        identity = self.identify(repository)
+        primary = identity.root
+        target = branch or identity.default_branch
+        remote_head = self._fetch_target(primary, identity.remote, target) if refresh else None
+        root = self._scratch_root / "validation" / f"{_slug(target)}-{uuid4().hex[:8]}"
+        root.parent.mkdir(parents=True, exist_ok=True)
+        self._require_scratch_path(root)
+        with self._primary_lock:
+            revision = self._git(primary, "rev-parse", "--verify", f"refs/heads/{target}")
+            if (
+                remote_head is not None
+                and remote_head != revision
+                and self._is_ancestor(primary, revision, remote_head)
+            ):
+                revision = self._advance_local(primary, target, revision, remote_head)
+            self._git(primary, "worktree", "add", "--detach", str(root), revision)
+        return ValidationCheckout(root, revision, primary)
+
+    def _advance_local(self, primary: Path, target: str, local: str, remote_head: str) -> str:
+        """Fast-forward the local ``target`` from ``local`` to ``remote_head``;
+        the caller holds the primary-checkout lock. A checked-out target moves
+        by ``merge --ff-only`` on a clean checkout only; another branch's ref
+        moves by a guarded ref update. Returns the head to validate."""
+
+        if self._git(primary, "branch", "--show-current") == target:
+            if self._git(primary, "status", "--porcelain", "--untracked-files=all"):
+                # A dirty primary is never touched; the fetched head is still
+                # the one to validate.
+                return remote_head
+            self._git(primary, "merge", "--ff-only", remote_head)
+        else:
+            self._git(primary, "update-ref", f"refs/heads/{target}", remote_head, local)
+        return self._git(primary, "rev-parse", "--verify", f"refs/heads/{target}")
+
+    def close_validation_checkout(self, checkout: ValidationCheckout) -> None:
+        self._require_scratch_path(checkout.root)
+        with self._primary_lock:
+            self._git(
+                checkout.repository, "worktree", "remove", "--force", str(checkout.root),
+                check=False,
+            )
+
+    def _commit_report(self, root: Path, relative: str, content: str, message: str) -> str:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        self._git(root, "add", "-A", "--", relative)
+        self._git(root, "commit", "-m", message, "--", relative)
+        return self._git(root, "rev-parse", "HEAD")
 
     def release(self, workspace: WorkspaceRef) -> None:
         with self._lock:
@@ -545,13 +978,14 @@ class GitWorkspaceAdapter:
             self._leases.pop(workspace.lease_id, None)
         if workspace.root.exists():
             try:
-                self._git(
-                    lease.repository.root,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(workspace.root),
-                )
+                with self._primary_lock:
+                    self._git(
+                        lease.repository.root,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(workspace.root),
+                    )
             except AdapterError:
                 if self._worktree_registered(lease.repository.root, workspace.root):
                     with self._lock:
@@ -671,9 +1105,31 @@ class GitWorkspaceAdapter:
                 f"uncommitted product paths remain after scoped commit: {remaining}"
             )
 
+    def _on_clean_primary(self, step: Callable[[], _T]) -> _T:
+        """Run ``step`` under the primary-checkout lock. When its clean-checkout
+        check finds tracker files only, a tracker write that was appended and
+        not committed, the lock is let go, the tracker's own recovery runs, and
+        the step is tried again, up to ``LEFTOVER_RECOVERIES`` times. Product
+        dirt is never touched and fails the step."""
+
+        for _ in range(LEFTOVER_RECOVERIES):
+            try:
+                with self._primary_lock:
+                    return step()
+            except _TrackerLeftover:
+                assert self._tracker_recovery is not None
+                self._tracker_recovery()
+        with self._primary_lock:
+            return step()
+
     def _require_clean_primary(self, primary: Path, timing: str) -> None:
         if self._git(primary, "status", "--porcelain", "--untracked-files=all"):
-            raise AdapterError(f"primary checkout must be clean {timing}")
+            message = f"primary checkout must be clean {timing}"
+            if self._tracker_recovery is not None and only_tracker_changes(
+                self._git, primary, self._tracker_paths
+            ):
+                raise _TrackerLeftover(message)
+            raise AdapterError(message)
 
     def _default_branch(self, root: Path) -> str:
         symbolic = self._git(

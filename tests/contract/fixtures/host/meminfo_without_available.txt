@@ -1,0 +1,6 @@
+MemTotal:        4046336 kB
+MemFree:          812000 kB
+Buffers:           64000 kB
+Cached:          1200000 kB
+CommitLimit:     2023168 kB
+Committed_AS:    2500000 kB

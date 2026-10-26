@@ -297,12 +297,12 @@ class LocalCommandAdapter:
         clock."""
 
         deadline = request.progress_deadline_seconds
-        cap = request.timeout_seconds
         interval = min(self._sample_interval_seconds, deadline)
         start = time.monotonic()
         samples = [self._sample(process, request, stdout_path, stderr_path, start)]
         while True:
-            remaining_cap = cap - (time.monotonic() - start)
+            # The cap is read on every pass: it stretches under host pressure.
+            remaining_cap = request.current_timeout_seconds() - (time.monotonic() - start)
             if remaining_cap <= 0:
                 self._terminate_tree(process)
                 process.wait()

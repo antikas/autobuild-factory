@@ -49,6 +49,7 @@ from autobuild.domain import (
 )
 from autobuild.enforcement.preflight import UsageLane, run_usage_preflight
 from autobuild.testing import (
+    FakeClock,
     FakeCommandAdapter,
     FakeHarnessAdapter,
     FakeKnowledgeAdapter,
@@ -193,6 +194,9 @@ def ports(
         usage_meter=meter,
         usage_policy=policy if meter is not None else None,
         usage_retry_wait=recorded.append,
+        # Every meter check sees a reading older than its 60 seconds, so each
+        # seat reads the meter afresh as these tests script.
+        usage_clock=FakeClock(step=61.0),
     )
 
 
@@ -562,7 +566,7 @@ def test_a_stop_crossed_before_seat_two_cools_the_lane_until_the_latest_reset_an
     assert len(stop) == 1 and stop[0].payload["reset_at"] == WEEKLY_RESET
 
 
-def test_a_stop_crossed_on_the_only_lane_parks_the_item_and_stops_the_campaign() -> None:
+def test_a_stop_crossed_on_the_only_lane_parks_the_item_and_holds_admissions() -> None:
     meter = meter_of(reading(weekly(50)), reading(weekly(91)))
     claude = metered([builder()])
     state = FakeLaneStateAdapter(identity("lanes"))
@@ -570,7 +574,13 @@ def test_a_stop_crossed_on_the_only_lane_parks_the_item_and_stops_the_campaign()
 
     outcome = CampaignRunner(workflow_ports).run(campaign(), lambda item: spec())
 
-    assert outcome.stop_reason is CampaignStopReason.LANES_EXHAUSTED
+    # Exhausted lanes hold admissions; the item bound of one ends the campaign.
+    assert outcome.stop_reason is CampaignStopReason.ITEM_BOUND
+    assert [
+        event.payload["condition"]
+        for event in workflow_ports.records.events
+        if event.event_type == "campaign.hold_started"
+    ] == ["lanes_exhausted"]
     assert outcome.items[0].disposition is ItemDisposition.PARKED
     assert outcome.items[0].lanes_exhausted
     assert workflow_ports.tracker.parked[0][1].startswith("claude-code:usage")

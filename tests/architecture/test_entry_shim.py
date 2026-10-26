@@ -29,4 +29,4 @@ def test_package_entry_points_delegate_to_the_application_sequence() -> None:
     assert 'autobuild = "autobuild.cli:main"' in project
     assert "run_campaign(" in cli
     assert "CampaignRunner(ports).run" in composition
-    assert "while len(outcomes) < campaign.max_items" in application
+    assert "len(schedule.outcomes) + len(schedule.running) >= campaign.max_items" in application

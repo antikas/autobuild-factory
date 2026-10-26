@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Condition, Lock
 
 from autobuild.application.dependencies import Lane, WorkflowPorts
 from autobuild.application.progress import render_progress_line
@@ -52,11 +53,15 @@ from autobuild.domain import (
     UsageLimit,
     UsagePolicy,
     UsageProbeFailure,
+    UsageReading,
     ValidationEvidence,
     WorkspaceRef,
     review_verdict_rule_error,
 )
+from autobuild.domain.models import DeliveryParked, RevalidationDecision
 from autobuild.enforcement import classify_item_nature
+from autobuild.enforcement.pressure import PATIENT_LOOKBACK_SECONDS, stretched_seat_cap
+from autobuild.enforcement.triage import declared_path_tokens
 from autobuild.ports import RunRecordPort
 
 # Every tracker write AutoBuild makes carries a role@host handle; a tracker that
@@ -112,6 +117,8 @@ def _stderr_ref(diagnostics: tuple[str, ...]) -> str:
 USAGE_RETRY_SECONDS = 300.0
 USAGE_RETRY_ATTEMPTS = 3
 USAGE_UNAVAILABLE_SIGNATURE = "usage_meter_unavailable"
+# How long one good meter reading is shared by the seats on its lane.
+USAGE_READING_SECONDS = 60.0
 
 
 def _limit_payload(limit: UsageLimit) -> dict[str, object]:
@@ -128,26 +135,75 @@ class _UsageGate:
 
     It holds the meter, the profile's levels and the warning state, so a limit
     that crosses the warning level emits one ``usage.warning`` event and emits
-    again only after it has fallen below the level and crossed it once more."""
+    again only after it has fallen below the level and crossed it once more.
 
-    __slots__ = ("_meter", "policy", "wait", "_warned")
+    A good reading is shared by every seat on the lane for
+    ``USAGE_READING_SECONDS``. When it has aged out, one seat fetches the next
+    reading while the others keep judging the previous one; seats wait only
+    when the lane has no good reading at all. A failed reading is never shared.
+    Every seat still judges a reading against the levels itself."""
 
-    def __init__(self, meter, policy: UsagePolicy, wait) -> None:
+    __slots__ = (
+        "_meter", "policy", "wait", "_clock", "_warned", "_readings", "_refreshing", "_changed"
+    )
+
+    def __init__(self, meter, policy: UsagePolicy, wait, clock) -> None:
         self._meter = meter
         self.policy = policy
         self.wait = wait
+        self._clock = clock
         self._warned: dict[str, frozenset[tuple[str, str | None]]] = {}
+        # Lane name -> (clock time of the fetch, good reading).
+        self._readings: dict[str, tuple[float, UsageReading]] = {}
+        self._refreshing: set[str] = set()
+        self._changed = Condition()
 
     def assess(self, lane: Lane, emit) -> UsageAssessment:
         meter_id = lane.meter_id or ""
-        assessment = self.policy.assess_meter(self._meter.read, meter_id)
+        assessment = self.policy.assess_meter(
+            lambda requested: self._reading(lane.name, requested), meter_id
+        )
         if assessment.reading.ok:
             self._warn(lane, meter_id, assessment, emit)
         return assessment
 
+    def _reading(self, lane_name: str, meter_id: str) -> UsageReading:
+        with self._changed:
+            while True:
+                now = self._clock()
+                held = self._readings.get(lane_name)
+                if held is not None and now - held[0] < USAGE_READING_SECONDS:
+                    return held[1]
+                if lane_name not in self._refreshing:
+                    self._refreshing.add(lane_name)
+                    break
+                if held is not None:
+                    return held[1]
+                self._changed.wait()
+        reading: UsageReading | None = None
+        try:
+            reading = self._meter.read(meter_id)
+            return reading
+        finally:
+            with self._changed:
+                self._refreshing.discard(lane_name)
+                if reading is not None and reading.ok:
+                    self._readings[lane_name] = (now, reading)
+                self._changed.notify_all()
+
+    def latest(self, lane_name: str) -> UsageReading | None:
+        """The lane's last good shared reading, whatever its age, or None when
+        the lane has none yet. Nothing is fetched."""
+
+        with self._changed:
+            held = self._readings.get(lane_name)
+        return held[1] if held is not None else None
+
     def _warn(self, lane: Lane, meter_id: str, assessment: UsageAssessment, emit) -> None:
         current = {(limit.kind.value, limit.scope): limit for limit in assessment.warnings}
-        before = self._warned.get(meter_id, frozenset())
+        with self._changed:
+            before = self._warned.get(meter_id, frozenset())
+            self._warned[meter_id] = frozenset(current)
         for key, limit in current.items():
             if key in before:
                 continue
@@ -160,7 +216,6 @@ class _UsageGate:
                     **_limit_payload(limit),
                 },
             )
-        self._warned[meter_id] = frozenset(current)
 
 
 class _LaneRouter:
@@ -169,9 +224,14 @@ class _LaneRouter:
     The router walks the configured lanes in preference order, skipping any lane
     the shared lane state reports as cooled. A structural signal cools the
     current lane and moves the router to the next capable one; when none remains
-    it raises ``LanesExhausted`` carrying the signature the item parks under."""
+    it raises ``LanesExhausted`` carrying the signature the item parks under.
 
-    __slots__ = ("_lanes", "_state", "_campaign_id", "_emit", "_index", "_last_signature")
+    A router belongs to one item run and is never shared, so it needs no lock;
+    ``builder_lane`` is the lane the item's builder last settled on."""
+
+    __slots__ = (
+        "_lanes", "_state", "_campaign_id", "_emit", "_index", "_last_signature", "builder_lane"
+    )
 
     def __init__(self, lanes, lane_state, campaign_id, emit) -> None:
         self._lanes: tuple[Lane, ...] = lanes
@@ -180,6 +240,7 @@ class _LaneRouter:
         self._emit = emit
         self._index = 0
         self._last_signature = "lanes_exhausted"
+        self.builder_lane: str | None = None
 
     def _cooled(self, name: str) -> bool:
         return self._state is not None and self._state.active(name) is not None
@@ -261,12 +322,17 @@ class _PhaseMarker:
         workspace: WorkspaceRef | None = None,
         diff: DiffEvidence | None = None,
         corrections: int | None = None,
+        head_commit: str | None = None,
     ) -> None:
         if workspace is not None:
             self.workspace = workspace
         if diff is not None:
             self.head_commit = diff.head_commit
             self.workspace_revision = diff.workspace_revision
+        if head_commit is not None:
+            # The finalised marker pins the tracker commit, so a resume matches
+            # a worktree whose delivery merged the target branch on top of it.
+            self.head_commit = head_commit
         if corrections is not None:
             self.corrections = corrections
 
@@ -292,6 +358,23 @@ class _PhaseMarker:
         )
 
 
+def _with_tracker_failure(outcome: ItemOutcome, exc: BaseException | None) -> ItemOutcome:
+    """The outcome carrying a tracker failure's class and exit code, so the
+    campaign asks the tracker to recover before it admits more work."""
+
+    if not isinstance(exc, TrackerStop):
+        return outcome
+    return replace(
+        outcome,
+        tracker_stop=(
+            CampaignStopReason.TRACKER_ENVIRONMENT
+            if exc.environment
+            else CampaignStopReason.TRACKER_REFUSED
+        ),
+        tracker_exit_code=exc.code,
+    )
+
+
 def unpublished_write(item_id: str, operation: str, note: str) -> RunEvent:
     """The run event for a tracker write that was committed and not published.
     It is not a stop: the write goes out with the next push of its branch."""
@@ -303,22 +386,342 @@ def unpublished_write(item_id: str, operation: str, note: str) -> RunEvent:
     )
 
 
+class UnpublishedWrites:
+    """Tracker writes committed and not yet published, as "<id> <operation>", in
+    the order they were recorded. One campaign and all of its items add to it."""
+
+    __slots__ = ("_entries", "_guard")
+
+    def __init__(self) -> None:
+        self._entries: list[str] = []
+        self._guard = Lock()
+
+    def add(self, entry: str) -> None:
+        with self._guard:
+            self._entries.append(entry)
+
+    def entries(self) -> tuple[str, ...]:
+        with self._guard:
+            return tuple(self._entries)
+
+
+@dataclass(frozen=True, slots=True)
+class UnfinishedItem:
+    """An item that ended without a recorded park: its kept worktree, or an
+    empty string when it had none, and the error that ended it."""
+
+    item_id: str
+    worktree: str
+    error: str
+
+
+class UnfinishedItems:
+    """The campaign's unfinished items, in the order they ended. One campaign
+    and all of its items add to it; the lock covers only the list."""
+
+    __slots__ = ("_entries", "_guard")
+
+    def __init__(self) -> None:
+        self._entries: list[UnfinishedItem] = []
+        self._guard = Lock()
+
+    def add(self, entry: UnfinishedItem) -> None:
+        with self._guard:
+            self._entries.append(entry)
+
+    def entries(self) -> tuple[UnfinishedItem, ...]:
+        with self._guard:
+            return tuple(self._entries)
+
+
+class _DeliveryQueue:
+    """The campaign's delivery queue: deliveries run one at a time, in the order
+    they asked.
+
+    Each delivery takes a ticket and waits for its turn. The condition covers
+    only the two ticket counters; it is released while a delivery waits and
+    while it runs, so a claim, a park without a worktree or another item's
+    build never waits behind a delivery. A delivery that ends, by any path,
+    serves the next ticket."""
+
+    __slots__ = ("_issued", "_serving", "_turn")
+
+    def __init__(self) -> None:
+        self._issued = 0
+        self._serving = 0
+        self._turn = Condition()
+
+    def ticket(self) -> tuple[int, int]:
+        """Take the next ticket. Returns it and how many deliveries are ahead."""
+
+        with self._turn:
+            ticket = self._issued
+            self._issued += 1
+            return ticket, ticket - self._serving
+
+    def wait(self, ticket: int) -> None:
+        with self._turn:
+            while self._serving != ticket:
+                self._turn.wait()
+
+    def done(self) -> None:
+        with self._turn:
+            self._serving += 1
+            self._turn.notify_all()
+
+
+class _HeavyTicket:
+    """One heavy command's hold on the slots. ``pressured`` is set while the
+    command runs if the host pressure level withholds heavy commands at any
+    point of its run; the slots' condition guards it."""
+
+    __slots__ = ("exclusive", "pressured")
+
+    def __init__(self, exclusive: bool) -> None:
+        self.exclusive = exclusive
+        self.pressured = False
+
+
+class HeavySlots:
+    """The campaign's heavy-command slots, shared by its items.
+
+    A heavy command (a validator run AutoBuild starts) takes one slot, up to
+    ``limit`` at once (None means no limit), and starts only while the host
+    pressure level allows heavy commands. An exclusive command waits until no
+    other heavy command runs and holds back every new one while it waits and
+    runs. The condition covers only the counters, the tickets and the level
+    flag; it is released while a command waits and never held while one runs.
+    Nothing here stops a running command."""
+
+    __slots__ = (
+        "_limit", "_running", "_waiting", "_exclusive_waiting", "_withheld", "_changed", "_spans"
+    )
+
+    def __init__(self, limit: int | None = None) -> None:
+        if limit is not None and limit < 1:
+            raise ValueError("heavy slot limit must be positive")
+        self._limit = limit
+        self._running: list[_HeavyTicket] = []
+        self._waiting = 0
+        self._exclusive_waiting = 0
+        self._withheld = False
+        self._changed = Condition()
+        # The pressured spans [start, end] on the monitor's clock; an open span
+        # has no end yet. The condition guards them with the rest.
+        self._spans: list[list[float | None]] = []
+
+    def withhold(self, withheld: bool, at: float | None = None) -> None:
+        """Publish whether the pressure level withholds heavy commands, that
+        is, whether it is ``high`` or ``critical``. While it does, every running
+        command is marked as having run under pressure. ``at`` is the reading's
+        time on the monitor's clock; with it the change is kept as a pressured
+        span for seat stretch and the patient validator."""
+
+        with self._changed:
+            self._withheld = withheld
+            if withheld:
+                for ticket in self._running:
+                    ticket.pressured = True
+            if at is not None:
+                open_span = bool(self._spans) and self._spans[-1][1] is None
+                if withheld and not open_span:
+                    self._spans.append([at, None])
+                elif not withheld and open_span:
+                    self._spans[-1][1] = at
+            self._changed.notify_all()
+
+    def pressured_seconds(self, start: float, end: float) -> float:
+        """Seconds of [start, end] the level was ``high`` or ``critical``."""
+
+        with self._changed:
+            spans = [(begin, finish) for begin, finish in self._spans]
+        total = 0.0
+        for begin, finish in spans:
+            stop = end if finish is None else min(finish, end)
+            total += max(0.0, stop - max(begin, start))
+        return total
+
+    def pressured_within(self, now: float, seconds: float) -> bool:
+        """True when the level is ``high`` or ``critical`` at ``now`` or was at
+        any point in the ``seconds`` before it."""
+
+        since = now - seconds
+        with self._changed:
+            return any(
+                begin <= now and (finish is None or finish >= since)
+                for begin, finish in self._spans
+            )
+
+    def _may_start(self, exclusive: bool) -> bool:
+        if self._withheld or any(ticket.exclusive for ticket in self._running):
+            return False
+        if exclusive:
+            return not self._running
+        if self._exclusive_waiting:
+            return False
+        return self._limit is None or len(self._running) < self._limit
+
+    def acquire(self, exclusive: bool = False) -> _HeavyTicket:
+        with self._changed:
+            self._waiting += 1
+            self._exclusive_waiting += exclusive
+            try:
+                while not self._may_start(exclusive):
+                    self._changed.wait()
+            finally:
+                self._waiting -= 1
+                self._exclusive_waiting -= exclusive
+            ticket = _HeavyTicket(exclusive)
+            self._running.append(ticket)
+            return ticket
+
+    def release(self, ticket: _HeavyTicket) -> bool:
+        """Give the slot back. Returns True when the command ran under pressure."""
+
+        with self._changed:
+            self._running.remove(ticket)
+            self._changed.notify_all()
+            return ticket.pressured
+
+    def counts(self) -> tuple[int, int]:
+        """How many heavy commands run and how many wait for a slot."""
+
+        with self._changed:
+            return len(self._running), self._waiting
+
+    def withheld(self) -> bool:
+        with self._changed:
+            return self._withheld
+
+
+# Set to "1" in a validator's environment when it starts under recent host
+# pressure and the profile names no patient argv, so the project validator can
+# choose a serial run or longer timeouts.
+HOST_PRESSURE_VARIABLE = "AUTOBUILD_HOST_PRESSURE"
+
+
+def patient_request(request: CommandRequest, patient_argv: tuple[str, ...]) -> CommandRequest:
+    """The patient form of a validator request: ``patient_argv`` when the
+    profile sets one, otherwise the same argv with the host-pressure variable."""
+
+    if patient_argv:
+        return replace(request, argv=patient_argv)
+    return replace(request, environment=(*request.environment, (HOST_PRESSURE_VARIABLE, "1")))
+
+
+def run_heavy(
+    slots: HeavySlots,
+    commands,
+    request: CommandRequest,
+    clock,
+    patient_argv: tuple[str, ...] = (),
+    exclusive: bool = False,
+):
+    """Run one heavy command inside a heavy slot, which is released by every
+    path. A command that starts while the level is ``high`` or ``critical``,
+    or was in the previous ``PATIENT_LOOKBACK_SECONDS``, runs in its patient
+    form. Returns the result, whether it ran under pressure and whether it ran
+    patient."""
+
+    ticket = slots.acquire(exclusive)
+    try:
+        patient = slots.pressured_within(clock(), PATIENT_LOOKBACK_SECONDS)
+        command = commands.run(patient_request(request, patient_argv) if patient else request)
+    finally:
+        pressured = slots.release(ticket)
+    return command, pressured, patient
+
+
 class ItemWorkflow:
-    def __init__(self, ports: WorkflowPorts, unpublished: list[str] | None = None) -> None:
+    """Runs one item at a time per call. Concurrent calls on one instance share
+    only the campaign-wide usage gate, the unpublished-write and unfinished-item
+    records, the delivery count and the heavy-command slots; every other piece
+    of run state lives in the call."""
+
+    def __init__(
+        self,
+        ports: WorkflowPorts,
+        unpublished: UnpublishedWrites | None = None,
+        unfinished: UnfinishedItems | None = None,
+    ) -> None:
         self._ports = ports
         # The usage gate lives as long as the workflow, so warning crossings are
         # tracked across every item of a campaign.
         self._usage = (
-            _UsageGate(ports.usage_meter, ports.usage_policy, ports.usage_retry_wait)
+            _UsageGate(
+                ports.usage_meter, ports.usage_policy, ports.usage_retry_wait, ports.usage_clock
+            )
             if ports.usage_meter is not None and ports.usage_policy is not None
             else None
         )
-        # Per-item lane routing state, reset at the start of every ``run``.
-        self._router: _LaneRouter | None = None
-        self._builder_lane: str | None = None
-        # Tracker writes committed but not yet published, as "<item> <operation>",
-        # shared with the campaign that owns the report.
-        self._unpublished = unpublished if unpublished is not None else []
+        self._unpublished = unpublished if unpublished is not None else UnpublishedWrites()
+        self._unfinished = unfinished if unfinished is not None else UnfinishedItems()
+        self._deliveries = _DeliveryQueue()
+        self._heavy = HeavySlots()
+
+    def use_heavy_slots(self, slots: HeavySlots) -> None:
+        """Share one campaign's heavy-command slots across its items. The
+        campaign binds them before its first item starts."""
+
+        self._heavy = slots
+
+    def heavy_commands(self) -> tuple[int, int]:
+        """How many heavy commands run and how many wait for a slot."""
+
+        return self._heavy.counts()
+
+    def heavy_withheld(self) -> bool:
+        """True while the host pressure level withholds new heavy commands."""
+
+        return self._heavy.withheld()
+
+    def usage_at_warning(self) -> bool:
+        """True when the shared cached reading of the first lane is at or above
+        the warning level. An unmetered first lane, a run without ``[usage]``
+        or a lane with no good reading yet is never at the warning level, and
+        no meter is read here."""
+
+        gate = self._usage
+        lane = self._lanes()[0]
+        if gate is None or not lane.meter_id:
+            return False
+        reading = gate.latest(lane.name)
+        if reading is None:
+            return False
+        assessment = gate.policy.assess(reading)
+        return not assessment.failure and bool(assessment.warnings)
+
+    def _deliver(
+        self,
+        record: RunRecordRef,
+        spec: ItemExecutionSpec,
+        workspace: WorkspaceRef,
+        request: DeliveryRequest,
+    ):
+        """Deliver through the workspace port in the campaign's delivery queue,
+        recording when the delivery waits behind others of this campaign."""
+
+        ticket, ahead = self._deliveries.ticket()
+        notice_error: Exception | None = None
+        if ahead:
+            try:
+                self._event(
+                    record,
+                    "item.delivery_waiting",
+                    spec.item.item_id,
+                    payload={"ahead": ahead},
+                )
+            except Exception as exc:
+                notice_error = exc
+        # The turn is always taken and always handed on, so a failure on any
+        # path never stalls the deliveries queued behind this one.
+        self._deliveries.wait(ticket)
+        try:
+            if notice_error is not None:
+                raise notice_error
+            return self._ports.workspace.deliver(workspace, request)
+        finally:
+            self._deliveries.done()
 
     def record_publication(
         self,
@@ -330,7 +733,7 @@ class ItemWorkflow:
     ) -> None:
         if published:
             return
-        self._unpublished.append(f"{item_id} {operation}")
+        self._unpublished.add(f"{item_id} {operation}")
         event = unpublished_write(item_id, operation, note)
         self._event(record, event.event_type, event.item_id, payload=dict(event.payload))
 
@@ -357,12 +760,15 @@ class ItemWorkflow:
         workspace: WorkspaceRef | None = None
         worktree_grant: LeaseGrant | None = None
         claimed = False
+        # True once the item branch holds the item's product commit, so a park
+        # is recorded from the primary checkout and never delivered from the
+        # worktree, which would publish that commit.
+        committed = False
         seats: list[SeatObservation] = []
         guard = _ParkGuard()
         marker = _PhaseMarker(self._ports.records, record, spec.item.item_id)
         result: ItemOutcome | None = None
-        self._builder_lane = None
-        self._router = _LaneRouter(
+        router = _LaneRouter(
             self._lanes(),
             self._ports.lane_state,
             campaign.campaign_id,
@@ -392,13 +798,14 @@ class ItemWorkflow:
                     },
                 )
                 if resume.marker_state == ItemState.FINALISED.value:
+                    committed = True
                     result = self._resume_finalised(
-                        spec, machine, marker, record, workspace, seats
+                        spec, machine, marker, record, workspace, seats, guard
                     )
                     worktree_grant = self._release_worktree_lease(worktree_grant, record)
                     return result
                 verdict, diff, validation, corrections = self._resume_first_verdict(
-                    spec, workspace, machine, marker, record, seats, resume
+                    spec, workspace, machine, marker, record, seats, router, resume
                 )
             else:
                 nature = classify_item_nature(
@@ -412,7 +819,7 @@ class ItemWorkflow:
                     )
                     return result
                 self._advance(machine, marker, ItemState.VERIFIED)
-                start_lane = self._router.current_lane().name
+                start_lane = router.current_lane().name
                 claim_actor = self._lane_actor(start_lane)
                 receipt = self._ports.tracker.claim(spec.item, actor=claim_actor)
                 claimed = True
@@ -453,9 +860,9 @@ class ItemWorkflow:
                 )
 
                 verdict, diff, validation = self._build_validate_review(
-                    spec, workspace, machine, marker, record, seats, context_refs=()
+                    spec, workspace, machine, marker, record, seats, router, context_refs=()
                 )
-                self._reclaim_if_builder_flipped(spec, record, start_lane)
+                self._reclaim_if_builder_flipped(spec, record, start_lane, router)
                 corrections = 0
             while verdict.decision is ReviewDecision.CORRECT:
                 if corrections >= spec.max_corrections:
@@ -490,12 +897,15 @@ class ItemWorkflow:
                     marker,
                     record,
                     seats,
+                    router,
                     context_refs=(verdict.evidence_ref,),
                 )
 
             if verdict.decision is ReviewDecision.ESCALATE:
                 self._advance(machine, marker, ItemState.ESCALATED)
-                verdict = self._specialist_review(spec, workspace, verdict, record, seats)
+                verdict = self._specialist_review(
+                    spec, workspace, verdict, record, seats, router
+                )
                 if verdict.decision is ReviewDecision.CORRECT:
                     if corrections >= spec.max_corrections:
                         result = self._park(
@@ -529,6 +939,7 @@ class ItemWorkflow:
                         marker,
                         record,
                         seats,
+                        router,
                         context_refs=(verdict.evidence_ref,),
                     )
 
@@ -572,16 +983,33 @@ class ItemWorkflow:
                     commit_message=f"ADDED: {spec.item.title}",
                 ),
             )
+            committed = True
             self._ports.tracker.close(close, item_commit, workspace, actor=COORDINATOR_ACTOR)
             tracker_commit = self._ports.workspace.commit_tracker(
                 workspace, spec.item.item_id, item_commit
             )
-            finalise = self._ports.workspace.deliver(
-                workspace, self._delivery_request(spec, item_commit, tracker_commit)
-            )
+            try:
+                finalise = self._deliver(
+                    record,
+                    spec,
+                    workspace,
+                    self._delivery_request(
+                        spec,
+                        item_commit,
+                        tracker_commit,
+                        self._revalidator(spec, workspace, record),
+                        self._revalidation_note(spec, record),
+                    ),
+                )
+            except DeliveryParked as parked:
+                result = self._park_delivery(
+                    spec, machine, marker, record, workspace, seats, guard, parked, corrections
+                )
+                return result
             self._ports.workspace.confirm_delivery(
                 workspace, finalise, spec.delivery_target_branch
             )
+            marker.observe(head_commit=tracker_commit)
             self._advance(machine, marker, ItemState.FINALISED)
             self._event(
                 record,
@@ -604,7 +1032,9 @@ class ItemWorkflow:
             self._advance(machine, marker, ItemState.RELEASED)
             worktree_grant = self._release_worktree_lease(worktree_grant, record)
             marker.write("closed")
-            follow_ups = self._record_follow_ups(spec, campaign, verdict, record)
+            follow_ups, follow_up_error = self._follow_ups_after_delivery(
+                spec, campaign, verdict, record
+            )
             result = ItemOutcome(
                 item_id=spec.item.item_id,
                 disposition=ItemDisposition.ACCEPTED,
@@ -614,65 +1044,26 @@ class ItemWorkflow:
                 seats=tuple(seats),
                 follow_ups=follow_ups,
             )
-            return result
+            return _with_tracker_failure(result, follow_up_error)
         except LanesExhausted as exc:
-            try:
-                result = self._park_lanes_exhausted(
-                    spec, machine, marker, record, workspace, seats, guard, exc, claimed
-                )
-            except TrackerStop as stop:
-                result = self._tracker_stopped(spec, machine, record, workspace, seats, guard, stop)
-                worktree_grant = self._release_worktree_lease(worktree_grant, record)
+            result = self._park_lanes_exhausted(
+                spec, machine, marker, record, workspace, seats, guard, exc, claimed
+            )
             return result
         except ClaimTaken:
             raise
-        except TrackerStop as exc:
-            result = self._tracker_stopped(spec, machine, record, workspace, seats, guard, exc)
-            worktree_grant = self._release_worktree_lease(worktree_grant, record)
-            return result
         except Exception as exc:
-            structural = isinstance(exc, (EvidenceError, TypeError, ValueError))
-            if claimed:
-                try:
-                    result = self._park(
-                        spec,
-                        machine,
-                        marker,
-                        record,
-                        workspace,
-                        seats,
-                        guard,
-                        str(exc),
-                        structural=structural,
-                        kill=getattr(exc, "seat_kill", None),
-                    )
-                    return result
-                except TrackerStop as stop:
-                    result = self._tracker_stopped(
-                        spec, machine, record, workspace, seats, guard, stop
-                    )
-                    worktree_grant = self._release_worktree_lease(worktree_grant, record)
-                    return result
-                except Exception:
-                    structural = True
-            self._write_trajectory(
-                record, spec.item.item_id, ItemDisposition.FAILED, machine, seats, str(exc)
-            )
-            result = ItemOutcome(
-                item_id=spec.item.item_id,
-                disposition=ItemDisposition.FAILED,
-                states=tuple(machine.history),
-                reason=str(exc),
-                structural_failure=structural,
-                title=spec.item.title,
-                seats=tuple(seats),
+            result = self._end_on_error(
+                spec, machine, marker, record, workspace, seats, guard, exc, claimed, committed
             )
             return result
         finally:
-            if (
+            if guard.leave_worktree:
+                # A kept worktree is evidence; no writer is left in it.
+                worktree_grant = self._release_worktree_lease(worktree_grant, record)
+            elif (
                 workspace is not None
                 and machine.current is not ItemState.RELEASED
-                and not guard.leave_worktree
             ):
                 try:
                     self._ports.workspace.release(workspace)
@@ -693,7 +1084,68 @@ class ItemWorkflow:
                         )
                         return replace(result, reason=diagnostic)
 
-    def _tracker_stopped(
+    def _end_on_error(
+        self,
+        spec: ItemExecutionSpec,
+        machine: ItemStateMachine,
+        marker: _PhaseMarker,
+        record: RunRecordRef,
+        workspace: WorkspaceRef | None,
+        seats: list[SeatObservation],
+        guard: _ParkGuard,
+        exc: Exception,
+        claimed: bool,
+        committed: bool,
+    ) -> ItemOutcome:
+        """End the item on an error scoped to it; the campaign goes on.
+
+        A claimed item parks with the error as its reason. Once its branch
+        holds its product commit the park is recorded from the primary
+        checkout and the worktree is kept as evidence, because a park delivered
+        from the worktree would publish that commit; before that it parks in
+        its worktree. A park that fails leaves the item unfinished with its
+        worktree kept. An unclaimed item fails. A tracker failure is carried
+        on the outcome, so the campaign checks the tracker before it admits
+        more work."""
+
+        reason = str(exc)
+        structural = isinstance(exc, (EvidenceError, TypeError, ValueError))
+        kill = getattr(exc, "seat_kill", None)
+        result: ItemOutcome | None = None
+        if claimed:
+            try:
+                if committed and workspace is not None:
+                    guard.leave_worktree = True
+                    result = self._park(
+                        spec, machine, marker, record, None, seats, guard, reason,
+                        structural=structural, kill=kill,
+                        evidence_workspace=workspace, delivery_park=True,
+                    )
+                else:
+                    result = self._park(
+                        spec, machine, marker, record, workspace, seats, guard, reason,
+                        structural=structural, kill=kill,
+                    )
+            except Exception as park_error:
+                result = self._unfinished_item(
+                    spec, machine, record, workspace, seats, guard, f"{reason}; {park_error}"
+                )
+        if result is None:
+            self._write_trajectory(
+                record, spec.item.item_id, ItemDisposition.FAILED, machine, seats, reason
+            )
+            result = ItemOutcome(
+                item_id=spec.item.item_id,
+                disposition=ItemDisposition.FAILED,
+                states=tuple(machine.history),
+                reason=reason,
+                structural_failure=structural,
+                title=spec.item.title,
+                seats=tuple(seats),
+            )
+        return _with_tracker_failure(result, exc)
+
+    def _unfinished_item(
         self,
         spec: ItemExecutionSpec,
         machine: ItemStateMachine,
@@ -701,31 +1153,51 @@ class ItemWorkflow:
         workspace: WorkspaceRef | None,
         seats: list[SeatObservation],
         guard: _ParkGuard,
-        exc: TrackerStop,
+        error: str,
     ) -> ItemOutcome:
-        """A tracker stop ends the item without another tracker write: no park is
-        attempted and the worktree is kept as evidence. The outcome carries the
-        states the item reached and the stop, so the campaign stops with it."""
+        """Record an item that ended without a park. Its worktree, if any, is
+        kept with its evidence and named in the campaign report."""
 
         if workspace is not None:
             guard.leave_worktree = True
-        self._write_trajectory(
-            record, spec.item.item_id, ItemDisposition.FAILED, machine, seats, str(exc)
+        self._unfinished.add(
+            UnfinishedItem(
+                spec.item.item_id, str(workspace.root) if workspace is not None else "", error
+            )
         )
+        try:
+            self._write_trajectory(
+                record, spec.item.item_id, ItemDisposition.FAILED, machine, seats, error
+            )
+        except Exception:
+            pass
         return ItemOutcome(
             item_id=spec.item.item_id,
             disposition=ItemDisposition.FAILED,
             states=tuple(machine.history),
-            reason=str(exc),
+            reason=error,
             title=spec.item.title,
             seats=tuple(seats),
-            tracker_stop=(
-                CampaignStopReason.TRACKER_ENVIRONMENT
-                if exc.environment
-                else CampaignStopReason.TRACKER_REFUSED
-            ),
-            tracker_exit_code=exc.code,
         )
+
+    def _follow_ups_after_delivery(
+        self,
+        spec: ItemExecutionSpec,
+        campaign: CampaignRef,
+        verdict: ReviewVerdict,
+        record: RunRecordRef,
+    ) -> tuple[tuple[str, ...], Exception | None]:
+        """Record the follow-ups of a delivered item. A failure here never
+        undoes the delivery: it is recorded as an event and returned, and the
+        item stays accepted."""
+
+        try:
+            return self._record_follow_ups(spec, campaign, verdict, record), None
+        except Exception as exc:
+            self._event(
+                record, "item.follow_up_failed", spec.item.item_id, payload={"error": str(exc)}
+            )
+            return (), exc
 
     def _acquire_worktree_lease(
         self, campaign: CampaignRef, workspace: WorkspaceRef, record: RunRecordRef
@@ -778,6 +1250,7 @@ class ItemWorkflow:
         marker: _PhaseMarker,
         record: RunRecordRef,
         seats: list[SeatObservation],
+        router: _LaneRouter,
         resume: ResumePlan,
     ) -> tuple[ReviewVerdict, DiffEvidence, ValidationEvidence, int]:
         """Produce the first review verdict for a resumed item.
@@ -788,11 +1261,11 @@ class ItemWorkflow:
 
         if resume.marker_state in _RESUME_REBUILD:
             verdict, diff, validation = self._build_validate_review(
-                spec, workspace, machine, marker, record, seats, context_refs=()
+                spec, workspace, machine, marker, record, seats, router, context_refs=()
             )
         else:
             verdict, diff, validation = self._validate_and_review(
-                spec, workspace, machine, marker, record, seats
+                spec, workspace, machine, marker, record, seats, router
             )
         return verdict, diff, validation, resume.correction_count
 
@@ -804,6 +1277,7 @@ class ItemWorkflow:
         record: RunRecordRef,
         workspace: WorkspaceRef,
         seats: list[SeatObservation],
+        guard: _ParkGuard,
     ) -> ItemOutcome:
         """Re-run delivery for a marker interrupted after finalisation.
 
@@ -812,9 +1286,23 @@ class ItemWorkflow:
         landed is a no-op; the worktree is then released and the marker closed."""
 
         item_commit, tracker_commit = self._ports.workspace.resume_delivery_commits(workspace)
-        finalise = self._ports.workspace.deliver(
-            workspace, self._delivery_request(spec, item_commit, tracker_commit)
-        )
+        try:
+            finalise = self._deliver(
+                record,
+                spec,
+                workspace,
+                self._delivery_request(
+                    spec,
+                    item_commit,
+                    tracker_commit,
+                    self._revalidator(spec, workspace, record),
+                    self._revalidation_note(spec, record),
+                ),
+            )
+        except DeliveryParked as parked:
+            return self._park_delivery(
+                spec, machine, marker, record, workspace, seats, guard, parked, 0
+            )
         self._ports.workspace.confirm_delivery(
             workspace, finalise, spec.delivery_target_branch
         )
@@ -852,10 +1340,11 @@ class ItemWorkflow:
         marker: _PhaseMarker,
         record: RunRecordRef,
         seats: list[SeatObservation],
+        router: _LaneRouter,
         context_refs: tuple[str, ...],
     ) -> tuple[ReviewVerdict, DiffEvidence, ValidationEvidence]:
-        self._run_builder(spec, workspace, machine, marker, record, seats, context_refs)
-        return self._validate_and_review(spec, workspace, machine, marker, record, seats)
+        self._run_builder(spec, workspace, machine, marker, record, seats, router, context_refs)
+        return self._validate_and_review(spec, workspace, machine, marker, record, seats, router)
 
     def _run_builder(
         self,
@@ -865,11 +1354,13 @@ class ItemWorkflow:
         marker: _PhaseMarker,
         record: RunRecordRef,
         seats: list[SeatObservation],
+        router: _LaneRouter,
         context_refs: tuple[str, ...],
     ) -> None:
         brief_path = self._workspace_brief(spec, workspace)
         builder_policy = self._workspace_policy(spec.tool_policy, workspace)
         builder = self._invoke_seat(
+            router,
             record,
             seats,
             spec,
@@ -905,17 +1396,13 @@ class ItemWorkflow:
         marker: _PhaseMarker,
         record: RunRecordRef,
         seats: list[SeatObservation],
+        router: _LaneRouter,
     ) -> tuple[ReviewVerdict, DiffEvidence, ValidationEvidence]:
         brief_path = self._workspace_brief(spec, workspace)
         diff = self._ports.workspace.diff(workspace)
         marker.observe(diff=diff)
-        command = self._ports.command.run(
-            CommandRequest(
-                command_id=f"{record.run_id}:{spec.item.item_id}:{spec.validator_id}",
-                argv=spec.validator_argv,
-                cwd=workspace.root,
-                timeout_seconds=spec.command_timeout_seconds,
-            )
+        command = self._run_validator(
+            spec, workspace, record, {"changed_path_count": len(diff.changed_paths)}
         )
         validation = ValidationEvidence(
             validator_id=spec.validator_id,
@@ -923,22 +1410,7 @@ class ItemWorkflow:
             command=command,
             changed_paths=diff.changed_paths,
         )
-        self._event(
-            record,
-            "validation.completed",
-            spec.item.item_id,
-            command.stdout_ref,
-            payload={
-                "validator_id": spec.validator_id,
-                "exit_code": command.exit_code,
-                "timed_out": command.timed_out,
-                "duration_seconds": _duration_seconds(command.started_at, command.ended_at),
-                "stdout_ref": command.stdout_ref,
-                "stderr_ref": command.stderr_ref,
-                "changed_path_count": len(diff.changed_paths),
-            },
-        )
-        if command.exit_code != 0 or command.timed_out or command.cancelled:
+        if not self._passed(command):
             raise AdapterError(f"validator {spec.validator_id} did not pass")
         self._advance(machine, marker, ItemState.VALIDATED)
 
@@ -946,6 +1418,7 @@ class ItemWorkflow:
             spec.reviewer_tool_policy or self._read_only_policy(spec), workspace
         )
         reviewer = self._invoke_seat(
+            router,
             record,
             seats,
             spec,
@@ -986,6 +1459,100 @@ class ItemWorkflow:
         )
         return reviewer.payload, diff, validation
 
+    def _run_validator(
+        self,
+        spec: ItemExecutionSpec,
+        workspace: WorkspaceRef,
+        record: RunRecordRef,
+        detail: dict[str, object],
+    ):
+        """Run the item's declared validator in its worktree and record one
+        ``validation.completed`` event carrying ``detail``. The one place a
+        validator runs, for the reviewed candidate and for an integrated one.
+
+        The run holds a heavy slot. A run that times out while the host
+        pressure level withheld heavy commands is suspected of failing from
+        load: it is run once more, alone, and that verdict stands."""
+
+        request = CommandRequest(
+            command_id=f"{record.run_id}:{spec.item.item_id}:{spec.validator_id}",
+            argv=spec.validator_argv,
+            cwd=workspace.root,
+            environment=self._ports.item_environment(spec.item.item_id),
+            timeout_seconds=spec.command_timeout_seconds,
+        )
+        command, pressured, patient = self._heavy_run(request, spec.validator_patient_argv)
+        if command.timed_out and pressured:
+            self._event(
+                record,
+                "validation.load_rerun",
+                spec.item.item_id,
+                command.stdout_ref,
+                payload={
+                    "validator_id": spec.validator_id,
+                    "exit_code": command.exit_code,
+                    "timed_out": command.timed_out,
+                    "duration_seconds": _duration_seconds(command.started_at, command.ended_at),
+                    "stdout_ref": command.stdout_ref,
+                    "stderr_ref": command.stderr_ref,
+                },
+            )
+            command, _pressured, patient = self._heavy_run(
+                replace(request, command_id=f"{request.command_id}:rerun"),
+                spec.validator_patient_argv,
+                exclusive=True,
+            )
+        payload: dict[str, object] = {
+            "validator_id": spec.validator_id,
+            "exit_code": command.exit_code,
+            "timed_out": command.timed_out,
+            "duration_seconds": _duration_seconds(command.started_at, command.ended_at),
+            "stdout_ref": command.stdout_ref,
+            "stderr_ref": command.stderr_ref,
+            **detail,
+        }
+        if patient:
+            payload["patient"] = True
+        self._event(
+            record, "validation.completed", spec.item.item_id, command.stdout_ref, payload=payload
+        )
+        return command
+
+    def _heavy_run(
+        self,
+        request: CommandRequest,
+        patient_argv: tuple[str, ...] = (),
+        exclusive: bool = False,
+    ):
+        """Run one heavy command in the campaign's heavy slots; see ``run_heavy``."""
+
+        return run_heavy(
+            self._heavy,
+            self._ports.command,
+            request,
+            self._ports.schedule_clock,
+            patient_argv,
+            exclusive,
+        )
+
+    @staticmethod
+    def _passed(command) -> bool:
+        return command.exit_code == 0 and not command.timed_out and not command.cancelled
+
+    def _revalidator(
+        self, spec: ItemExecutionSpec, workspace: WorkspaceRef, record: RunRecordRef
+    ):
+        """The callback delivery runs when integrating the target branch changed
+        a product path: the same validator, on the integrated candidate."""
+
+        def revalidate() -> bool:
+            command = self._run_validator(
+                spec, workspace, record, {"candidate": "integrated"}
+            )
+            return self._passed(command)
+
+        return revalidate
+
     def _specialist_review(
         self,
         spec: ItemExecutionSpec,
@@ -993,12 +1560,14 @@ class ItemWorkflow:
         triggering: ReviewVerdict,
         record: RunRecordRef,
         seats: list[SeatObservation],
+        router: _LaneRouter,
     ) -> ReviewVerdict:
         brief_path = self._workspace_brief(spec, workspace)
         reviewer_policy = self._workspace_policy(
             spec.reviewer_tool_policy or self._read_only_policy(spec), workspace
         )
         result = self._invoke_seat(
+            router,
             record,
             seats,
             spec,
@@ -1073,6 +1642,7 @@ class ItemWorkflow:
 
     def _invoke_seat(
         self,
+        router: _LaneRouter,
         record: RunRecordRef,
         seats: list[SeatObservation],
         spec: ItemExecutionSpec,
@@ -1087,14 +1657,19 @@ class ItemWorkflow:
         each attempt on a metered lane the usage meter is read; see
         ``_usage_admits``."""
 
-        assert self._router is not None
         skip: set[str] = set()
         while True:
-            lane = self._router.current_lane(frozenset(skip))
-            if not self._usage_admits(record, lane, request, skip):
+            lane = router.current_lane(frozenset(skip))
+            if not self._usage_admits(router, record, lane, request, skip):
                 continue
-            attempt = replace(request, effort=spec.seat_effort(request.seat, lane.name))
+            extension = self._seat_stretch(request.timeout_seconds)
+            attempt = replace(
+                request,
+                effort=spec.seat_effort(request.seat, lane.name),
+                timeout_extension=extension,
+            )
             result = lane.harness.invoke(attempt)
+            extended = extension()
             if result.lane != lane.name:
                 result = replace(result, lane=lane.name)
             observation = SeatObservation(
@@ -1115,24 +1690,47 @@ class ItemWorkflow:
                 lane=lane.name,
             )
             seats.append(observation)
+            payload = self._seat_payload(observation)
+            if extended > 0:
+                payload["timeout_extension_seconds"] = extended
             self._event(
                 record,
                 "seat.completed",
                 attempt.item_id,
                 result.raw_output_ref,
-                payload=self._seat_payload(observation),
+                payload=payload,
             )
             if result.outcome is SeatOutcome.SUCCEEDED:
-                self._note_builder_lane(attempt, result)
+                self._note_builder_lane(router, attempt, result)
                 return result
             signal = lane.harness.classify_failure(result)
             if signal is None:
-                self._note_builder_lane(attempt, result)
+                self._note_builder_lane(router, attempt, result)
                 return result
-            self._router.signal(lane, signal)
+            router.signal(lane, signal)
+
+    def _seat_stretch(self, class_cap: float):
+        """The seat's cap extension so far, as a zero-argument callable the
+        harness reads on every check: every second of the seat's run at
+        ``high`` or ``critical`` adds a second, up to twice the class cap."""
+
+        clock = self._ports.schedule_clock
+        slots = self._heavy
+        started = clock()
+
+        def extension() -> float:
+            pressured = slots.pressured_seconds(started, clock())
+            return stretched_seat_cap(class_cap, pressured) - class_cap
+
+        return extension
 
     def _usage_admits(
-        self, record: RunRecordRef, lane: Lane, request: SeatRequest, skip: set[str]
+        self,
+        router: _LaneRouter,
+        record: RunRecordRef,
+        lane: Lane,
+        request: SeatRequest,
+        skip: set[str],
     ) -> bool:
         """Read the lane's usage meter before a seat starts on it.
 
@@ -1193,7 +1791,7 @@ class ItemWorkflow:
                     "detail": detail,
                 },
             )
-            self._router.signal(
+            router.signal(
                 lane,
                 LaneSignal(LaneSignalKind.USAGE, reset_at=assessment.reset_at, detail=detail),
             )
@@ -1218,12 +1816,17 @@ class ItemWorkflow:
             return False
         return True
 
-    def _note_builder_lane(self, request: SeatRequest, result: SeatResult) -> None:
+    @staticmethod
+    def _note_builder_lane(router: _LaneRouter, request: SeatRequest, result: SeatResult) -> None:
         if request.seat is Seat.BUILDER:
-            self._builder_lane = result.lane
+            router.builder_lane = result.lane
 
     def _reclaim_if_builder_flipped(
-        self, spec: ItemExecutionSpec, record: RunRecordRef, start_lane: str
+        self,
+        spec: ItemExecutionSpec,
+        record: RunRecordRef,
+        start_lane: str,
+        router: _LaneRouter,
     ) -> None:
         """Re-record the claim when the builder settled on a different lane.
 
@@ -1233,7 +1836,7 @@ class ItemWorkflow:
         tracker that refuses the re-claim leaves a diagnostic and does not fail
         the item."""
 
-        builder_lane = self._builder_lane
+        builder_lane = router.builder_lane
         if not builder_lane or builder_lane == start_lane:
             return
         actor = self._lane_actor(builder_lane)
@@ -1271,7 +1874,8 @@ class ItemWorkflow:
     ) -> ItemOutcome:
         """Park a claimed item with the lane signature, keeping its tree evidence.
 
-        The campaign reads ``lanes_exhausted`` and stops with that reason."""
+        The campaign reads ``lanes_exhausted`` and holds admissions until the
+        earliest lane cooling resets."""
 
         reason = f"{exc.lane}:{exc.signature}" if exc.lane else exc.signature
         if claimed:
@@ -1427,6 +2031,40 @@ class ItemWorkflow:
             return spec.brief_path
         return workspace.root / spec.brief_path
 
+    def _park_delivery(
+        self,
+        spec: ItemExecutionSpec,
+        machine: ItemStateMachine,
+        marker: _PhaseMarker,
+        record: RunRecordRef,
+        workspace: WorkspaceRef,
+        seats: list[SeatObservation],
+        guard: _ParkGuard,
+        parked: DeliveryParked,
+        corrections: int,
+    ) -> ItemOutcome:
+        """Park an item whose delivery stopped without pushing.
+
+        The park is recorded from the primary checkout, never in the worktree, so
+        the item branch and its tracker close do not reach the remote. The
+        worktree is snapshotted (the item's own change only) and kept with its
+        branch as the delivery evidence."""
+
+        guard.leave_worktree = True
+        return self._park(
+            spec,
+            machine,
+            marker,
+            record,
+            None,
+            seats,
+            guard,
+            str(parked),
+            corrections=corrections,
+            evidence_workspace=workspace,
+            delivery_park=True,
+        )
+
     def _park_by_nature(
         self,
         spec: ItemExecutionSpec,
@@ -1463,16 +2101,28 @@ class ItemWorkflow:
         structural: bool = False,
         corrections: int = 0,
         kill: dict[str, object] | None = None,
+        evidence_workspace: WorkspaceRef | None = None,
+        delivery_park: bool = False,
     ) -> ItemOutcome:
+        """Park the item. ``workspace`` parks in that worktree and delivers the
+        park; without it the park is recorded from the primary checkout.
+        ``evidence_workspace`` snapshots a worktree for a primary park without
+        writing the park into it."""
+
         marker.observe(corrections=corrections)
         last_state = machine.current.value
-        if machine.current not in {ItemState.PARKED, ItemState.RELEASED}:
+        # Only a delivery park of a resumed finalised item has no park
+        # transition; its marker still records the park below. Any other state
+        # without one raises, as an invalid transition always has.
+        resumed_delivery = delivery_park and machine.current is ItemState.FINALISED
+        if machine.current not in {ItemState.PARKED, ItemState.RELEASED} and not resumed_delivery:
             self._advance(machine, marker, ItemState.PARKED)
         snapshot_dir = ""
         snapshotted: tuple[str, ...] = ()
-        if workspace is not None:
+        evidence = workspace if workspace is not None else evidence_workspace
+        if evidence is not None:
             snapshot_dir = f"evidence/{spec.item.item_id}-park"
-            snapshotted = self._snapshot(spec, record, workspace, reason, seats)
+            snapshotted = self._snapshot(spec, record, evidence, reason, seats)
         trajectory_ref = self._write_trajectory(
             record, spec.item.item_id, ItemDisposition.PARKED, machine, seats, reason
         )
@@ -1490,12 +2140,12 @@ class ItemWorkflow:
                 tracker_commit = self._ports.workspace.commit_tracker(
                     workspace, spec.item.item_id, item_commit=None
                 )
-                finalise = self._ports.workspace.deliver(
-                    workspace, self._delivery_request(spec, None, tracker_commit)
+                finalise = self._deliver(
+                    record, spec, workspace, self._delivery_request(spec, None, tracker_commit)
                 )
         except Exception as exc:
-            if workspace is not None:
-                guard.leave_worktree = True
+            # The item is unfinished: its worktree and evidence are kept and
+            # the campaign goes on.
             self._event(
                 record,
                 "item.park_failed",
@@ -1505,18 +2155,12 @@ class ItemWorkflow:
                     "reason": reason,
                     "error": str(exc),
                     "snapshot_path": snapshot_dir,
+                    "worktree_root": str(evidence.root) if evidence is not None else "",
                 },
             )
-            if isinstance(exc, TrackerStop):
-                raise
-            return ItemOutcome(
-                item_id=spec.item.item_id,
-                disposition=ItemDisposition.FAILED,
-                states=tuple(machine.history),
-                reason=str(exc),
-                structural_failure=False,
-                title=spec.item.title,
-                seats=tuple(seats),
+            return _with_tracker_failure(
+                self._unfinished_item(spec, machine, record, evidence, seats, guard, str(exc)),
+                exc,
             )
         self._emit_parked(
             record,
@@ -1660,7 +2304,11 @@ class ItemWorkflow:
 
     @staticmethod
     def _delivery_request(
-        spec: ItemExecutionSpec, item_commit: str | None, tracker_commit: str
+        spec: ItemExecutionSpec,
+        item_commit: str | None,
+        tracker_commit: str,
+        revalidate=None,
+        note_revalidation=None,
     ) -> DeliveryRequest:
         return DeliveryRequest(
             spec.item.item_id,
@@ -1671,4 +2319,26 @@ class ItemWorkflow:
             spec.delivery_target_revision,
             spec.push_current_branch,
             spec.allow_current_branch_default,
+            revalidate=revalidate,
+            declared_paths=declared_path_tokens(spec.brief_text),
+            note_revalidation=note_revalidation,
         )
+
+    def _revalidation_note(self, spec: ItemExecutionSpec, record: RunRecordRef):
+        """Record each delivery revalidation decision as one
+        ``delivery.revalidation`` event."""
+
+        def note(decision: RevalidationDecision) -> None:
+            self._event(
+                record,
+                "delivery.revalidation",
+                spec.item.item_id,
+                payload={
+                    "run": decision.run,
+                    "reason": decision.reason,
+                    "incoming": list(decision.incoming),
+                    "overlapping": list(decision.overlapping),
+                },
+            )
+
+        return note

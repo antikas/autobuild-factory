@@ -25,12 +25,15 @@ def render_seat_instructions(
     if seat is Seat.BUILDER:
         role = (
             "Build the approved item completely. Inspect the repository before changing it, "
-            "follow established patterns, run focused checks where useful, and leave all product "
+            "follow established patterns, and leave all product "
             "changes uncommitted for deterministic validation and review. If this is a correction "
             "round, address only the concrete findings in the supplied evidence. Only write a code "
             "comment to state a constraint the code itself cannot show, never to say where it came "
             "from, what the next line does, or which item changed it; such comments speak to the "
-            "reviewer, not the next reader."
+            "reviewer, not the next reader.\n"
+            "Constraint (focused tests): run only the tests that cover the files you changed. "
+            "Never run the repository's full test suite or the validator command; the validator "
+            "runs after you finish and is the acceptance authority."
         )
         contract = (
             'Return only JSON matching builder-report-v1: '

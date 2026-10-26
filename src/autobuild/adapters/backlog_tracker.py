@@ -5,9 +5,11 @@ from __future__ import annotations
 import re
 import subprocess
 import time
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 
 from autobuild.domain import (
     AdapterError,
@@ -22,6 +24,7 @@ from autobuild.domain import (
     WorkItem,
     WorkspaceRef,
 )
+from autobuild.domain.models import SkippedItem, TrackerRecovery
 
 
 _READY = {"ready", "approved", "queued", "todo", "to do", "not started"}
@@ -63,7 +66,13 @@ class BacklogTrackerAdapter:
         proposal_prefix: str = "ABP",
         remote: str = "origin",
         push_primary: bool = True,
+        primary_lock: AbstractContextManager[object] | None = None,
     ) -> None:
+        """``primary_lock`` is the primary-checkout lock composition shares with
+        the workspace adapter. It covers the row update and its local commit on
+        the primary checkout, never the push that publishes it."""
+
+        self._primary_lock = primary_lock if primary_lock is not None else Lock()
         self._repository = repository.resolve(strict=False)
         candidate = Path(backlog_path).expanduser()
         resolved = (
@@ -159,15 +168,17 @@ class BacklogTrackerAdapter:
         return ""
 
     def claim(self, item: WorkItem, actor: str) -> ClaimReceipt:
-        if self._git(
-            self._repository, "status", "--porcelain", "--untracked-files=all"
-        ).strip():
-            raise AdapterError("primary checkout must be clean before a tracker claim")
-        row = self._find(self._read(self._repository), item.item_id)
-        if self._status_kind(row.status) != "ready":
-            raise EvidenceError(f"BACKLOG item {item.item_id} is not ready")
-        self._set_status(self._repository, item.item_id, f"Claimed by {actor}")
-        self._commit_primary(f"MODIFIED: claim {item.item_id} in BACKLOG")
+        with self._primary_lock:
+            if self._git(
+                self._repository, "status", "--porcelain", "--untracked-files=all"
+            ).strip():
+                raise AdapterError("primary checkout must be clean before a tracker claim")
+            row = self._find(self._read(self._repository), item.item_id)
+            if self._status_kind(row.status) != "ready":
+                raise EvidenceError(f"BACKLOG item {item.item_id} is not ready")
+            self._set_status(self._repository, item.item_id, f"Claimed by {actor}")
+            revision = self._commit_primary(f"MODIFIED: claim {item.item_id} in BACKLOG")
+        self._publish_primary(revision)
         return ClaimReceipt(item.item_id, actor, datetime.now(UTC).isoformat())
 
     def close(
@@ -189,14 +200,36 @@ class BacklogTrackerAdapter:
     ) -> None:
         del actor
         clean_reason = " ".join(reason.replace("|", "/").split())
-        root = workspace.root if workspace is not None else self._repository
-        self._set_status(root, item_id, f"Parked: {clean_reason}")
-        if workspace is None:
-            self._commit_primary(f"MODIFIED: park {item_id} in BACKLOG")
+        if workspace is not None:
+            self._set_status(workspace.root, item_id, f"Parked: {clean_reason}")
+            return None
+        with self._primary_lock:
+            self._set_status(self._repository, item_id, f"Parked: {clean_reason}")
+            revision = self._commit_primary(f"MODIFIED: park {item_id} in BACKLOG")
+        self._publish_primary(revision)
+        return None
+
+    def recover(self) -> TrackerRecovery:
+        """The backlog adapter commits every write itself in one step, so it
+        never leaves a partial write to recover."""
+
+        return TrackerRecovery()
+
+    def skipped_items(self) -> tuple[SkippedItem, ...]:
+        """Every backlog row it lists is runnable, so it skips none."""
+
+        return ()
 
     def propose(self, proposal: Proposal, actor: str) -> ProposalRef:
         del actor
         self.validate_proposal(proposal)
+        with self._primary_lock:
+            proposal_id = self._append_proposal(proposal)
+            revision = self._commit_primary(f"ADDED: propose {proposal.title} in BACKLOG")
+        self._publish_primary(revision)
+        return ProposalRef(proposal_id, runnable=False)
+
+    def _append_proposal(self, proposal: Proposal) -> str:
         table = self._read(self._repository)
         sequence = max(
             (
@@ -223,8 +256,7 @@ class BacklogTrackerAdapter:
         insert_at = table.rows[-1].line_index + 1 if table.rows else table.separator_index + 1
         lines.insert(insert_at, self._render(cells))
         self._write(self._repository, lines)
-        self._commit_primary(f"ADDED: propose {proposal.title} in BACKLOG")
-        return ProposalRef(proposal_id, runnable=False)
+        return proposal_id
 
     @staticmethod
     def validate_proposal(proposal: Proposal) -> None:
@@ -323,18 +355,23 @@ class BacklogTrackerAdapter:
         relative = self._relative_path.as_posix()
         self._git(self._repository, "add", "-A", "--", relative)
         self._git(self._repository, "commit", "-m", message, "--", relative)
-        revision = self._git(self._repository, "rev-parse", "HEAD")
+        return self._git(self._repository, "rev-parse", "HEAD")
+
+    def _publish_primary(self, revision: str) -> None:
+        """Push one committed tracker revision and verify it on the remote. It
+        runs outside the primary-checkout lock; it pushes the exact revision,
+        so a later local commit never rides along."""
+
         if not self._push_primary:
-            return revision
-        self._git(self._repository, "push", self._remote, "HEAD")
+            return
         branch = self._git(self._repository, "branch", "--show-current")
+        self._git(self._repository, "push", self._remote, f"{revision}:refs/heads/{branch}")
         remote_line = self._git(
             self._repository, "ls-remote", self._remote, f"refs/heads/{branch}"
         )
         remote_revision = remote_line.split()[0] if remote_line.split() else ""
         if remote_revision != revision:
             raise AdapterError("remote verification did not observe the tracker commit")
-        return revision
 
     def _tracker_status_line(self, line: str) -> bool:
         return line[3:].replace("\\", "/") == self._relative_path.as_posix()
