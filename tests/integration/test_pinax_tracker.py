@@ -161,7 +161,10 @@ def test_pinax_refuses_a_claim_before_mutating_a_dirty_primary_checkout(
     before = {
         path.name: path.read_bytes() for path in (repo / ".ergon" / "log").glob("*.jsonl")
     }
+    # A staged change is dirt; an untracked product file alone is not (see
+    # test_recovery_gaps_delivery.py).
     (repo / "dirty.txt").write_text("preserve me\n", encoding="utf-8")
+    git(repo, "add", "dirty.txt")
 
     with pytest.raises(AdapterError, match="clean before a tracker claim"):
         tracker.claim(item, "builder@proof")

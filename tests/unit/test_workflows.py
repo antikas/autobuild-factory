@@ -53,6 +53,7 @@ from autobuild.domain import (
     WorktreeStatus,
 )
 from autobuild.domain import ClaimTaken, ScopeFenceViolation, TrackerPublication, TrackerStop
+from autobuild.domain.models import BuilderContinuation
 from autobuild.enforcement import ScopedTrackerPort
 from autobuild.domain import (
     CampaignContext,
@@ -355,10 +356,26 @@ def test_pass_with_a_blocking_finding_is_rejected() -> None:
     assert ports.tracker.closed == []
 
 
+def test_a_builder_timeout_hands_the_item_back_with_its_worktree_kept() -> None:
+    timed_out = SeatResult("builder", SeatOutcome.TIMED_OUT, None, "raw", SeatUsage(), "start", "end")
+    ports = make_ports([timed_out], [], diff_count=0)
+
+    with pytest.raises(BuilderContinuation) as handed:
+        ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+
+    assert str(handed.value) == "timeout:builder"
+    plan = handed.value.plan
+    assert (plan.marker_state, plan.worktree_root, plan.continuations) == (
+        "isolated", Path("/worktree"), 1
+    )
+    assert ports.workspace.released == []
+    assert ports.workspace.snapshotted == []
+    assert ports.tracker.parked == []
+
+
 @pytest.mark.parametrize(
     "seat_outcome,expected_reason",
     [
-        (SeatOutcome.TIMED_OUT, "timeout:builder"),
         (SeatOutcome.CANCELLED, "builder ended cancelled"),
         (SeatOutcome.FAILED, "builder ended failed"),
     ],

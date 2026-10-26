@@ -12,6 +12,7 @@ def render_seat_instructions(
     seat: Seat,
     context_refs: tuple[str, ...],
     brief_path: Path | None = None,
+    continuation: bool = False,
 ) -> str:
     acceptance = "\n".join(f"- {criterion}" for criterion in spec.item.acceptance)
     context = "\n".join(f"- {reference}" for reference in context_refs) or "- None"
@@ -35,6 +36,13 @@ def render_seat_instructions(
             "Never run the repository's full test suite or the validator command; the validator "
             "runs after you finish and is the acceptance authority."
         )
+        if continuation:
+            role += (
+                "\nContinuation: A previous builder seat timed out in this workspace before it "
+                "finished. Its partial work is present in the workspace as uncommitted changes. "
+                "Inspect it first. Complete that partial work; do not restart the item, discard "
+                "the changes or rebuild what is already done."
+            )
         contract = (
             'Return only JSON matching builder-report-v1: '
             '{"summary":"what changed and why","report_ref":"durable evidence reference"}.'

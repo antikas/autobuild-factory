@@ -38,7 +38,6 @@ from autobuild.domain import (
 )
 from autobuild.domain.models import DeliveryParked, DeliveryParkReason, ValidationCheckout
 from autobuild.adapters.tracker_commits import (
-    only_tracker_changes,
     require_one_tracker_commit,
 )
 from autobuild.enforcement.integration import revalidation_decision
@@ -723,6 +722,9 @@ class GitWorkspaceAdapter:
                     "delivery candidate differs from the validated tree in a path "
                     "that overlaps the item"
                 )
+        # Checked before the push: once pushed, the local target must be able
+        # to move onto the candidate.
+        self._require_no_collision(primary, candidate)
         return candidate
 
     def _settle_target(
@@ -751,6 +753,7 @@ class GitWorkspaceAdapter:
 
         primary = lease.repository.root
         self._require_clean_primary(primary, "before delivery")
+        self._require_no_collision(primary, commit)
         if self._git(primary, "branch", "--show-current") != target:
             self._git(primary, "checkout", target)
         self._git(primary, "merge", "--ff-only", commit)
@@ -839,6 +842,7 @@ class GitWorkspaceAdapter:
             # Without a push the local commit is the delivery itself.
             def commit_locally() -> str:
                 self._require_clean_primary(primary, "before report")
+                self._require_report_path_free(primary, relative)
                 if self._git(primary, "branch", "--show-current") != branch:
                     self._git(primary, "checkout", branch)
                 commit = self._commit_report(primary, relative, request.content, message)
@@ -861,6 +865,7 @@ class GitWorkspaceAdapter:
         self._require_scratch_path(report_root)
         def add_report_worktree() -> None:
             self._require_clean_primary(primary, "before report")
+            self._require_report_path_free(primary, relative)
             base = self._git(primary, "rev-parse", "--verify", f"refs/heads/{branch}")
             self._git(primary, "worktree", "add", "--detach", str(report_root), base)
 
@@ -929,7 +934,8 @@ class GitWorkspaceAdapter:
         moves by a guarded ref update. Returns the head to validate."""
 
         if self._git(primary, "branch", "--show-current") == target:
-            if self._git(primary, "status", "--porcelain", "--untracked-files=all"):
+            incoming = self._product_changes(primary, local, remote_head)
+            if self._primary_dirt(primary) or self._untracked_collisions(primary, incoming):
                 # A dirty primary is never touched; the fetched head is still
                 # the one to validate.
                 return remote_head
@@ -1123,13 +1129,79 @@ class GitWorkspaceAdapter:
             return step()
 
     def _require_clean_primary(self, primary: Path, timing: str) -> None:
-        if self._git(primary, "status", "--porcelain", "--untracked-files=all"):
+        dirt = self._primary_dirt(primary)
+        if dirt:
             message = f"primary checkout must be clean {timing}"
-            if self._tracker_recovery is not None and only_tracker_changes(
-                self._git, primary, self._tracker_paths
+            if self._tracker_recovery is not None and all(
+                not self._is_product_path(path) for path in dirt
             ):
                 raise _TrackerLeftover(message)
             raise AdapterError(message)
+
+    def _primary_dirt(self, primary: Path) -> list[str]:
+        """The paths that make the primary checkout dirty: staged or modified
+        tracked files, and untracked tracker files (a tracker write left
+        uncommitted). An untracked product file is not dirt; it blocks only a
+        delivery that brings in its path (see ``_require_no_collision``)."""
+
+        dirt: list[str] = []
+        for line in self._git(primary, "status", "--porcelain", "--untracked-files=all").splitlines():
+            if not line[3:]:
+                continue
+            paths = line[3:].split(" -> ")
+            if line.startswith("??") and all(self._is_product_path(path) for path in paths):
+                continue
+            dirt.extend(paths)
+        return dirt
+
+    def _untracked_collisions(self, primary: Path, incoming: list[str]) -> list[str]:
+        """The untracked product files in the primary checkout that a change
+        to ``incoming`` would overwrite: the same path, or one path a folder
+        of the other."""
+
+        if not incoming:
+            return []
+        untracked = [
+            path
+            for path in self._git(
+                primary, "ls-files", "--others", "--exclude-standard", "-z"
+            ).split("\0")
+            if path and self._is_product_path(path)
+        ]
+        return sorted(
+            path
+            for path in untracked
+            if any(
+                path == other or path.startswith(other + "/") or other.startswith(path + "/")
+                for other in incoming
+            )
+        )
+
+    def _require_report_path_free(self, primary: Path, relative: str) -> None:
+        collisions = self._untracked_collisions(primary, [relative])
+        if collisions:
+            raise AdapterError(
+                "untracked files in the primary checkout are at the report path: "
+                + ", ".join(collisions)
+            )
+
+    def _require_no_collision(self, primary: Path, commit: str) -> None:
+        """Refuse a delivery of ``commit`` that would overwrite an untracked
+        file in the primary checkout when its target moves onto it."""
+
+        incoming = [
+            path
+            for path in self._git(
+                primary, "diff", "--name-only", "-z", "--no-renames", "HEAD", commit
+            ).split("\0")
+            if path
+        ]
+        collisions = self._untracked_collisions(primary, incoming)
+        if collisions:
+            raise AdapterError(
+                "untracked files in the primary checkout are at paths the delivery "
+                "brings in: " + ", ".join(collisions)
+            )
 
     def _default_branch(self, root: Path) -> str:
         symbolic = self._git(

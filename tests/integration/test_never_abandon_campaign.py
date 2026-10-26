@@ -416,14 +416,14 @@ def test_a_ready_item_without_a_brief_is_skipped_and_named(tmp_path: Path) -> No
 
 
 def test_a_delivery_error_after_the_item_commit_parks_from_the_primary(tmp_path: Path) -> None:
-    """The primary holds a stray product file, so delivery refuses. The item's
-    branch already holds its product commit; the park must succeed from the
-    primary checkout, keep the worktree and publish none of the item's
-    commits."""
+    """The primary holds a stray untracked file at the path the item adds, so
+    delivery refuses. The item's branch already holds its product commit; the
+    park must succeed from the primary checkout, keep the worktree and publish
+    none of the item's commits."""
 
     origin = pinax_origin(tmp_path)
     tracker, workspace = default_adapters(origin)
-    stray = origin.repo / "stray.txt"
+    stray = origin.repo / "feature.txt"
     harness = scripted_harness(
         origin.items[0],
         after_review=lambda: stray.write_text("left by hand\n", encoding="utf-8"),
@@ -432,7 +432,9 @@ def test_a_delivery_error_after_the_item_commit_parks_from_the_primary(tmp_path:
     outcome, ports = run_item(origin, workspace, tracker, harness, ValidatorRuns())
 
     assert outcome.disposition is ItemDisposition.PARKED, outcome.reason
-    assert "primary checkout must be clean before delivery" in (outcome.reason or "")
+    assert "untracked files in the primary checkout are at paths the delivery brings in" in (
+        outcome.reason or ""
+    )
     assert outcome.states[-1] is ItemState.PARKED
     assert item_status(origin, origin.items[0]) == "parked"
     assert "feature.txt" not in git(origin.repo, "ls-tree", "-r", "--name-only", origin.head())
