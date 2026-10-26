@@ -97,10 +97,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.9.2 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.9.2). Install the released command from PyPI:
+Release 0.9.3 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.9.3). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.9.2
+uv tool install autobuild-factory==0.9.3
 ```
 
 AutoBuild 0.7.0 needs pinax-tracker 0.2.1 or later when the project uses Pinax. From 0.7.0 Pinax commits every tracker change itself and AutoBuild only verifies that commit; an earlier Pinax leaves the change uncommitted and AutoBuild stops at the first claim. Do not use AutoBuild 0.6.0 or earlier with pinax-tracker 0.2.1 or later: those versions commit the tracker change themselves and refuse a tracker that has already committed it.
@@ -134,7 +134,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.9.2
+uv tool install autobuild-factory==0.9.3
 autobuild --help
 ```
 
@@ -473,6 +473,8 @@ Pressure never takes the last slot. With nothing of its own running, a campaign 
 
 A validator run that times out while the level was `high` or `critical` at any point of its run is suspected of failing from load. It is run once more, alone: it waits until no other heavy command runs, and no other starts until it ends. The rerun's verdict stands. A timeout without recorded pressure, or any other failure, is not run again.
 
+Every validator command id ends with the validator id, which is how the policy admits it: `<run>:<item>:<validator>` for an item, `<run>:<item>:rerun:<validator>` for the load rerun and `<run>:batch:<N>:<validator>` for a batch validation. The profile's `patient_argv` is approved with the validator.
+
 When the first reading cannot measure CPU busy or memory, the campaign records one warning and keeps its static concurrency without pressure control. After a measured reading, a read that fails or lacks a field is skipped: the level, the cap, the heavy-command hold and the window stay as they were, and the first failure of a run records one `campaign.pressure_read_failed` warning. After three failures in a row the campaign records one `campaign.pressure_fallback` event and keeps the current level and cap; it never raises the cap or lifts a hold on a failed read, and only measured readings move them again. A run record that cannot be written does not stop the monitor. A serial campaign does not run the monitor.
 
 The optional `[pressure]` table sets every threshold. These are the defaults; memory values are GiB:
@@ -682,7 +684,7 @@ The meter needs `curl` on `PATH` and Claude Code's `.credentials.json` file in i
 The `claude-sdk` lane runs Claude Code seats through the Claude Agent SDK on an API key, so a campaign can keep building when the subscription lane is cooled. Install AutoBuild with the optional extra:
 
 ```text
-uv tool install "autobuild-factory[sdk]==0.9.2"
+uv tool install "autobuild-factory[sdk]==0.9.3"
 ```
 
 Create an API key in the Console organisation whose credit should pay for the seats, save it alone in a file, and name the file in the lane table. Put the lane last so it is used only when the earlier lanes are cooled:
@@ -883,7 +885,7 @@ An error that belongs to one item ends that item and the campaign keeps admittin
 - An item that fails before its claim is not picked again in the same campaign.
 - A failure while recording the follow-ups of a delivered item never undoes the delivery: the item stays accepted and the run record gains an `item.follow_up_failed` event.
 
-A tracker failure on an item's write is classified from the Pinax exit code. `tracker_environment` is exit 4, and the message states the cause Pinax reported (the remote could not be reached or read, the repository is inside another repository, or a claim was committed on a branch Pinax does not publish outside `current-branch-pr`), or an installed Pinax that left its change uncommitted (pinax-tracker 0.2.1 or later is required). `tracker_refused` is exit 1 (unknown item), 2 (invalid actor), 5 (push rejected on every attempt), 6 (clock behind the newest published event) or 7 (commit refused). The run record gains an `item.tracker_failed` event with the class, the exit code and Pinax's message. AutoBuild then asks the tracker to recover and holds admissions while the tracker is not clear.
+A tracker failure on an item's write is classified from the Pinax exit code. `tracker_environment` is exit 4, and the message states the cause Pinax reported (the remote could not be reached or read, the repository is inside another repository, or a claim was committed on a branch Pinax does not publish outside `current-branch-pr`), or an installed Pinax that left its change uncommitted (pinax-tracker 0.2.1 or later is required). `tracker_refused` is exit 1 (unknown item), 2 (invalid actor), 5 (push rejected; outside a claim it is an unpublished write, described at the end of "Holds"), 6 (clock behind the newest published event) or 7 (commit refused). The run record gains an `item.tracker_failed` event with the class, the exit code and Pinax's message. AutoBuild then asks the tracker to recover and holds admissions while the tracker is not clear.
 
 ### Partial tracker writes
 
@@ -911,7 +913,7 @@ A ready item without an approved brief is never claimed. The run record gains on
 
 The run record gains `campaign.hold_started` with the condition and the next check, `campaign.hold_retry` after each failed check, and `campaign.hold_released` with the hold's duration when it clears. A hold that lasts `run.hold_limit_seconds` records `campaign.hold_limit` and ends the campaign with `hold_limit`. The report lists each hold under Holds with its duration and how it ended.
 
-A claim that Pinax reports superseded (exit 3) is not a stop: another writer holds the item, the run record gains an `item.claim_taken` event, and the campaign selects the next item. A claim, park or proposal that Pinax committed without pushing is not a stop either: the run record gains a `tracker.unpublished` event, the progress log says so, and the report lists it under Unpublished tracker writes; it goes out with the next push of its branch. A park or proposal from the primary checkout is refused while that checkout holds staged or modified non-tracker files, and a tracker commit that touches any non-tracker path is refused.
+A claim that Pinax reports superseded (exit 3) is not a stop: another writer holds the item, the run record gains an `item.claim_taken` event, and the campaign selects the next item. A claim, park or proposal that Pinax committed without pushing is not a stop either: the run record gains a `tracker.unpublished` event, the progress log says so, and the report lists it under Unpublished tracker writes; it goes out with the next push of its branch. Pinax exit 5 with the status `push_rejected`, meaning a concurrent push won the race and the event stayed committed on the local branch, is handled the same way for a park, a proposal and its block and note: AutoBuild checks the commit and records it as unpublished. For a claim, which Pinax annuls when it cannot publish it, exit 5 still fails as `tracker_refused`. A park or proposal from the primary checkout is refused while that checkout holds staged or modified non-tracker files, and a tracker commit that touches any non-tracker path is refused.
 
 The process exit code is:
 

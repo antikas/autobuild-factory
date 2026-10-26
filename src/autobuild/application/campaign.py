@@ -59,6 +59,7 @@ from autobuild.domain.models import (
     PressurePolicy,
     TrackerRecovery,
     bytes_to_gib,
+    validator_command_id,
 )
 from autobuild.enforcement.pressure import assess_pressure, initial_pressure
 from autobuild.enforcement.selection import admission_limit
@@ -1424,7 +1425,11 @@ class CampaignRunner:
         assert batch is not None and schedule.heavy is not None
         policy = batch.policy
         request = CommandRequest(
-            command_id=f"{record.run_id}:batch:{number}",
+            # The validator id is the final segment, as the enforced command
+            # port requires of every validator run.
+            command_id=validator_command_id(
+                record.run_id, "batch", str(number), validator=policy.validator_id
+            ),
             argv=policy.argv,
             cwd=checkout.root,
             environment=self._ports.item_environment(f"batch-{number}"),

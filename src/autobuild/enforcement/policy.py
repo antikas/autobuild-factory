@@ -28,6 +28,7 @@ from autobuild.domain import (
     RunRecordRef,
     SeatRequest,
     WorkspaceRef,
+    identifies_validator,
     review_verdict_rule_error,
 )
 from autobuild.domain import LeaseGrant, LeaseRequest, LeaseSurface
@@ -46,10 +47,16 @@ from autobuild.ports import (
 class ApprovedValidator:
     validator_id: str
     argv: tuple[str, ...]
+    # The profile's patient form of the validator, run under host pressure. It
+    # is approved with the validator, so a patient run is not refused.
+    patient_argv: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.validator_id.strip() or not self.argv:
             raise ValueError("approved validators require an id and argv")
+
+    def admits(self, argv: tuple[str, ...]) -> bool:
+        return argv == self.argv or (bool(self.patient_argv) and argv == self.patient_argv)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +123,7 @@ def _require_close_evidence(
     if evidence.validation.validator_id not in validator_ids:
         raise EvidenceError("closing validator is not approved")
     command = evidence.validation.command
-    if not command.command_id.endswith(f":{evidence.validation.validator_id}"):
+    if not identifies_validator(command.command_id, evidence.validation.validator_id):
         raise EvidenceError("closing command does not identify the validator")
     if command.exit_code != 0 or command.timed_out or command.cancelled:
         raise EvidenceError("closing validator did not pass")
@@ -146,11 +153,11 @@ class EnforcedCommandPort:
         matches = [
             validator
             for validator in self._config.approved_validators
-            if request.command_id.endswith(f":{validator.validator_id}")
+            if identifies_validator(request.command_id, validator.validator_id)
         ]
         if len(matches) != 1:
             raise PolicyViolation("command does not identify one approved validator")
-        if request.argv != matches[0].argv:
+        if not matches[0].admits(request.argv):
             raise PolicyViolation("validator argv differs from the approved item")
         if request.stdin_ref is not None:
             raise PolicyViolation("validator stdin differs from the approved item")

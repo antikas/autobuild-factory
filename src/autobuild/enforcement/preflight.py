@@ -22,6 +22,7 @@ from autobuild.domain import (
     PreflightProbe,
     UsagePolicy,
     UsageProbeFailure,
+    validator_command_id,
 )
 from autobuild.ports import (
     CommandPort,
@@ -275,7 +276,9 @@ def _validator_runnable(
         raise _fail(name, f"validator executable was not found: {executable}")
     result = command.run(
         CommandRequest(
-            command_id=f"preflight:validator-version:{validator.validator_id}",
+            command_id=validator_command_id(
+                "preflight", "validator-version", validator=validator.validator_id
+            ),
             argv=(executable, "--version"),
             cwd=validator.repository,
             timeout_seconds=validator.version_timeout_seconds,
@@ -317,7 +320,9 @@ def _validator_offline(
     started = now()
     result = command.run(
         CommandRequest(
-            command_id=f"preflight:validator-offline:{validator.validator_id}",
+            command_id=validator_command_id(
+                "preflight", "validator-offline", validator=validator.validator_id
+            ),
             argv=validator.argv,
             cwd=validator.repository,
             environment=environment,

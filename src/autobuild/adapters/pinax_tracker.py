@@ -55,6 +55,10 @@ _REFUSED_EXITS = frozenset({1, 2, 5, 6, 7})
 # asks the caller to commit the shard and the projection.
 _PARTIAL_WRITE_EXIT = 7
 _PARTIAL_WRITE_STATUSES = frozenset({"commit_refused", "stage_failed"})
+# Exit 5 with this status: the push lost a race and Pinax's pull did not finish.
+# Outside a claim the event stays committed on the local branch, not annulled.
+_PUSH_REJECTED_EXIT = 5
+_PUSH_REJECTED = "push_rejected"
 # The waits before each retry of a partial write's recovery commit, and of its
 # publishing push. The first attempt runs at once.
 RECOVERY_WAITS = (2.0, 5.0, 10.0)
@@ -669,6 +673,24 @@ class PinaxTrackerAdapter:
             raise _PartialWrite(f"{label}: {cause}", report)
         if code in _ENVIRONMENT_EXITS:
             raise TrackerStop(f"{label}: {cause}", code=code, environment=True)
+        if (
+            code == _PUSH_REJECTED_EXIT
+            and command != "claim"
+            and status == _PUSH_REJECTED
+            and report.get("committed") is True
+            and not report.get("annulled")
+        ):
+            # A concurrent push won the race and Pinax's pull did not finish:
+            # its event is committed on the local branch and stands. The next
+            # delivery integrates the local branch and publishes it, as for a
+            # committed-local write. A claim needs the remote and stays a stop.
+            require_no_foreign_changes(self._git, root, _TRACKER_PATHS)
+            require_committed(self._git, root, before, _TRACKER_PATHS, published)
+            obstacle = str(report.get("git_output") or "").strip()
+            note = "; ".join(part for part in (f"{label}: {cause}", obstacle) if part)
+            return report, TrackerPublication(
+                False, f"{note}; the commit goes out with the next push of its branch"
+            )
         if code in _REFUSED_EXITS:
             raise TrackerStop(f"{label}: {cause}", code=code, environment=False)
         if code != 0:

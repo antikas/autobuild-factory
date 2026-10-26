@@ -91,7 +91,9 @@ from autobuild.domain.models import (
     WorktreeSnapshot,
     WorktreeStatus,
     bytes_to_gib,
+    identifies_validator,
     review_verdict_rule_error,
+    validator_command_id,
 )
 
 __all__ = [
@@ -183,5 +185,7 @@ __all__ = [
     "WorktreeSnapshot",
     "WorktreeStatus",
     "bytes_to_gib",
+    "identifies_validator",
     "review_verdict_rule_error",
+    "validator_command_id",
 ]
