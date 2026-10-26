@@ -65,6 +65,12 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
         return f"item {item_id} correction round {payload.get('round', '?')}"
     if event_type == "item.parked":
         return f"item {item_id} parked: {payload.get('reason', '')}"
+    if event_type == "item.builder_continued":
+        return (
+            f"item {item_id} builder timed out; claim and worktree kept, a fresh builder "
+            f"continues it (continuation {payload.get('continuation', '?')} of "
+            f"{payload.get('limit', '?')})"
+        )
     if event_type == "item.finalised":
         return (
             f"item {item_id} delivered: item {_commit(payload.get('item_commit'))}, "

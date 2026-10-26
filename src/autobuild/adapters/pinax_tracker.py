@@ -288,9 +288,23 @@ class PinaxTrackerAdapter:
             # publishes it.
             if only_tracker_changes(self._git, self._repository, _TRACKER_PATHS):
                 self._commit_leftover(self._repository, self._pending_subject())
-            if self._git(
-                self._repository, "status", "--porcelain", "--untracked-files=all"
-            ).strip():
+            # An untracked product file is not dirt: the claim commits tracker
+            # paths only, so it can never sweep one in.
+            dirty = [
+                line
+                for line in self._git(
+                    self._repository, "status", "--porcelain", "--untracked-files=all"
+                ).splitlines()
+                if line[3:]
+                and not (
+                    line.startswith("??")
+                    and not any(
+                        line[3:] == path or line[3:].startswith(path + "/")
+                        for path in _TRACKER_PATHS
+                    )
+                )
+            ]
+            if dirty:
                 raise AdapterError("primary checkout must be clean before a tracker claim")
 
         _, publication = self._on_primary(

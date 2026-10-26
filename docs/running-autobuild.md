@@ -97,10 +97,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.9.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.9.0). Install the released command from PyPI:
+Release 0.9.1 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.9.1). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.9.0
+uv tool install autobuild-factory==0.9.1
 ```
 
 AutoBuild 0.7.0 needs pinax-tracker 0.2.1 or later when the project uses Pinax. From 0.7.0 Pinax commits every tracker change itself and AutoBuild only verifies that commit; an earlier Pinax leaves the change uncommitted and AutoBuild stops at the first claim. Do not use AutoBuild 0.6.0 or earlier with pinax-tracker 0.2.1 or later: those versions commit the tracker change themselves and refuse a tracker that has already committed it.
@@ -134,7 +134,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.9.0
+uv tool install autobuild-factory==0.9.1
 autobuild --help
 ```
 
@@ -469,6 +469,8 @@ On a 32 GiB host the high line is 4 GiB and the critical line 2 GiB; on a 64 GiB
 
 Only `normal` admits new items. At `high` and `critical` no new heavy command starts either, and each further 5 minutes there lowers the effective item cap by one, down to 1. At `recovering` heavy commands start again but items are still not admitted. Back at `normal` the cap rises by one every 60 seconds, up to the concurrency. Back-off never stops anything that has started: a running seat, validator or reviewer runs to its own end or its own timeout. With nothing running, a pressure wait lasts until the level is back at `normal`; it is not a hold, and `run.hold_limit_seconds` does not bound it.
 
+Pressure never takes the last slot. With nothing of its own running, a campaign always admits one item, whatever the level, so load from other work on the host cannot leave it idle; the hold applies only to admissions beyond the first. In the same way, with no heavy command of the campaign running, one heavy command starts at any level, in its patient form.
+
 A validator run that times out while the level was `high` or `critical` at any point of its run is suspected of failing from load. It is run once more, alone: it waits until no other heavy command runs, and no other starts until it ends. The rerun's verdict stands. A timeout without recorded pressure, or any other failure, is not run again.
 
 When the first reading cannot measure CPU busy or memory, the campaign records one warning and keeps its static concurrency without pressure control. After a measured reading, a read that fails or lacks a field is skipped: the level, the cap, the heavy-command hold and the window stay as they were, and the first failure of a run records one `campaign.pressure_read_failed` warning. After three failures in a row the campaign records one `campaign.pressure_fallback` event and keeps the current level and cap; it never raises the cap or lifts a hold on a failed read, and only measured readings move them again. A run record that cannot be written does not stop the monitor. A serial campaign does not run the monitor.
@@ -680,7 +682,7 @@ The meter needs `curl` on `PATH` and Claude Code's `.credentials.json` file in i
 The `claude-sdk` lane runs Claude Code seats through the Claude Agent SDK on an API key, so a campaign can keep building when the subscription lane is cooled. Install AutoBuild with the optional extra:
 
 ```text
-uv tool install "autobuild-factory[sdk]==0.9.0"
+uv tool install "autobuild-factory[sdk]==0.9.1"
 ```
 
 Create an API key in the Console organisation whose credit should pay for the seats, save it alone in a file, and name the file in the lane table. Put the lane last so it is used only when the earlier lanes are cooled:
@@ -876,7 +878,8 @@ A stopped process (an interrupt or a kill) ends the campaign too; see "Recover a
 An error that belongs to one item ends that item and the campaign keeps admitting other items. Such errors are invalid evidence or a broken contract, a tracker refusal or environment error during that item's own write, an adapter error, and any delivery error.
 
 - A claimed item parks with the error as its reason and its evidence. Before the item's product commit exists, the park is recorded in its worktree as usual. Once the item branch holds its product commit, the park is recorded from the primary checkout and the worktree and branch are kept as evidence, so none of the item's commits reach the remote.
-- When the park itself fails, the item is unfinished: its disposition is `failed`, its worktree and evidence are kept, its worktree lease is released, the `item.park_failed` event names the error and the kept worktree, and the report lists it under Unfinished.
+- When the park itself fails, the item is unfinished: its disposition is `failed`, its worktree and evidence are kept, its worktree lease is released, the `item.park_failed` event names the error and the kept worktree, and the report lists it under Unfinished. An accepted item in this state keeps its `finalised` phase marker, so the next campaign resumes it by delivering it (see "Recover an interrupted run").
+- A builder seat that times out is not an item error. The item keeps its claim and its worktree, nothing is parked or snapshotted, and the run record gains an `item.builder_continued` event with the continuation number. The campaign admits the item again ahead of new work, and a fresh builder seat continues in the same worktree; its prompt says that a previous seat's partial work is present and must be completed, not restarted. Each item gets at most 2 continuations; a third timeout parks it `timeout:builder` with its snapshot. A continuation the campaign stops before admitting stays claimed with its worktree and marker, and the report lists it under Unfinished.
 - An item that fails before its claim is not picked again in the same campaign.
 - A failure while recording the follow-ups of a delivered item never undoes the delivery: the item stays accepted and the run record gains an `item.follow_up_failed` event.
 
@@ -968,6 +971,8 @@ The evidence rule is that the tree the validator passed equals the pushed commit
 
 Changes from other packages reach the target without the item validating them, so the integration is checked in batches. After every `run.batch_validate_every` deliveries (default 5), and once at campaign end when anything was delivered since the last batch, AutoBuild runs the validator once on the current head of the delivery target branch in a detached scratch worktree, in a heavy slot and on its own thread, so admissions go on while it runs. A pass records `campaign.batch_validated`. A failure records `campaign.batch_validation_failed` with the head, the validator exit code and the commits delivered since the last batch that passed, and holds new admissions with the `batch_validation_failed` condition. Nothing is reverted and the campaign does not end. Every 600 seconds the hold fetches the target branch from `origin`, fast-forwards the local branch to it when the local head is part of it, and checks the head. An operator clears the hold by pushing a fix to the target branch; the moved head is then validated, and the hold is released only when a later batch passes. The hold limit applies as to any hold. With 6 deliveries the head is validated twice: after the fifth and at the end.
 
+Only staged or modified tracked files, and untracked tracker files, make the primary checkout dirty for a claim, a delivery, a park or a campaign report. An untracked product file, such as a brief written by hand during a campaign, stays where it is and does not block them. It still blocks a delivery that brings in a file at its path, or a folder that holds it: the delivery refuses before the push with `untracked files in the primary checkout are at paths the delivery brings in`, names them, and the item parks from the primary checkout.
+
 A delivery that cannot finish parks the item from the primary checkout and keeps the item worktree and branch as evidence. Any other error after the item's product commit, such as a delivery check that refuses or a tracker close that fails, parks the same way. The park's own tracker commit is checked on its own: the item's product commit before it is outside that check, and a park commit that touches a non-tracker path is still refused. For every delivery park reason, none of the item's commits reach the remote. The park snapshot records only the item's own change, from the start commit to the item's tracker commit, never the target branch changes an integration merge brought in. The park reason starts with one of:
 
 - `delivery_conflict`: merging the target branch conflicted in a file other than the Pinax projection; the merge is aborted and the reason names the files
@@ -1028,7 +1033,7 @@ The command must answer `--version`, and the fog ledger must already exist. Publ
 
 Normal failures park the claimed item and release the isolated worktree. A killed process or machine restart can leave a claimed item, an AutoBuild branch, or a worktree under the scratch root. A tracker write that Pinax appended and could not commit is recovered by AutoBuild while the campaign runs (see "Partial tracker writes"); a killed run can leave one behind on the primary checkout, and the next claim, delivery or report commits it the same way.
 
-At the start of every campaign, before it selects the first item, AutoBuild asks the tracker for items its builder actor still holds that are neither done nor parked, and reads each item's phase marker from the most recent run under the scratch root. An interrupted item resumes automatically when its state is good: the marker's worktree still exists as a registered worktree of the repository, the worktree head matches the marker (a delivery integration merge on top of the recorded commit still matches), the product status digest still matches a `built`, `validated` or `reviewed` marker, the tracker still shows the item claimed, and no live lease from another campaign holds the worktree or the tracker root. A resumed item restarts from its marker: a build that is not yet trusted re-runs the builder, a `built` marker re-runs validation and review, a `validated` marker re-runs review, and a `reviewed` correction starts the next round with the same correction count. The run record notes `item.resumed` with the prior run id and marker state, and the campaign then continues to the rest of the queue.
+At the start of every campaign, before it selects the first item, AutoBuild asks the tracker for items its builder actor still holds that are neither done nor parked, and reads each item's phase marker from the most recent run under the scratch root. An interrupted item resumes automatically when its state is good: the marker's worktree still exists as a registered worktree of the repository, the worktree head matches the marker (a delivery integration merge on top of the recorded commit still matches), the product status digest still matches a `built`, `validated` or `reviewed` marker, the tracker still shows the item claimed, and no live lease from another campaign holds the worktree or the tracker root. A resumed item restarts from its marker: a build that is not yet trusted re-runs the builder, a `built` marker re-runs validation and review, a `validated` marker re-runs review, and a `reviewed` correction starts the next round with the same correction count. An accepted item writes its `finalised` marker as soon as its product and tracker commits exist, before delivery, and keeps it until the tracker records a park. So an item whose delivery failed and that stayed claimed resumes by delivering: its worktree's item commit is integrated, validated again when the target moved in a path that overlaps it, pushed, and the item ends `done`. The run record notes `item.resumed` with the prior run id and marker state, and the campaign then continues to the rest of the queue.
 
 When the state is not good, AutoBuild parks the item with a stated reason and moves on rather than attaching to it. The reason is one of `resume:missing-worktree`, `resume:head-moved`, `resume:revision-changed`, `resume:lease-held`, `resume:tracker-mismatch` or `resume:missing-marker`. A parked item's worktree is snapshotted into the run record and left in place, so nothing is lost. A worktree under the scratch root that no claimed item owns is never attached; the campaign report lists it under Parked with reason `resume:orphan-worktree` and leaves it in place. These park cases still need a person: inspect the named worktree and reconcile it before you re-queue the item. Taking over a worktree that another live campaign holds is never automatic, so stop the named holder first.
 
@@ -1085,7 +1090,7 @@ AutoBuild resumes a good-state item on its own at the next launch. Reconcile the
 
 `briefs preflight failed` names a ready item whose brief file is missing or larger than 1 MiB. Fix the brief path or trim the brief.
 
-`primary checkout must be clean` means the main repository has tracked or untracked changes. Commit, move, or intentionally resolve them before retrying.
+`primary checkout must be clean` means the main repository has staged or modified tracked files, or untracked files under the tracker paths. Commit, move, or intentionally resolve them before retrying. Untracked product files do not cause it.
 
 `required git remote is missing: origin` means the repository has no `origin` remote. Add the correct writable remote before the run.
 

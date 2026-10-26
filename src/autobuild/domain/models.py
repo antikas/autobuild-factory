@@ -636,12 +636,16 @@ class ResumePlan:
 
     ``marker_state`` is the phase to restart from, ``worktree_root`` names the
     worktree to adopt, ``correction_count`` preserves how many correction rounds
-    had run, and ``prior_run_id`` names the run the marker came from."""
+    had run, and ``prior_run_id`` names the run the marker came from.
+    ``continuations`` counts the builder seats that timed out on this item in
+    this campaign; above zero the resumed builder continues their partial work
+    in the same worktree."""
 
     marker_state: str
     worktree_root: Path
     correction_count: int
     prior_run_id: str
+    continuations: int = 0
 
 
 class SurfaceKind(str, Enum):
@@ -1130,6 +1134,17 @@ class DeliveryParked(AutoBuildError):
         self.reason = reason
         self.detail = detail
         super().__init__(f"{reason.value}: {detail}" if detail else reason.value)
+
+
+class BuilderContinuation(AutoBuildError):
+    """A builder seat timed out and the item keeps its claim, its worktree and
+    its phase marker. The item workflow raises it instead of parking; the
+    campaign re-admits the item with ``plan``, and a fresh builder seat
+    continues the partial work in the same worktree."""
+
+    def __init__(self, plan: ResumePlan, reason: str) -> None:
+        self.plan = plan
+        super().__init__(reason)
 
 
 @dataclass(frozen=True, slots=True)

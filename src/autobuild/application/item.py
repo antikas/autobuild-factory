@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Condition, Lock
+from typing import NoReturn
 
 from autobuild.application.dependencies import Lane, WorkflowPorts
 from autobuild.application.progress import render_progress_line
@@ -58,7 +59,7 @@ from autobuild.domain import (
     WorkspaceRef,
     review_verdict_rule_error,
 )
-from autobuild.domain.models import DeliveryParked, RevalidationDecision
+from autobuild.domain.models import BuilderContinuation, DeliveryParked, RevalidationDecision
 from autobuild.enforcement import classify_item_nature
 from autobuild.enforcement.pressure import PATIENT_LOOKBACK_SECONDS, stretched_seat_cap
 from autobuild.enforcement.triage import declared_path_tokens
@@ -89,6 +90,9 @@ _RESUME_SEED = {
     ItemState.ESCALATED.value: ItemState.BUILT,
     ItemState.FINALISED.value: ItemState.FINALISED,
 }
+# How many times a timed-out builder's item is handed back, with its claim and
+# worktree, for a fresh builder to continue; the next timeout parks it.
+BUILDER_CONTINUATIONS = 2
 # Marker states whose build is not yet trusted, so a resume re-runs the builder.
 _RESUME_REBUILD = frozenset(
     {ItemState.CLAIMED.value, ItemState.ISOLATED.value, ItemState.CORRECTING.value}
@@ -487,7 +491,8 @@ class HeavySlots:
 
     A heavy command (a validator run AutoBuild starts) takes one slot, up to
     ``limit`` at once (None means no limit), and starts only while the host
-    pressure level allows heavy commands. An exclusive command waits until no
+    pressure level allows heavy commands or no other heavy command runs. An
+    exclusive command waits until no
     other heavy command runs and holds back every new one while it waits and
     runs. The condition covers only the counters, the tickets and the level
     flag; it is released while a command waits and never held while one runs.
@@ -553,7 +558,11 @@ class HeavySlots:
             )
 
     def _may_start(self, exclusive: bool) -> bool:
-        if self._withheld or any(ticket.exclusive for ticket in self._running):
+        # As with admissions, pressure never takes the last slot: with no heavy
+        # command running, one starts (in its patient form) whatever the level.
+        if (self._withheld and self._running) or any(
+            ticket.exclusive for ticket in self._running
+        ):
             return False
         if exclusive:
             return not self._running
@@ -768,6 +777,7 @@ class ItemWorkflow:
         guard = _ParkGuard()
         marker = _PhaseMarker(self._ports.records, record, spec.item.item_id)
         result: ItemOutcome | None = None
+        continuations = resume.continuations if resume is not None else 0
         router = _LaneRouter(
             self._lanes(),
             self._ports.lane_state,
@@ -988,6 +998,11 @@ class ItemWorkflow:
             tracker_commit = self._ports.workspace.commit_tracker(
                 workspace, spec.item.item_id, item_commit
             )
+            # From here the worktree holds the accepted item's product and
+            # tracker commits, so a delivery that fails without a park resumes
+            # by delivering them, never by building or parking again.
+            marker.observe(head_commit=tracker_commit)
+            marker.write(ItemState.FINALISED.value)
             try:
                 finalise = self._deliver(
                     record,
@@ -1009,8 +1024,8 @@ class ItemWorkflow:
             self._ports.workspace.confirm_delivery(
                 workspace, finalise, spec.delivery_target_branch
             )
-            marker.observe(head_commit=tracker_commit)
-            self._advance(machine, marker, ItemState.FINALISED)
+            # The finalised marker was written before the delivery.
+            machine.transition(ItemState.FINALISED)
             self._event(
                 record,
                 "item.finalised",
@@ -1054,7 +1069,8 @@ class ItemWorkflow:
             raise
         except Exception as exc:
             result = self._end_on_error(
-                spec, machine, marker, record, workspace, seats, guard, exc, claimed, committed
+                spec, machine, marker, record, workspace, seats, guard, exc, claimed, committed,
+                continuations,
             )
             return result
         finally:
@@ -1096,8 +1112,13 @@ class ItemWorkflow:
         exc: Exception,
         claimed: bool,
         committed: bool,
+        continuations: int = 0,
     ) -> ItemOutcome:
         """End the item on an error scoped to it; the campaign goes on.
+
+        A builder seat that timed out, before the item commit and within
+        ``BUILDER_CONTINUATIONS``, is not an end: the item keeps its claim and
+        its worktree and is handed back for a fresh builder to continue.
 
         A claimed item parks with the error as its reason. Once its branch
         holds its product commit the park is recorded from the primary
@@ -1112,6 +1133,18 @@ class ItemWorkflow:
         structural = isinstance(exc, (EvidenceError, TypeError, ValueError))
         kill = getattr(exc, "seat_kill", None)
         result: ItemOutcome | None = None
+        if (
+            claimed
+            and not committed
+            and workspace is not None
+            and kill is not None
+            and kill.get("seat") == Seat.BUILDER.value
+            and kill.get("kind") == "timeout"
+            and continuations < BUILDER_CONTINUATIONS
+        ):
+            self._continue_builder(
+                spec, machine, marker, record, workspace, seats, guard, reason, continuations + 1
+            )
         if claimed:
             try:
                 if committed and workspace is not None:
@@ -1144,6 +1177,46 @@ class ItemWorkflow:
                 seats=tuple(seats),
             )
         return _with_tracker_failure(result, exc)
+
+    def _continue_builder(
+        self,
+        spec: ItemExecutionSpec,
+        machine: ItemStateMachine,
+        marker: _PhaseMarker,
+        record: RunRecordRef,
+        workspace: WorkspaceRef,
+        seats: list[SeatObservation],
+        guard: _ParkGuard,
+        reason: str,
+        continuation: int,
+    ) -> NoReturn:
+        """Hand a timed-out builder's item back to the campaign with its claim,
+        its worktree and its phase marker intact, by raising
+        ``BuilderContinuation``. Nothing is parked or snapshotted; the campaign
+        re-admits the item with the plan and a fresh builder seat continues in
+        the same worktree."""
+
+        guard.leave_worktree = True
+        plan = ResumePlan(
+            machine.current.value,
+            workspace.root,
+            marker.corrections,
+            record.run_id,
+            continuations=continuation,
+        )
+        self._event(
+            record,
+            "item.builder_continued",
+            spec.item.item_id,
+            payload={
+                "reason": reason,
+                "continuation": continuation,
+                "limit": BUILDER_CONTINUATIONS,
+                "marker_state": plan.marker_state,
+                "worktree_root": str(workspace.root),
+            },
+        )
+        raise BuilderContinuation(plan, reason)
 
     def _unfinished_item(
         self,
@@ -1261,7 +1334,8 @@ class ItemWorkflow:
 
         if resume.marker_state in _RESUME_REBUILD:
             verdict, diff, validation = self._build_validate_review(
-                spec, workspace, machine, marker, record, seats, router, context_refs=()
+                spec, workspace, machine, marker, record, seats, router, context_refs=(),
+                continuation=resume.continuations > 0,
             )
         else:
             verdict, diff, validation = self._validate_and_review(
@@ -1342,8 +1416,11 @@ class ItemWorkflow:
         seats: list[SeatObservation],
         router: _LaneRouter,
         context_refs: tuple[str, ...],
+        continuation: bool = False,
     ) -> tuple[ReviewVerdict, DiffEvidence, ValidationEvidence]:
-        self._run_builder(spec, workspace, machine, marker, record, seats, router, context_refs)
+        self._run_builder(
+            spec, workspace, machine, marker, record, seats, router, context_refs, continuation
+        )
         return self._validate_and_review(spec, workspace, machine, marker, record, seats, router)
 
     def _run_builder(
@@ -1356,6 +1433,7 @@ class ItemWorkflow:
         seats: list[SeatObservation],
         router: _LaneRouter,
         context_refs: tuple[str, ...],
+        continuation: bool = False,
     ) -> None:
         brief_path = self._workspace_brief(spec, workspace)
         builder_policy = self._workspace_policy(spec.tool_policy, workspace)
@@ -1373,7 +1451,7 @@ class ItemWorkflow:
                 workspace=workspace,
                 tool_policy=builder_policy,
                 instructions=render_seat_instructions(
-                    spec, Seat.BUILDER, context_refs, brief_path
+                    spec, Seat.BUILDER, context_refs, brief_path, continuation
                 ),
                 result_contract="builder-report-v1",
                 timeout_seconds=spec.seat_timeout_seconds,
@@ -2116,7 +2194,13 @@ class ItemWorkflow:
         # without one raises, as an invalid transition always has.
         resumed_delivery = delivery_park and machine.current is ItemState.FINALISED
         if machine.current not in {ItemState.PARKED, ItemState.RELEASED} and not resumed_delivery:
-            self._advance(machine, marker, ItemState.PARKED)
+            if delivery_park:
+                # The finalised marker stays until the tracker records the
+                # park, so a park that fails leaves an item the next campaign
+                # resumes by delivering.
+                machine.transition(ItemState.PARKED)
+            else:
+                self._advance(machine, marker, ItemState.PARKED)
         snapshot_dir = ""
         snapshotted: tuple[str, ...] = ()
         evidence = workspace if workspace is not None else evidence_workspace

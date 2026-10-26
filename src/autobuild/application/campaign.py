@@ -51,6 +51,7 @@ from autobuild.domain import (
 from autobuild.domain.models import (
     GIB,
     BatchValidationPolicy,
+    BuilderContinuation,
     CommandRequest,
     HoldCondition,
     HostReading,
@@ -128,10 +129,13 @@ class _ResumeAssessment:
 
 @dataclass(frozen=True, slots=True)
 class _ResumeCandidate:
-    """An interrupted claim found at launch, with the phase marker read then."""
+    """An interrupted claim found at launch, with the phase marker read then,
+    or an item of this campaign handed back for a builder continuation, with
+    the plan it resumes from."""
 
     item: WorkItem
     marker: PhaseMarker | None
+    plan: ResumePlan | None = None
 
 
 @dataclass(slots=True)
@@ -147,12 +151,15 @@ class _Flight:
 @dataclass(frozen=True, slots=True)
 class _Completion:
     """A finished worker's result. ``outcome`` is None when the claim was taken
-    by another writer; ``taken`` then carries the tracker's message."""
+    by another writer; ``taken`` then carries the tracker's message. It is
+    also None when a timed-out builder handed its item back; ``continuation``
+    then carries the plan the item is re-admitted with."""
 
     item_id: str
     outcome: ItemOutcome | None
     taken: str
     finished: float
+    continuation: ResumePlan | None = None
 
 
 class _Completions:
@@ -858,6 +865,7 @@ class CampaignRunner:
             error = self._absorb_all(campaign, schedule, completions.wait(), record, lease)
             if failure is None:
                 failure = error
+        self._keep_continuations(schedule)
         if not schedule.orphans_reported:
             self._report_orphans(record, schedule)
         if failure is not None:
@@ -948,7 +956,11 @@ class CampaignRunner:
                     record, schedule, HoldCondition.LEASE_RENEW_FAILED, str(renew_error)
                 )
                 return self._hold_released(campaign, record, schedule)
-        if not view.level.admits and schedule.pressure_episode == view.episode:
+        if (
+            not view.level.admits
+            and schedule.running
+            and schedule.pressure_episode == view.episode
+        ):
             # This episode's wait is already recorded and nothing can be
             # admitted until the level changes: skip reading the tracker.
             schedule.held = True
@@ -1046,6 +1058,14 @@ class CampaignRunner:
         at once when it is not in a good state to resume."""
 
         item, marker = candidate.item, candidate.marker
+        if candidate.plan is not None:
+            # A continuation of this campaign's own item: its worktree, claim
+            # and marker were kept by the item itself, so there is nothing to
+            # assess.
+            self._start(
+                campaign, item, spec_for, record, schedule, completions, resume=candidate.plan
+            )
+            return
         assessment = self._assess_resume(campaign, marker, schedule.statuses, context)
         if not assessment.good:
             schedule.outcomes.append(
@@ -1146,12 +1166,15 @@ class CampaignRunner:
 
         outcome: ItemOutcome | None = None
         taken = ""
+        continuation: ResumePlan | None = None
         try:
             prepared = spec if spec is not None else spec_for(item)
             if resume is None:
                 outcome = self._items.run(campaign, prepared, record)
             else:
                 outcome = self._items.run(campaign, prepared, record, resume=resume)
+        except BuilderContinuation as exc:
+            continuation = exc.plan
         except ClaimTaken as exc:
             if resume is None:
                 taken = str(exc) or "claim taken"
@@ -1161,7 +1184,32 @@ class CampaignRunner:
             outcome = self._worker_failure(item, resume, exc)
         finally:
             completions.post(
-                _Completion(item.item_id, outcome, taken, self._ports.schedule_clock())
+                _Completion(
+                    item.item_id, outcome, taken, self._ports.schedule_clock(), continuation
+                )
+            )
+
+    def _keep_continuations(self, schedule: _Schedule) -> None:
+        """A continuation the campaign stopped before admitting stays claimed
+        with its worktree and phase marker, so the next campaign resumes it.
+        It is reported as an unfinished item with its kept worktree."""
+
+        for candidate in [entry for entry in schedule.resumes if entry.plan is not None]:
+            schedule.resumes.remove(candidate)
+            plan = candidate.plan
+            assert plan is not None
+            reason = "timeout:builder; kept with its claim and worktree for the next campaign"
+            self._unfinished.add(
+                UnfinishedItem(candidate.item.item_id, str(plan.worktree_root), reason)
+            )
+            schedule.outcomes.append(
+                ItemOutcome(
+                    item_id=candidate.item.item_id,
+                    disposition=ItemDisposition.FAILED,
+                    states=(ItemState.CLAIMED,),
+                    reason=reason,
+                    title=candidate.item.title,
+                )
             )
 
     @staticmethod
@@ -1228,6 +1276,12 @@ class CampaignRunner:
         schedule.item_seconds += max(0.0, done.finished - flight.started)
         schedule.last_wait = None
         outcome = done.outcome
+        if done.continuation is not None:
+            # A timed-out builder's item comes back with its claim and its
+            # worktree; it is admitted again ahead of new work and is not an
+            # outcome yet.
+            schedule.resumes.append(_ResumeCandidate(flight.item, None, done.continuation))
+            return
         if outcome is None:
             schedule.taken.add(done.item_id)
             self._append(
@@ -1566,9 +1620,11 @@ class CampaignRunner:
         """True when the pressure level withholds an admission a free slot
         and an admissible item would otherwise allow. The first such hold of
         each pressure episode records one ``pressure`` wait, however many
-        items are queued."""
+        items are queued. Pressure never takes the last slot: with nothing of
+        its own running the campaign always admits one item, so pressure from
+        other work on the host cannot leave it idle."""
 
-        if view.level.admits:
+        if view.level.admits or not schedule.running:
             return False
         schedule.held = True
         if schedule.pressure_episode != view.episode:
