@@ -1,0 +1,1448 @@
+{
+ "lane_failover": {
+  "claims": [
+   [
+    "item-1",
+    "builder@lane-one"
+   ],
+   [
+    "item-1",
+    "builder@lane-two"
+   ],
+   [
+    "item-2",
+    "builder@lane-two"
+   ]
+  ],
+  "events": [
+   {
+    "event_type": "campaign.started",
+    "evidence_refs": [],
+    "item_id": null,
+    "payload": {
+     "delivery_mode": "protected-default",
+     "efforts": {},
+     "harness": "",
+     "item_bound": 3,
+     "manifest_path": "/fake/record/manifest.json",
+     "models": {},
+     "validator_id": ""
+    }
+   },
+   {
+    "event_type": "item.claimed",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "actor": "builder@lane-one",
+     "brief_ref": "plan",
+     "lane": "lane-one",
+     "title": "test item"
+    }
+   },
+   {
+    "event_type": "tracker.unpublished",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "note": "committed on the pull request branch",
+     "operation": "claim"
+    }
+   },
+   {
+    "event_type": "workspace.created",
+    "evidence_refs": [
+     "base"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "branch": "run",
+     "start_commit": "base",
+     "worktree_root": "/worktree"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:one"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "cost": null,
+     "duration_seconds": null,
+     "effort": null,
+     "ended_at": "end",
+     "exit_code": null,
+     "input_tokens": null,
+     "lane": "lane-one",
+     "model": "",
+     "model_class": "builder-class",
+     "outcome": "failed",
+     "output_tokens": null,
+     "raw_output_ref": "raw:one",
+     "seat": "builder",
+     "started_at": "start",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "lane.cooled",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "kind": "rate_limit",
+     "lane": "lane-one",
+     "reset_at": null,
+     "signature": "rate_limit"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:two"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "cost": null,
+     "duration_seconds": null,
+     "effort": null,
+     "ended_at": "end",
+     "exit_code": null,
+     "input_tokens": null,
+     "lane": "lane-two",
+     "model": "",
+     "model_class": "builder-class",
+     "outcome": "succeeded",
+     "output_tokens": null,
+     "raw_output_ref": "raw:two",
+     "seat": "builder",
+     "started_at": "start",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "validation.completed",
+    "evidence_refs": [
+     "stdout:1"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "changed_path_count": 0,
+     "duration_seconds": null,
+     "exit_code": 0,
+     "stderr_ref": "stderr:1",
+     "stdout_ref": "stdout:1",
+     "timed_out": false,
+     "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:review:1"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "cost": 0.01,
+     "duration_seconds": 2.0,
+     "effort": null,
+     "ended_at": "2026-09-03T00:00:02+00:00",
+     "exit_code": 0,
+     "input_tokens": 5,
+     "lane": "lane-two",
+     "model": "resolved-model",
+     "model_class": "reviewer-class",
+     "outcome": "succeeded",
+     "output_tokens": 3,
+     "raw_output_ref": "raw:review:1",
+     "seat": "reviewer",
+     "started_at": "2026-09-03T00:00:00+00:00",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "review.completed",
+    "evidence_refs": [
+     "verdict:1"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "blocking_finding_codes": [],
+     "decision": "pass",
+     "evidence_ref": "verdict:1",
+     "finding_codes": [],
+     "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "item.lane_changed",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "actor": "builder@lane-two",
+     "from_lane": "lane-one",
+     "lane": "lane-two"
+    }
+   },
+   {
+    "event_type": "tracker.unpublished",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "note": "committed on the pull request branch",
+     "operation": "claim"
+    }
+   },
+   {
+    "event_type": "item.finalised",
+    "evidence_refs": [
+     "item-commit",
+     "tracker-commit"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "item_commit": "item-commit",
+     "merged_commit": "merge-commit",
+     "pushed": true,
+     "seat_lanes": [
+      {
+       "lane": "lane-one",
+       "seat": "builder"
+      },
+      {
+       "lane": "lane-two",
+       "seat": "builder"
+      },
+      {
+       "lane": "lane-two",
+       "seat": "reviewer"
+      }
+     ],
+     "tracker_commit": "tracker-commit"
+    }
+   },
+   {
+    "event_type": "item.claimed",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "actor": "builder@lane-two",
+     "brief_ref": "plan",
+     "lane": "lane-two",
+     "title": "second"
+    }
+   },
+   {
+    "event_type": "tracker.unpublished",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "note": "committed on the pull request branch",
+     "operation": "claim"
+    }
+   },
+   {
+    "event_type": "workspace.created",
+    "evidence_refs": [
+     "base"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "branch": "run",
+     "start_commit": "base",
+     "worktree_root": "/worktree"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:two-b"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "cost": null,
+     "duration_seconds": null,
+     "effort": null,
+     "ended_at": "end",
+     "exit_code": null,
+     "input_tokens": null,
+     "lane": "lane-two",
+     "model": "",
+     "model_class": "builder-class",
+     "outcome": "succeeded",
+     "output_tokens": null,
+     "raw_output_ref": "raw:two-b",
+     "seat": "builder",
+     "started_at": "start",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "validation.completed",
+    "evidence_refs": [
+     "stdout:2"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "changed_path_count": 0,
+     "duration_seconds": null,
+     "exit_code": 0,
+     "stderr_ref": "stderr:2",
+     "stdout_ref": "stdout:2",
+     "timed_out": false,
+     "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:review:2"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "cost": 0.01,
+     "duration_seconds": 2.0,
+     "effort": null,
+     "ended_at": "2026-09-03T00:00:02+00:00",
+     "exit_code": 0,
+     "input_tokens": 5,
+     "lane": "lane-two",
+     "model": "resolved-model",
+     "model_class": "reviewer-class",
+     "outcome": "succeeded",
+     "output_tokens": 3,
+     "raw_output_ref": "raw:review:2",
+     "seat": "reviewer",
+     "started_at": "2026-09-03T00:00:00+00:00",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "review.completed",
+    "evidence_refs": [
+     "verdict:2"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "blocking_finding_codes": [],
+     "decision": "pass",
+     "evidence_ref": "verdict:2",
+     "finding_codes": [],
+     "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "item.finalised",
+    "evidence_refs": [
+     "item-commit",
+     "tracker-commit"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "item_commit": "item-commit",
+     "merged_commit": "merge-commit",
+     "pushed": true,
+     "seat_lanes": [
+      {
+       "lane": "lane-two",
+       "seat": "builder"
+      },
+      {
+       "lane": "lane-two",
+       "seat": "reviewer"
+      }
+     ],
+     "tracker_commit": "tracker-commit"
+    }
+   },
+   {
+    "event_type": "campaign.completed",
+    "evidence_refs": [],
+    "item_id": null,
+    "payload": {
+     "accepted": 2,
+     "failed": 0,
+     "parked": 0,
+     "report": "docs/campaigns/campaign.md",
+     "report_path": "/repo/docs/campaigns/campaign.md",
+     "stop_reason": "queue_dry"
+    }
+   }
+  ],
+  "outcomes": [
+   {
+    "disposition": "accepted",
+    "finalise": {
+     "diagnostics": [],
+     "item_commit": "item-commit",
+     "merged_commit": "merge-commit",
+     "pushed": true,
+     "tracker_commit": "tracker-commit"
+    },
+    "follow_ups": [],
+    "item_id": "item-1",
+    "lane_signature": null,
+    "lanes_exhausted": false,
+    "reason": null,
+    "seats": [
+     {
+      "cost": null,
+      "duration_seconds": null,
+      "effort": null,
+      "ended_at": "end",
+      "exit_code": null,
+      "input_tokens": null,
+      "lane": "lane-one",
+      "model": "",
+      "model_class": "builder-class",
+      "outcome": "failed",
+      "output_tokens": null,
+      "raw_output_ref": "raw:one",
+      "seat": "builder",
+      "started_at": "start",
+      "stderr_ref": ""
+     },
+     {
+      "cost": null,
+      "duration_seconds": null,
+      "effort": null,
+      "ended_at": "end",
+      "exit_code": null,
+      "input_tokens": null,
+      "lane": "lane-two",
+      "model": "",
+      "model_class": "builder-class",
+      "outcome": "succeeded",
+      "output_tokens": null,
+      "raw_output_ref": "raw:two",
+      "seat": "builder",
+      "started_at": "start",
+      "stderr_ref": ""
+     },
+     {
+      "cost": 0.01,
+      "duration_seconds": 2.0,
+      "effort": null,
+      "ended_at": "2026-09-03T00:00:02+00:00",
+      "exit_code": 0,
+      "input_tokens": 5,
+      "lane": "lane-two",
+      "model": "resolved-model",
+      "model_class": "reviewer-class",
+      "outcome": "succeeded",
+      "output_tokens": 3,
+      "raw_output_ref": "raw:review:1",
+      "seat": "reviewer",
+      "started_at": "2026-09-03T00:00:00+00:00",
+      "stderr_ref": ""
+     }
+    ],
+    "states": [
+     "ready",
+     "verified",
+     "claimed",
+     "isolated",
+     "built",
+     "validated",
+     "reviewed",
+     "finalised",
+     "released"
+    ],
+    "structural_failure": false,
+    "title": "test item",
+    "tracker_exit_code": null,
+    "tracker_stop": null
+   },
+   {
+    "disposition": "accepted",
+    "finalise": {
+     "diagnostics": [],
+     "item_commit": "item-commit",
+     "merged_commit": "merge-commit",
+     "pushed": true,
+     "tracker_commit": "tracker-commit"
+    },
+    "follow_ups": [],
+    "item_id": "item-2",
+    "lane_signature": null,
+    "lanes_exhausted": false,
+    "reason": null,
+    "seats": [
+     {
+      "cost": null,
+      "duration_seconds": null,
+      "effort": null,
+      "ended_at": "end",
+      "exit_code": null,
+      "input_tokens": null,
+      "lane": "lane-two",
+      "model": "",
+      "model_class": "builder-class",
+      "outcome": "succeeded",
+      "output_tokens": null,
+      "raw_output_ref": "raw:two-b",
+      "seat": "builder",
+      "started_at": "start",
+      "stderr_ref": ""
+     },
+     {
+      "cost": 0.01,
+      "duration_seconds": 2.0,
+      "effort": null,
+      "ended_at": "2026-09-03T00:00:02+00:00",
+      "exit_code": 0,
+      "input_tokens": 5,
+      "lane": "lane-two",
+      "model": "resolved-model",
+      "model_class": "reviewer-class",
+      "outcome": "succeeded",
+      "output_tokens": 3,
+      "raw_output_ref": "raw:review:2",
+      "seat": "reviewer",
+      "started_at": "2026-09-03T00:00:00+00:00",
+      "stderr_ref": ""
+     }
+    ],
+    "states": [
+     "ready",
+     "verified",
+     "claimed",
+     "isolated",
+     "built",
+     "validated",
+     "reviewed",
+     "finalised",
+     "released"
+    ],
+    "structural_failure": false,
+    "title": "second",
+    "tracker_exit_code": null,
+    "tracker_stop": null
+   }
+  ],
+  "progress": [
+   "campaign started: harness , models , efforts none, up to 3 items",
+   "item item-1 claimed: test item",
+   "item item-1 claim committed and not yet published; it goes out with the next push of its branch",
+   "item item-1 seat builder failed",
+   "item item-1 seat builder succeeded",
+   "item item-1 validation passed",
+   "item item-1 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-1 review pass with 0 finding(s)",
+   "item item-1 claim committed and not yet published; it goes out with the next push of its branch",
+   "item item-1 delivered: item item-commit, tracker tracker-commit, pushed True",
+   "item item-2 claimed: second",
+   "item item-2 claim committed and not yet published; it goes out with the next push of its branch",
+   "item item-2 seat builder succeeded",
+   "item item-2 validation passed",
+   "item item-2 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-2 review pass with 0 finding(s)",
+   "item item-2 delivered: item item-commit, tracker tracker-commit, pushed True",
+   "campaign completed: shipped 2, parked 0, failed 0; report docs/campaigns/campaign.md; stop queue_dry"
+  ],
+  "stop_reason": "queue_dry"
+ },
+ "mixed_queue": {
+  "claims": [
+   [
+    "item-1",
+    "builder@autobuild"
+   ],
+   [
+    "item-2",
+    "builder@autobuild"
+   ],
+   [
+    "item-3",
+    "builder@autobuild"
+   ]
+  ],
+  "events": [
+   {
+    "event_type": "campaign.started",
+    "evidence_refs": [],
+    "item_id": null,
+    "payload": {
+     "delivery_mode": "protected-default",
+     "efforts": {},
+     "harness": "",
+     "item_bound": 6,
+     "manifest_path": "/fake/record/manifest.json",
+     "models": {},
+     "validator_id": ""
+    }
+   },
+   {
+    "event_type": "item.claimed",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "actor": "builder@autobuild",
+     "brief_ref": "plan",
+     "lane": "",
+     "title": "test item"
+    }
+   },
+   {
+    "event_type": "workspace.created",
+    "evidence_refs": [
+     "base"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "branch": "run",
+     "start_commit": "base",
+     "worktree_root": "/worktree"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:b1"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "cost": null,
+     "duration_seconds": null,
+     "effort": null,
+     "ended_at": "end",
+     "exit_code": null,
+     "input_tokens": null,
+     "lane": "",
+     "model": "",
+     "model_class": "builder-class",
+     "outcome": "succeeded",
+     "output_tokens": null,
+     "raw_output_ref": "raw:b1",
+     "seat": "builder",
+     "started_at": "start",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "validation.completed",
+    "evidence_refs": [
+     "stdout:1"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "changed_path_count": 0,
+     "duration_seconds": null,
+     "exit_code": 0,
+     "stderr_ref": "stderr:1",
+     "stdout_ref": "stdout:1",
+     "timed_out": false,
+     "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:review:1"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "cost": 0.01,
+     "duration_seconds": 2.0,
+     "effort": null,
+     "ended_at": "2026-09-03T00:00:02+00:00",
+     "exit_code": 0,
+     "input_tokens": 5,
+     "lane": "",
+     "model": "resolved-model",
+     "model_class": "reviewer-class",
+     "outcome": "succeeded",
+     "output_tokens": 3,
+     "raw_output_ref": "raw:review:1",
+     "seat": "reviewer",
+     "started_at": "2026-09-03T00:00:00+00:00",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "review.completed",
+    "evidence_refs": [
+     "verdict:1"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "blocking_finding_codes": [],
+     "decision": "pass",
+     "evidence_ref": "verdict:1",
+     "finding_codes": [],
+     "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "item.finalised",
+    "evidence_refs": [
+     "item-commit",
+     "tracker-commit"
+    ],
+    "item_id": "item-1",
+    "payload": {
+     "item_commit": "item-commit",
+     "merged_commit": "merge-commit",
+     "pushed": true,
+     "seat_lanes": [
+      {
+       "lane": "",
+       "seat": "builder"
+      },
+      {
+       "lane": "",
+       "seat": "reviewer"
+      }
+     ],
+     "tracker_commit": "tracker-commit"
+    }
+   },
+   {
+    "event_type": "item.claimed",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "actor": "builder@autobuild",
+     "brief_ref": "plan",
+     "lane": "",
+     "title": "second"
+    }
+   },
+   {
+    "event_type": "workspace.created",
+    "evidence_refs": [
+     "base"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "branch": "run",
+     "start_commit": "base",
+     "worktree_root": "/worktree"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:b2"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "cost": null,
+     "duration_seconds": null,
+     "effort": null,
+     "ended_at": "end",
+     "exit_code": null,
+     "input_tokens": null,
+     "lane": "",
+     "model": "",
+     "model_class": "builder-class",
+     "outcome": "succeeded",
+     "output_tokens": null,
+     "raw_output_ref": "raw:b2",
+     "seat": "builder",
+     "started_at": "start",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "validation.completed",
+    "evidence_refs": [
+     "stdout:2a"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "changed_path_count": 0,
+     "duration_seconds": null,
+     "exit_code": 0,
+     "stderr_ref": "stderr:2a",
+     "stdout_ref": "stdout:2a",
+     "timed_out": false,
+     "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:review:2a"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "cost": 0.01,
+     "duration_seconds": 2.0,
+     "effort": null,
+     "ended_at": "2026-09-03T00:00:02+00:00",
+     "exit_code": 0,
+     "input_tokens": 5,
+     "lane": "",
+     "model": "resolved-model",
+     "model_class": "reviewer-class",
+     "outcome": "succeeded",
+     "output_tokens": 3,
+     "raw_output_ref": "raw:review:2a",
+     "seat": "reviewer",
+     "started_at": "2026-09-03T00:00:00+00:00",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "review.completed",
+    "evidence_refs": [
+     "verdict:2a"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "blocking_finding_codes": [
+      "finding"
+     ],
+     "decision": "correct",
+     "evidence_ref": "verdict:2a",
+     "finding_codes": [
+      "finding"
+     ],
+     "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "item.correcting",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "round": 1,
+     "triggering_evidence_ref": "verdict:2a"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:b2-fold"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "cost": null,
+     "duration_seconds": null,
+     "effort": null,
+     "ended_at": "end",
+     "exit_code": null,
+     "input_tokens": null,
+     "lane": "",
+     "model": "",
+     "model_class": "builder-class",
+     "outcome": "succeeded",
+     "output_tokens": null,
+     "raw_output_ref": "raw:b2-fold",
+     "seat": "builder",
+     "started_at": "start",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "validation.completed",
+    "evidence_refs": [
+     "stdout:2b"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "changed_path_count": 0,
+     "duration_seconds": null,
+     "exit_code": 0,
+     "stderr_ref": "stderr:2b",
+     "stdout_ref": "stdout:2b",
+     "timed_out": false,
+     "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:review:2b"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "cost": 0.01,
+     "duration_seconds": 2.0,
+     "effort": null,
+     "ended_at": "2026-09-03T00:00:02+00:00",
+     "exit_code": 0,
+     "input_tokens": 5,
+     "lane": "",
+     "model": "resolved-model",
+     "model_class": "reviewer-class",
+     "outcome": "succeeded",
+     "output_tokens": 3,
+     "raw_output_ref": "raw:review:2b",
+     "seat": "reviewer",
+     "started_at": "2026-09-03T00:00:00+00:00",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "review.completed",
+    "evidence_refs": [
+     "verdict:2b"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "blocking_finding_codes": [],
+     "decision": "pass",
+     "evidence_ref": "verdict:2b",
+     "finding_codes": [],
+     "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "item.finalised",
+    "evidence_refs": [
+     "item-commit",
+     "tracker-commit"
+    ],
+    "item_id": "item-2",
+    "payload": {
+     "item_commit": "item-commit",
+     "merged_commit": "merge-commit",
+     "pushed": true,
+     "seat_lanes": [
+      {
+       "lane": "",
+       "seat": "builder"
+      },
+      {
+       "lane": "",
+       "seat": "reviewer"
+      },
+      {
+       "lane": "",
+       "seat": "builder"
+      },
+      {
+       "lane": "",
+       "seat": "reviewer"
+      }
+     ],
+     "tracker_commit": "tracker-commit"
+    }
+   },
+   {
+    "event_type": "item.claimed",
+    "evidence_refs": [],
+    "item_id": "item-3",
+    "payload": {
+     "actor": "builder@autobuild",
+     "brief_ref": "plan",
+     "lane": "",
+     "title": "third"
+    }
+   },
+   {
+    "event_type": "workspace.created",
+    "evidence_refs": [
+     "base"
+    ],
+    "item_id": "item-3",
+    "payload": {
+     "branch": "run",
+     "start_commit": "base",
+     "worktree_root": "/worktree"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:b3"
+    ],
+    "item_id": "item-3",
+    "payload": {
+     "cost": null,
+     "duration_seconds": null,
+     "effort": null,
+     "ended_at": "end",
+     "exit_code": null,
+     "input_tokens": null,
+     "lane": "",
+     "model": "",
+     "model_class": "builder-class",
+     "outcome": "succeeded",
+     "output_tokens": null,
+     "raw_output_ref": "raw:b3",
+     "seat": "builder",
+     "started_at": "start",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "validation.completed",
+    "evidence_refs": [
+     "stdout:3"
+    ],
+    "item_id": "item-3",
+    "payload": {
+     "changed_path_count": 0,
+     "duration_seconds": null,
+     "exit_code": 0,
+     "stderr_ref": "stderr:3",
+     "stdout_ref": "stdout:3",
+     "timed_out": false,
+     "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:review:3a"
+    ],
+    "item_id": "item-3",
+    "payload": {
+     "cost": 0.01,
+     "duration_seconds": 2.0,
+     "effort": null,
+     "ended_at": "2026-09-03T00:00:02+00:00",
+     "exit_code": 0,
+     "input_tokens": 5,
+     "lane": "",
+     "model": "resolved-model",
+     "model_class": "reviewer-class",
+     "outcome": "succeeded",
+     "output_tokens": 3,
+     "raw_output_ref": "raw:review:3a",
+     "seat": "reviewer",
+     "started_at": "2026-09-03T00:00:00+00:00",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "review.completed",
+    "evidence_refs": [
+     "verdict:3a"
+    ],
+    "item_id": "item-3",
+    "payload": {
+     "blocking_finding_codes": [
+      "finding"
+     ],
+     "decision": "escalate",
+     "evidence_ref": "verdict:3a",
+     "finding_codes": [
+      "finding"
+     ],
+     "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "seat.completed",
+    "evidence_refs": [
+     "raw:review:3b"
+    ],
+    "item_id": "item-3",
+    "payload": {
+     "cost": 0.01,
+     "duration_seconds": 2.0,
+     "effort": null,
+     "ended_at": "2026-09-03T00:00:02+00:00",
+     "exit_code": 0,
+     "input_tokens": 5,
+     "lane": "",
+     "model": "resolved-model",
+     "model_class": "specialist-class",
+     "outcome": "succeeded",
+     "output_tokens": 3,
+     "raw_output_ref": "raw:review:3b",
+     "seat": "specialist",
+     "started_at": "2026-09-03T00:00:00+00:00",
+     "stderr_ref": ""
+    }
+   },
+   {
+    "event_type": "specialist.completed",
+    "evidence_refs": [
+     "verdict:3b"
+    ],
+    "item_id": "item-3",
+    "payload": {
+     "blocking_finding_codes": [
+      "finding"
+     ],
+     "decision": "park",
+     "evidence_ref": "verdict:3b",
+     "finding_codes": [
+      "finding"
+     ],
+     "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "item.parked",
+    "evidence_refs": [
+     "evidence:item-3-trajectory"
+    ],
+    "item_id": "item-3",
+    "payload": {
+     "corrections_completed": 0,
+     "last_state": "escalated",
+     "reason": "review disposition was park",
+     "seat_evidence": [
+      {
+       "outcome": "succeeded",
+       "raw_output_ref": "raw:b3",
+       "seat": "builder",
+       "stderr_ref": ""
+      },
+      {
+       "outcome": "succeeded",
+       "raw_output_ref": "raw:review:3a",
+       "seat": "reviewer",
+       "stderr_ref": ""
+      },
+      {
+       "outcome": "succeeded",
+       "raw_output_ref": "raw:review:3b",
+       "seat": "specialist",
+       "stderr_ref": ""
+      }
+     ],
+     "snapshot_path": "evidence/item-3-park",
+     "snapshotted_paths": [
+      "snapshot.json"
+     ],
+     "structural": false
+    }
+   },
+   {
+    "event_type": "item.triaged",
+    "evidence_refs": [],
+    "item_id": "item-4",
+    "payload": {
+     "nature": "machine",
+     "reason": "nature:machine"
+    }
+   },
+   {
+    "event_type": "item.parked",
+    "evidence_refs": [
+     "evidence:item-4-trajectory"
+    ],
+    "item_id": "item-4",
+    "payload": {
+     "corrections_completed": 0,
+     "last_state": "ready",
+     "reason": "nature:machine",
+     "structural": false
+    }
+   },
+   {
+    "event_type": "campaign.completed",
+    "evidence_refs": [],
+    "item_id": null,
+    "payload": {
+     "accepted": 2,
+     "failed": 0,
+     "parked": 2,
+     "report": "docs/campaigns/campaign.md",
+     "report_path": "/repo/docs/campaigns/campaign.md",
+     "stop_reason": "queue_dry"
+    }
+   }
+  ],
+  "outcomes": [
+   {
+    "disposition": "accepted",
+    "finalise": {
+     "diagnostics": [],
+     "item_commit": "item-commit",
+     "merged_commit": "merge-commit",
+     "pushed": true,
+     "tracker_commit": "tracker-commit"
+    },
+    "follow_ups": [],
+    "item_id": "item-1",
+    "lane_signature": null,
+    "lanes_exhausted": false,
+    "reason": null,
+    "seats": [
+     {
+      "cost": null,
+      "duration_seconds": null,
+      "effort": null,
+      "ended_at": "end",
+      "exit_code": null,
+      "input_tokens": null,
+      "lane": "",
+      "model": "",
+      "model_class": "builder-class",
+      "outcome": "succeeded",
+      "output_tokens": null,
+      "raw_output_ref": "raw:b1",
+      "seat": "builder",
+      "started_at": "start",
+      "stderr_ref": ""
+     },
+     {
+      "cost": 0.01,
+      "duration_seconds": 2.0,
+      "effort": null,
+      "ended_at": "2026-09-03T00:00:02+00:00",
+      "exit_code": 0,
+      "input_tokens": 5,
+      "lane": "",
+      "model": "resolved-model",
+      "model_class": "reviewer-class",
+      "outcome": "succeeded",
+      "output_tokens": 3,
+      "raw_output_ref": "raw:review:1",
+      "seat": "reviewer",
+      "started_at": "2026-09-03T00:00:00+00:00",
+      "stderr_ref": ""
+     }
+    ],
+    "states": [
+     "ready",
+     "verified",
+     "claimed",
+     "isolated",
+     "built",
+     "validated",
+     "reviewed",
+     "finalised",
+     "released"
+    ],
+    "structural_failure": false,
+    "title": "test item",
+    "tracker_exit_code": null,
+    "tracker_stop": null
+   },
+   {
+    "disposition": "accepted",
+    "finalise": {
+     "diagnostics": [],
+     "item_commit": "item-commit",
+     "merged_commit": "merge-commit",
+     "pushed": true,
+     "tracker_commit": "tracker-commit"
+    },
+    "follow_ups": [],
+    "item_id": "item-2",
+    "lane_signature": null,
+    "lanes_exhausted": false,
+    "reason": null,
+    "seats": [
+     {
+      "cost": null,
+      "duration_seconds": null,
+      "effort": null,
+      "ended_at": "end",
+      "exit_code": null,
+      "input_tokens": null,
+      "lane": "",
+      "model": "",
+      "model_class": "builder-class",
+      "outcome": "succeeded",
+      "output_tokens": null,
+      "raw_output_ref": "raw:b2",
+      "seat": "builder",
+      "started_at": "start",
+      "stderr_ref": ""
+     },
+     {
+      "cost": 0.01,
+      "duration_seconds": 2.0,
+      "effort": null,
+      "ended_at": "2026-09-03T00:00:02+00:00",
+      "exit_code": 0,
+      "input_tokens": 5,
+      "lane": "",
+      "model": "resolved-model",
+      "model_class": "reviewer-class",
+      "outcome": "succeeded",
+      "output_tokens": 3,
+      "raw_output_ref": "raw:review:2a",
+      "seat": "reviewer",
+      "started_at": "2026-09-03T00:00:00+00:00",
+      "stderr_ref": ""
+     },
+     {
+      "cost": null,
+      "duration_seconds": null,
+      "effort": null,
+      "ended_at": "end",
+      "exit_code": null,
+      "input_tokens": null,
+      "lane": "",
+      "model": "",
+      "model_class": "builder-class",
+      "outcome": "succeeded",
+      "output_tokens": null,
+      "raw_output_ref": "raw:b2-fold",
+      "seat": "builder",
+      "started_at": "start",
+      "stderr_ref": ""
+     },
+     {
+      "cost": 0.01,
+      "duration_seconds": 2.0,
+      "effort": null,
+      "ended_at": "2026-09-03T00:00:02+00:00",
+      "exit_code": 0,
+      "input_tokens": 5,
+      "lane": "",
+      "model": "resolved-model",
+      "model_class": "reviewer-class",
+      "outcome": "succeeded",
+      "output_tokens": 3,
+      "raw_output_ref": "raw:review:2b",
+      "seat": "reviewer",
+      "started_at": "2026-09-03T00:00:00+00:00",
+      "stderr_ref": ""
+     }
+    ],
+    "states": [
+     "ready",
+     "verified",
+     "claimed",
+     "isolated",
+     "built",
+     "validated",
+     "reviewed",
+     "correcting",
+     "built",
+     "validated",
+     "reviewed",
+     "finalised",
+     "released"
+    ],
+    "structural_failure": false,
+    "title": "second",
+    "tracker_exit_code": null,
+    "tracker_stop": null
+   },
+   {
+    "disposition": "parked",
+    "finalise": {
+     "diagnostics": [],
+     "item_commit": null,
+     "merged_commit": "merge-commit",
+     "pushed": true,
+     "tracker_commit": "tracker-commit"
+    },
+    "follow_ups": [],
+    "item_id": "item-3",
+    "lane_signature": null,
+    "lanes_exhausted": false,
+    "reason": "review disposition was park",
+    "seats": [
+     {
+      "cost": null,
+      "duration_seconds": null,
+      "effort": null,
+      "ended_at": "end",
+      "exit_code": null,
+      "input_tokens": null,
+      "lane": "",
+      "model": "",
+      "model_class": "builder-class",
+      "outcome": "succeeded",
+      "output_tokens": null,
+      "raw_output_ref": "raw:b3",
+      "seat": "builder",
+      "started_at": "start",
+      "stderr_ref": ""
+     },
+     {
+      "cost": 0.01,
+      "duration_seconds": 2.0,
+      "effort": null,
+      "ended_at": "2026-09-03T00:00:02+00:00",
+      "exit_code": 0,
+      "input_tokens": 5,
+      "lane": "",
+      "model": "resolved-model",
+      "model_class": "reviewer-class",
+      "outcome": "succeeded",
+      "output_tokens": 3,
+      "raw_output_ref": "raw:review:3a",
+      "seat": "reviewer",
+      "started_at": "2026-09-03T00:00:00+00:00",
+      "stderr_ref": ""
+     },
+     {
+      "cost": 0.01,
+      "duration_seconds": 2.0,
+      "effort": null,
+      "ended_at": "2026-09-03T00:00:02+00:00",
+      "exit_code": 0,
+      "input_tokens": 5,
+      "lane": "",
+      "model": "resolved-model",
+      "model_class": "specialist-class",
+      "outcome": "succeeded",
+      "output_tokens": 3,
+      "raw_output_ref": "raw:review:3b",
+      "seat": "specialist",
+      "started_at": "2026-09-03T00:00:00+00:00",
+      "stderr_ref": ""
+     }
+    ],
+    "states": [
+     "ready",
+     "verified",
+     "claimed",
+     "isolated",
+     "built",
+     "validated",
+     "reviewed",
+     "escalated",
+     "parked"
+    ],
+    "structural_failure": false,
+    "title": "third",
+    "tracker_exit_code": null,
+    "tracker_stop": null
+   },
+   {
+    "disposition": "parked",
+    "finalise": null,
+    "follow_ups": [],
+    "item_id": "item-4",
+    "lane_signature": null,
+    "lanes_exhausted": false,
+    "reason": "nature:machine",
+    "seats": [],
+    "states": [
+     "ready",
+     "parked"
+    ],
+    "structural_failure": false,
+    "title": "machine item",
+    "tracker_exit_code": null,
+    "tracker_stop": null
+   }
+  ],
+  "progress": [
+   "campaign started: harness , models , efforts none, up to 6 items",
+   "item item-1 claimed: test item",
+   "item item-1 seat builder succeeded",
+   "item item-1 validation passed",
+   "item item-1 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-1 review pass with 0 finding(s)",
+   "item item-1 delivered: item item-commit, tracker tracker-commit, pushed True",
+   "item item-2 claimed: second",
+   "item item-2 seat builder succeeded",
+   "item item-2 validation passed",
+   "item item-2 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-2 review correct with 1 finding(s)",
+   "item item-2 correction round 1",
+   "item item-2 seat builder succeeded",
+   "item item-2 validation passed",
+   "item item-2 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-2 review pass with 0 finding(s)",
+   "item item-2 delivered: item item-commit, tracker tracker-commit, pushed True",
+   "item item-3 claimed: third",
+   "item item-3 seat builder succeeded",
+   "item item-3 validation passed",
+   "item item-3 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-3 review escalate with 1 finding(s)",
+   "item item-3 seat specialist succeeded in 0.0 min, cost 0.01",
+   "item item-3 parked: review disposition was park",
+   "item item-4 parked: nature:machine",
+   "campaign completed: shipped 2, parked 2, failed 0; report docs/campaigns/campaign.md; stop queue_dry"
+  ],
+  "stop_reason": "queue_dry"
+ }
+}

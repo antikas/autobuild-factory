@@ -12,7 +12,7 @@ Choose the mode first. When the request names one ("run it with the application"
 
 Use the repository passed by the user. A bare invocation means the current repository only. Read its instructions and identify the operational tracker once. Use `pinax status --json` when `.ergon/` exists and [Pinax](https://github.com/antikas/pinax-tracker) is available. Otherwise check the supported `BACKLOG.md` or `docs/BACKLOG.md` table described in `docs/running-autobuild.md`. The application selects and takes the next item.
 
-Build the run configuration from approved project facts. Prefer a committed `.autobuild.toml`. When it is absent, create a temporary profile from the repository's declared validator and the models available in the current harness. Ask only if those facts are ambiguous. Keep the temporary profile in the caller's permitted temporary area. Do not add it to the project.
+Build the run configuration from approved project facts. Prefer a committed `.autobuild.toml`. When it is absent, create a temporary profile from the repository's declared validator and the models available in the current harness. Ask only if those facts are ambiguous. Keep the temporary profile in the caller's permitted temporary area. Do not add it to the project. A profile without `[run] concurrency` builds as many items at once as the host allows and backs off under host pressure; write `concurrency = 1` only when the owner asks for one item at a time. A `BACKLOG.md` queue is the exception: it builds one item at a time unless the profile names an integer, because the backlog cannot express dependencies.
 
 Select the harness that is running this skill: `claude-code`, `codex`, or `github-copilot`. Launch:
 
@@ -22,10 +22,10 @@ autobuild run --repository <repo> --profile <profile> --harness <current-harness
 
 Use `--delivery-mode protected-default` only when the human has approved a merge and push to the repository's default branch. The local PR mode does not push unless the human also supplies `--push-current-branch`.
 
-If `autobuild` is not installed, run version 0.8.0 from the public release:
+If `autobuild` is not installed, run version 0.9.0 from the public release:
 
 ```text
-uvx --from autobuild-factory==0.8.0 autobuild run ...
+uvx --from autobuild-factory==0.9.0 autobuild run ...
 ```
 
 Supply `--scratch-root` only when the caller or machine has provided one. With no override, AutoBuild uses the operating system's standard temporary directory.
@@ -34,4 +34,4 @@ When the user supplies an approved `autobuild.refill-plan.v1` file, pass it with
 
 Do not reproduce campaign states, item states, review loops, close logic, Git delivery or tracker write-back in this skill. Configuration and invocation stay here; sequencing and policy stay in the Python package.
 
-Return the application's outcome in plain language: what shipped, what parked, what failed and the reported stop reason. Preserve its run record for diagnosis.
+Return the application's outcome in plain language: what shipped, what parked, what failed and the reported stop reason. No single item error ends a campaign; it stops on `queue_dry`, `item_bound` or `hold_limit`, and the report lists any unfinished item with its kept worktree and every hold with its duration. Preserve its run record for diagnosis.

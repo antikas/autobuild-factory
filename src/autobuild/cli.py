@@ -4,15 +4,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
 
 from autobuild.adapters.progress import ProgressLogReader, is_completion_line
-from autobuild.bootstrap.composition import preflight_report, read_usage, run_campaign
+from autobuild.bootstrap.composition import (
+    host_capacity,
+    preflight_report,
+    read_usage,
+    run_campaign,
+)
 from autobuild.bootstrap.environment import resolve_runs_root
-from autobuild.bootstrap.profile import ProfileOverrides, load_settings
-from autobuild.domain import DeliveryMode, ItemDisposition, UsageReading
+from autobuild.bootstrap.profile import ConfigurationError, ProfileOverrides, load_settings
+from autobuild.domain import (
+    CapacityPolicy,
+    DeliveryMode,
+    HostCapacity,
+    HostReading,
+    ItemDisposition,
+    UsageReading,
+    bytes_to_gib,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -69,6 +83,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     usage.add_argument("--json", action="store_true", help="Print the normalised reading as JSON.")
     usage.add_argument("--scratch-root", help="Directory for the meter command's output files.")
+
+    host = subcommands.add_parser(
+        "host",
+        help="Read the host's CPU and memory once and print the derived concurrency",
+    )
+    host.add_argument("--repository", default=".")
+    host.add_argument("--profile")
+    host.add_argument("--json", action="store_true", help="Print the reading and capacity as JSON.")
+    host.add_argument(
+        "--sample-seconds",
+        type=float,
+        default=1.0,
+        help="Window over which CPU busy is sampled (default 1).",
+    )
 
     preflight = subcommands.add_parser(
         "preflight",
@@ -235,6 +263,96 @@ def _usage(args: argparse.Namespace, read=read_usage) -> int:
     return 0 if reading.ok else 1
 
 
+def _gib(value: int | None) -> float | None:
+    gib = bytes_to_gib(value)
+    return None if gib is None else round(gib, 3)
+
+
+def host_payload(
+    reading: HostReading, policy: CapacityPolicy, capacity: HostCapacity
+) -> dict[str, object]:
+    """The reading and derived capacity ``autobuild host --json`` prints.
+    Memory is in GiB."""
+
+    busy = reading.cpu_busy_percent
+    return {
+        "schema": "autobuild.host.v1",
+        "reading": {
+            "logical_cpus": reading.logical_cpus,
+            "cpu_busy_percent": None if busy is None else round(busy, 1),
+            "sample_seconds": reading.sample_seconds,
+            "memory_total_gib": _gib(reading.memory_total_bytes),
+            "memory_available_gib": _gib(reading.memory_available_bytes),
+            "commit_total_gib": _gib(reading.commit_total_bytes),
+            "commit_available_gib": _gib(reading.commit_available_bytes),
+            "measured": reading.measured(),
+            "diagnostics": list(reading.diagnostics),
+        },
+        "profile": {
+            "concurrency": "auto" if policy.concurrency is None else policy.concurrency,
+            "heavy_concurrency": "auto"
+            if policy.heavy_concurrency is None
+            else policy.heavy_concurrency,
+            "reserve_gb": policy.reserve_gib,
+            "per_item_gb": policy.per_item_gib,
+            "max_concurrency": policy.max_concurrency,
+        },
+        "capacity": {
+            "items": capacity.items,
+            "heavy": capacity.heavy,
+            "items_source": capacity.items_source,
+            "heavy_source": capacity.heavy_source,
+            "cpu_term": capacity.cpu_term,
+            "memory_term": capacity.memory_term,
+        },
+    }
+
+
+def _host(args: argparse.Namespace, read=host_capacity) -> int:
+    """Print one host reading and the derived capacity; exit 0, or 2 when the
+    profile cannot be read or the sample window is not positive."""
+
+    if not (math.isfinite(args.sample_seconds) and args.sample_seconds > 0):
+        print("autobuild host: --sample-seconds must be a positive finite number", file=sys.stderr)
+        return 2
+    try:
+        reading, policy, capacity = read(args.repository, args.profile, args.sample_seconds)
+    except ConfigurationError as exc:
+        print(f"autobuild host: {exc}", file=sys.stderr)
+        return 2
+    payload = host_payload(reading, policy, capacity)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    shown = payload["reading"]
+
+    def text(value: object, unit: str = "") -> str:
+        return "unmeasured" if value is None else f"{value}{unit}"
+
+    print(f"logical cpus: {text(shown['logical_cpus'])}")
+    busy_line = f"cpu busy: {text(shown['cpu_busy_percent'], '%')}"
+    if shown["cpu_busy_percent"] is not None:
+        busy_line += f" over {reading.sample_seconds:g}s"
+    print(busy_line)
+    print(
+        f"memory available: {text(shown['memory_available_gib'], ' GiB')} "
+        f"of {text(shown['memory_total_gib'], ' GiB')}"
+    )
+    print(
+        f"commit available: {text(shown['commit_available_gib'], ' GiB')} "
+        f"of {text(shown['commit_total_gib'], ' GiB')}"
+    )
+    for diagnostic in reading.diagnostics:
+        print(f"note: {diagnostic}")
+    print(
+        f"concurrency: items {capacity.items} ({capacity.items_source}), "
+        f"heavy {capacity.heavy} ({capacity.heavy_source})"
+    )
+    if capacity.items_source == "auto":
+        print("run.concurrency is auto, the default; set it to 1 to build one item at a time")
+    return 0
+
+
 def _preflight(args: argparse.Namespace, report=preflight_report) -> int:
     """Print the lane probes and the preflight; exit 0 when the launch would
     pass, 1 when a check fails and 2 when the profile or runtime cannot load."""
@@ -267,6 +385,8 @@ def main(argv: list[str] | None = None) -> int:
         return _usage(args)
     if args.command == "preflight":
         return _preflight(args)
+    if args.command == "host":
+        return _host(args)
     try:
         settings = load_settings(args.repository, args.profile, _overrides(args))
         result = run_campaign(

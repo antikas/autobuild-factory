@@ -3,10 +3,12 @@
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import Event
 
 from autobuild.ports import (
     CommandPort,
     HarnessPort,
+    HostResourcePort,
     KnowledgePort,
     LaneStatePort,
     LeasePort,
@@ -31,6 +33,14 @@ class _NoOpProgressPort:
 
 
 _NO_OP_PROGRESS: ProgressPort = _NoOpProgressPort()
+
+
+def _no_item_environment(item_id: str) -> tuple[tuple[str, str], ...]:
+    return ()
+
+
+def _wait_for_event(event: Event, seconds: float) -> bool:
+    return event.wait(seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,3 +96,26 @@ class WorkflowPorts:
     # How a seat waits before it re-reads a meter that failed under the refuse
     # policy. Tests inject a recorder so no test sleeps.
     usage_retry_wait: Callable[[float], None] = time.sleep
+    # The monotonic clock, in seconds, that ages a lane's shared meter reading.
+    # Tests inject a fake clock.
+    usage_clock: Callable[[], float] = time.monotonic
+    # The environment one item's validator command runs with, so concurrent
+    # items never share temporary directories. The production composition maps
+    # each item to its own directories under the scratch root; the default adds
+    # nothing.
+    item_environment: Callable[[str], tuple[tuple[str, str], ...]] = _no_item_environment
+    # The monotonic clock, in seconds, that times each item and the campaign's
+    # makespan, and the wait the tracker lease heartbeat sleeps on between
+    # renewals: it returns True once the event is set (the campaign is
+    # ending) and False after ``seconds``. Tests inject a fake clock for both.
+    schedule_clock: Callable[[], float] = time.monotonic
+    heartbeat_wait: Callable[[Event, float], bool] = _wait_for_event
+    # The host resource readings a campaign above one item at a time watches
+    # for system-wide pressure, or None to run without the pressure monitor.
+    # The monitor times its samples with ``schedule_clock`` and sleeps between
+    # them on ``pressure_wait``, which behaves as ``heartbeat_wait`` does.
+    host: HostResourcePort | None = None
+    pressure_wait: Callable[[Event, float], bool] = _wait_for_event
+    # The wait a hold on admissions sleeps on until its next probe, timed with
+    # ``schedule_clock``; it behaves as ``heartbeat_wait`` does.
+    hold_wait: Callable[[Event, float], bool] = _wait_for_event

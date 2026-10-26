@@ -511,16 +511,21 @@ def test_tracker_park_error_fails_item_nonstructurally_and_campaign_continues() 
     assert ports.workspace.released == []
 
 
-def test_incomplete_review_evidence_stops_the_campaign_structurally() -> None:
+def test_incomplete_review_evidence_parks_the_item_structurally_and_the_next_builds() -> None:
     incomplete = SeatResult("review", SeatOutcome.SUCCEEDED, None, "raw", SeatUsage(), "start", "end")
-    ports = make_ports([builder(), incomplete], [command()], diff_count=1)
-    ports.tracker.queue.append(item())
+    ports = make_ports(
+        [builder(), incomplete, builder("b2"), verdict_result("item-2", ReviewDecision.PASS, "2")],
+        [command(), command(suffix="2")],
+        diff_count=2,
+    )
+    ports.tracker.queue.extend([item(), WorkItem("item-2", "second", "plan", ("passes",))])
 
-    outcome = CampaignRunner(ports).run(campaign(), lambda selected: spec(selected))
+    outcome = CampaignRunner(ports).run(campaign(max_items=3), lambda selected: spec(selected))
 
-    assert outcome.stop_reason is CampaignStopReason.STRUCTURAL_FAILURE
+    assert outcome.stop_reason is CampaignStopReason.QUEUE_DRY
     assert outcome.items[0].structural_failure is True
     assert outcome.items[0].disposition is ItemDisposition.PARKED
+    assert outcome.items[1].disposition is ItemDisposition.ACCEPTED
 
 
 def _phase_states(ports: WorkflowPorts, item_id: str = "item-1") -> list[str]:
@@ -615,16 +620,21 @@ def test_owner_gated_item_offered_by_the_tracker_parks_with_its_class() -> None:
     assert ("item-1", "nature:owner-gated") in ports.tracker.parked
 
 
-def test_unreachable_merged_commit_is_a_structural_failure() -> None:
+def test_unreachable_merged_commit_is_a_structural_failure_parked_from_the_primary() -> None:
     ports = make_ports([builder(), review(ReviewDecision.PASS)], [command()], diff_count=1)
     ports.workspace.unreachable_merge = True
     ports.tracker.queue.append(item())
 
     outcome = CampaignRunner(ports).run(campaign(), lambda selected: spec(selected))
 
-    assert outcome.stop_reason is CampaignStopReason.STRUCTURAL_FAILURE
+    assert outcome.stop_reason is CampaignStopReason.ITEM_BOUND
     assert outcome.items[0].structural_failure is True
+    assert outcome.items[0].disposition is ItemDisposition.PARKED
     assert "not reachable" in (outcome.items[0].reason or "")
+    # The branch holds the item's product commit, so the park is recorded from
+    # the primary checkout and the worktree is kept, never delivered.
+    assert ports.workspace.released == []
+    assert len(ports.workspace.delivered) == 1
 
 
 def test_dry_queue_refill_creates_proposals_and_fog_but_no_work() -> None:
@@ -865,8 +875,9 @@ def test_a_raising_item_workflow_still_leaves_a_completed_run_record(tmp_path: P
         campaign(max_items=1), lambda selected: spec(selected)
     )
 
-    assert outcome.stop_reason is CampaignStopReason.STRUCTURAL_FAILURE
+    assert outcome.stop_reason is CampaignStopReason.ITEM_BOUND
     assert outcome.items[0].disposition is ItemDisposition.FAILED
+    assert outcome.items[0].structural_failure is True
     run_dirs = list((tmp_path / "runs").iterdir())
     assert (run_dirs[0] / "report.txt").is_file()
     events = [
@@ -919,7 +930,7 @@ def test_excluded_item_after_refill_is_never_claimed_and_queue_ends_dry() -> Non
     assert len(ports.tracker.proposals) == 1
 
 
-def test_out_of_allow_list_next_item_stops_with_scope_fence_violation() -> None:
+def test_out_of_allow_list_next_item_is_never_claimed_and_the_fenced_queue_is_dry() -> None:
     out_of_scope = WorkItem("c", "Out of scope", "plan", ("passes",))
     ports = make_ports([], [], diff_count=0)
     base = FakeTrackerAdapter(identity("tracker"), queue=[out_of_scope])
@@ -939,9 +950,13 @@ def test_out_of_allow_list_next_item_stops_with_scope_fence_violation() -> None:
         campaign(selection=selection), lambda selected: spec(selected)
     )
 
-    assert outcome.stop_reason is CampaignStopReason.SCOPE_FENCE_VIOLATION
+    assert outcome.stop_reason is CampaignStopReason.QUEUE_DRY
     assert base.claims == []
     assert outcome.items == ()
+    violations = [
+        event for event in ports.records.events if event.event_type == "campaign.scope_fence_violation"
+    ]
+    assert len(violations) == 1 and "'c'" in violations[0].payload["error"]
 
 
 def test_report_lists_a_blocked_allowed_item_with_reason_blocked() -> None:
@@ -1159,7 +1174,7 @@ def test_builder_rate_limit_reruns_on_lane_two_and_the_item_is_accepted() -> Non
     assert delivered["reviewer"] == "lane-two"
 
 
-def test_signals_on_both_lanes_park_with_the_signature_and_stop_lanes_exhausted() -> None:
+def test_signals_on_both_lanes_park_with_the_signature_and_hold_lanes_exhausted() -> None:
     ports, state = lane_ports(
         [failed_builder("one")],
         [failed_builder("two")],
@@ -1170,9 +1185,13 @@ def test_signals_on_both_lanes_park_with_the_signature_and_stop_lanes_exhausted(
     )
     ports.tracker.queue.append(item())
 
-    outcome = CampaignRunner(ports).run(campaign(max_items=2), lambda selected: spec(selected))
+    outcome = CampaignRunner(ports).run(campaign(max_items=1), lambda selected: spec(selected))
 
-    assert outcome.stop_reason is CampaignStopReason.LANES_EXHAUSTED
+    # The campaign never stops for exhausted lanes: it holds admissions, and
+    # here the item bound ends it first.
+    assert outcome.stop_reason is CampaignStopReason.ITEM_BOUND
+    held = [event for event in ports.records.events if event.event_type == "campaign.hold_started"]
+    assert [event.payload["condition"] for event in held] == ["lanes_exhausted"]
     assert outcome.items[0].disposition is ItemDisposition.PARKED
     assert outcome.items[0].lanes_exhausted is True
     assert outcome.items[0].lane_signature == "rate_limit"
@@ -1805,30 +1824,32 @@ def test_a_claim_taken_by_another_writer_selects_the_next_item() -> None:
         (False, 7, CampaignStopReason.TRACKER_REFUSED),
     ),
 )
-def test_a_tracker_stop_on_claim_stops_the_campaign_with_the_code_and_message(
+def test_a_tracker_failure_on_claim_fails_only_the_item_with_the_code_and_message(
     environment: bool, code: int | None, reason: CampaignStopReason
 ) -> None:
     ports = make_ports([], [], diff_count=0)
-    ports.tracker.queue.extend([item(), WorkItem("item-2", "second", "plan", ("passes",))])
+    ports.tracker.queue.append(item())
     message = f"pinax claim exit {code}: tracker message"
     ports.tracker.claim_errors["item-1"] = TrackerStop(message, code=code, environment=environment)
 
-    outcome = CampaignRunner(ports).run(campaign(max_items=2), lambda selected: spec(selected))
+    outcome = CampaignRunner(ports).run(campaign(max_items=1), lambda selected: spec(selected))
 
-    assert outcome.stop_reason is reason
+    assert outcome.stop_reason is CampaignStopReason.ITEM_BOUND
     assert [entry.item_id for entry in outcome.items] == ["item-1"]
     assert outcome.items[0].disposition is ItemDisposition.FAILED
     assert outcome.items[0].reason == message
+    assert outcome.items[0].tracker_stop is reason
     assert ports.tracker.claims == []
     assert ports.tracker.parked == []
     assert ports.workspace.created == []
-    stopped = next(
-        event for event in ports.records.events if event.event_type == "campaign.tracker_stopped"
+    failed = next(
+        event for event in ports.records.events if event.event_type == "item.tracker_failed"
     )
-    assert stopped.payload == {"stop_reason": reason.value, "exit_code": code, "error": message}
+    assert failed.payload == {"kind": reason.value, "exit_code": code, "error": message}
+    assert ports.tracker.recoveries == 1
 
 
-def test_a_tracker_stop_on_close_keeps_the_worktree_and_never_parks() -> None:
+def test_a_tracker_failure_on_close_parks_from_the_primary_and_keeps_the_worktree() -> None:
     class _CloseRefusingTracker(FakeTrackerAdapter):
         def close(self, evidence, item_commit, workspace, actor):
             raise TrackerStop("pinax done exit 5: push rejected", code=5, environment=False)
@@ -1843,18 +1864,21 @@ def test_a_tracker_stop_on_close_keeps_the_worktree_and_never_parks() -> None:
         ports.knowledge,
         lease=ports.lease,
     )
-    ports.tracker.queue.extend([item(), WorkItem("item-2", "second", "plan", ("passes",))])
+    ports.tracker.queue.append(item())
 
-    outcome = CampaignRunner(ports).run(campaign(max_items=2), lambda selected: spec(selected))
+    outcome = CampaignRunner(ports).run(campaign(max_items=1), lambda selected: spec(selected))
 
-    assert outcome.stop_reason is CampaignStopReason.TRACKER_REFUSED
+    assert outcome.stop_reason is CampaignStopReason.ITEM_BOUND
     assert [entry.item_id for entry in outcome.items] == ["item-1"]
+    assert outcome.items[0].disposition is ItemDisposition.PARKED
     assert "exit 5" in (outcome.items[0].reason or "")
-    assert ports.tracker.parked == []
+    assert outcome.items[0].tracker_stop is CampaignStopReason.TRACKER_REFUSED
+    assert [item_id for item_id, _ in ports.tracker.parked] == ["item-1"]
     assert ports.workspace.released == []
+    assert ports.workspace.delivered == []
     assert [item_id for item_id, _ in ports.tracker.claims] == ["item-1"]
     states = outcome.items[0].states
-    assert states[-1] is ItemState.REVIEWED
+    assert states[-1] is ItemState.PARKED
     assert ItemState.CLAIMED in states
     assert _worktree_surfaces(ports) == [(SurfaceKind.WORKTREE, Path("/worktree"))]
 

@@ -362,7 +362,10 @@ def test_with_both_lanes_cooled_the_item_parks_cleanly(tmp_path: Path) -> None:
 
     outcome = CampaignRunner(ports).run(campaign(), lambda item: spec())
 
-    assert outcome.stop_reason is CampaignStopReason.LANES_EXHAUSTED
+    # Exhausted lanes hold admissions; the item bound of one ends the campaign.
+    assert outcome.stop_reason is CampaignStopReason.ITEM_BOUND
+    held = [event for event in ports.records.events if event.event_type == "campaign.hold_started"]
+    assert [event.payload["condition"] for event in held] == ["lanes_exhausted"]
     assert outcome.items[0].disposition is ItemDisposition.PARKED
     assert outcome.items[0].lanes_exhausted
     assert ports.tracker.parked[0][1].startswith("claude-sdk:quota")

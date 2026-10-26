@@ -27,6 +27,21 @@ def _under(path: str, tracker_paths: tuple[str, ...]) -> bool:
     return any(path == tracker or path.startswith(tracker + "/") for tracker in tracker_paths)
 
 
+def only_tracker_changes(git: Git, root: Path, tracker_paths: tuple[str, ...]) -> bool:
+    """True when the checkout is dirty and every dirty path is a tracker path:
+    the shape a tracker write leaves when it was appended and not committed."""
+
+    status = git(root, "status", "--porcelain", "--untracked-files=all")
+    # A rename or copy line reads "old -> new"; both sides must be tracker paths.
+    dirty = [
+        path
+        for line in status.splitlines()
+        if line[3:]
+        for path in line[3:].split(" -> ")
+    ]
+    return bool(dirty) and all(_under(path, tracker_paths) for path in dirty)
+
+
 def require_no_foreign_changes(git: Git, root: Path, tracker_paths: tuple[str, ...]) -> None:
     """Refuse a tracker write while the checkout holds staged or modified
     non-tracker files, which a tracker's own commit could sweep in."""

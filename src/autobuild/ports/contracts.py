@@ -18,6 +18,7 @@ from autobuild.domain import (
     FinaliseRequest,
     FinaliseResult,
     FogRecord,
+    HostReading,
     LaneCooling,
     LaneSignal,
     LeaseGrant,
@@ -42,7 +43,12 @@ from autobuild.domain import (
     WorktreeSnapshot,
     WorktreeStatus,
 )
-from autobuild.domain.models import SeatTransport
+from autobuild.domain.models import (
+    SeatTransport,
+    SkippedItem,
+    TrackerRecovery,
+    ValidationCheckout,
+)
 
 
 class Probeable(Protocol):
@@ -73,6 +79,19 @@ class TrackerPort(Probeable, Protocol):
         ...
 
     def propose(self, proposal: Proposal, actor: str) -> ProposalRef: ...
+
+    def recover(self) -> TrackerRecovery:
+        """Finish a tracker write the tracker appended and did not commit on
+        the primary checkout, then check that the tracker answers. The adapter
+        commits only the tracker paths the tracker itself left behind and
+        publishes them as the tracker would have. It never raises: what still
+        blocks work is reported in the result."""
+        ...
+
+    def skipped_items(self) -> tuple[SkippedItem, ...]:
+        """Every ready item the tracker has passed over so far, with its
+        reason, so the campaign records each skip instead of hiding it."""
+        ...
 
 
 @runtime_checkable
@@ -107,12 +126,43 @@ class WorkspacePort(Probeable, Protocol):
         self, workspace: WorkspaceRef, item_id: str, item_commit: str | None
     ) -> str: ...
     def snapshot(self, workspace: WorkspaceRef) -> WorktreeSnapshot: ...
-    def deliver(self, workspace: WorkspaceRef, request: DeliveryRequest) -> FinaliseResult: ...
+    def deliver(self, workspace: WorkspaceRef, request: DeliveryRequest) -> FinaliseResult:
+        """Integrate the target branch into the item branch, validate the
+        integrated candidate again through ``request.revalidate`` when the merge
+        changed a path outside the tracker paths, fast-forward the target branch
+        to that exact commit and push it unchanged. A conflict, a failed
+        revalidation or a target that stays contended raises ``DeliveryParked``
+        and pushes nothing."""
+        ...
+
     def confirm_delivery(
         self, workspace: WorkspaceRef, result: FinaliseResult, target_branch: str
     ) -> None: ...
     def deliver_report(self, request: CampaignReport) -> FinaliseResult: ...
     def release(self, workspace: WorkspaceRef) -> None: ...
+
+    def open_validation_checkout(
+        self, repository: Path, branch: str | None, refresh: bool = False
+    ) -> ValidationCheckout:
+        """A detached scratch checkout of the local head of ``branch``, the
+        default branch when None, for a batch validation. With ``refresh`` the
+        remote branch is fetched first and the local branch fast-forwarded to
+        it when the local head is its ancestor."""
+        ...
+
+    def close_validation_checkout(self, checkout: ValidationCheckout) -> None: ...
+
+
+@runtime_checkable
+class TrackerProjectionPort(Protocol):
+    """A tracker whose generated projection files are rebuilt from its event log.
+
+    Delivery uses it to settle a merge conflict confined to projection files:
+    the conflicted projection is regenerated from the merged log instead of
+    being treated as a real conflict."""
+
+    def is_projection(self, path: str) -> bool: ...
+    def regenerate_projection(self, root: Path) -> None: ...
 
 
 @runtime_checkable
@@ -254,3 +304,15 @@ class FilesystemProbePort(Protocol):
     def foreign_locks(self, path: Path) -> tuple[str, ...]: ...
     def is_file(self, path: Path) -> bool: ...
     def size(self, path: Path) -> int: ...
+
+
+
+@runtime_checkable
+class HostResourcePort(Probeable, Protocol):
+    """Read-only host resource readings.
+
+    ``read`` samples system-wide CPU busy over ``sample_seconds`` and reads
+    memory and commit at the end of the window. It never raises: a field the
+    host cannot measure is None in the reading, with a diagnostic."""
+
+    def read(self, sample_seconds: float) -> HostReading: ...

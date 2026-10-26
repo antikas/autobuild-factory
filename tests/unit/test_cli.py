@@ -114,6 +114,32 @@ def test_preflight_and_budget_settings_are_read_from_the_profile(tmp_path: Path)
     )
 
 
+def test_batch_and_patient_validator_settings_are_read_from_the_profile(tmp_path: Path) -> None:
+    repository = tmp_path / "project"
+    repository.mkdir()
+    profile = repository / ".autobuild.toml"
+    profile.write_text(PROFILE, encoding="utf-8")
+    args = arguments(repository)
+
+    defaults = load_settings(repository, args.profile, _overrides(args))
+
+    assert defaults.batch_validate_every == 5
+    assert defaults.validator_patient_argv == ()
+    profile.write_text(
+        PROFILE.replace(
+            'argv = ["uv", "run", "pytest", "-q"]',
+            'argv = ["uv", "run", "pytest", "-q"]\npatient_argv = ["uv", "run", "pytest", "-p", "x"]',
+        ).replace("[run]\n", "[run]\nbatch_validate_every = 3\n"),
+        encoding="utf-8",
+    )
+    settings = load_settings(repository, args.profile, _overrides(args))
+    assert settings.batch_validate_every == 3
+    assert settings.validator_patient_argv == ("uv", "run", "pytest", "-p", "x")
+    profile.write_text(PROFILE.replace("[run]\n", "[run]\nbatch_validate_every = 0\n"), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="batch_validate_every"):
+        load_settings(repository, args.profile, _overrides(args))
+
+
 def test_preflight_defaults_to_no_targets_and_no_accepted_variables(tmp_path: Path) -> None:
     repository = tmp_path / "project"
     repository.mkdir()

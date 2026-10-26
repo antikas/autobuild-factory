@@ -24,6 +24,17 @@ from autobuild.domain import (
 from autobuild.ports import TrackerPort
 
 
+def admission_limit(concurrency: int, usage_at_warning: bool) -> int:
+    """The single owner of the admission ceiling.
+
+    A campaign admits a new item only while fewer items run than this limit.
+    While the usage meter is at or above its warning level the limit is one,
+    so an item is admitted only when nothing runs: a run at the warning level
+    behaves as a serial run does."""
+
+    return 1 if usage_at_warning else concurrency
+
+
 class ScopedTrackerPort:
     """Wrap a tracker port and refuse any item outside the campaign selection."""
 
@@ -71,3 +82,9 @@ class ScopedTrackerPort:
 
     def propose(self, proposal: Proposal, actor: str) -> ProposalRef:
         return self._port.propose(proposal, actor)
+
+    def recover(self):
+        return self._port.recover()
+
+    def skipped_items(self):
+        return self._port.skipped_items()

@@ -48,6 +48,9 @@ class LocalRunRecordAdapter:
         self._root = root.resolve(strict=False)
         self._metadata = dict(metadata or {})
         self._lock = Lock()
+        # The last line number written to each events log, kept in memory so an
+        # append never recounts the file.
+        self._sequences: dict[Path, int] = {}
 
     def probe(self) -> ProbeResult:
         try:
@@ -75,6 +78,8 @@ class LocalRunRecordAdapter:
         _atomic_write(record_root / "manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
         (record_root / "events.jsonl").touch()
         (record_root / "evidence").mkdir()
+        with self._lock:
+            self._sequences[record_root / "events.jsonl"] = 0
         return RunRecordRef(run_id, record_root)
 
     def append(self, record: RunRecordRef, event: RunEvent) -> str:
@@ -85,13 +90,25 @@ class LocalRunRecordAdapter:
         payload = asdict(stamped)
         payload["evidence_refs"] = list(stamped.evidence_refs)
         payload["payload"] = dict(stamped.payload)
-        line = json.dumps(payload, sort_keys=True)
+        line = json.dumps(payload, sort_keys=True) + "\n"
+        existing = None if path in self._sequences else self._count_lines(path)
         with self._lock:
+            sequence = self._sequences.setdefault(path, existing or 0) + 1
             with path.open("a", encoding="utf-8", newline="\n") as stream:
-                stream.write(line + "\n")
-            with path.open("r", encoding="utf-8") as stream:
-                sequence = sum(1 for _ in stream)
+                stream.write(line)
+            self._sequences[path] = sequence
         return f"{path}#L{sequence}"
+
+    @staticmethod
+    def _count_lines(path: Path) -> int:
+        """The lines an events log already holds, read once when this adapter
+        first appends to a record it did not create."""
+
+        try:
+            with path.open("rb") as stream:
+                return sum(1 for _ in stream)
+        except FileNotFoundError:
+            return 0
 
     def write_evidence(self, record: RunRecordRef, name: str, content: str) -> str:
         path = record.root / "evidence" / f"{_safe_name(name)}.txt"

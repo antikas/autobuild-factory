@@ -87,6 +87,42 @@ def _has_out_of_fence_path(
     )
 
 
+_GLOB_CHARACTERS = frozenset("*?[")
+
+
+def exact_declared_paths(brief_text: str) -> frozenset[str]:
+    """The exact file paths a brief declares, for the path-overlap rule.
+
+    Glob entries such as ``tests/**`` are left out: only an exact path names a
+    file two items could both change. Separators are written as ``/`` and a
+    leading ``./`` is dropped, so two spellings of one path compare equal."""
+
+    paths: set[str] = set()
+    for raw in _declared_paths(brief_text):
+        if not raw or any(character in _GLOB_CHARACTERS for character in raw):
+            continue
+        normal = raw.replace("\\", "/")
+        while normal.startswith("./"):
+            normal = normal[2:]
+        normal = normal.rstrip("/")
+        if normal:
+            paths.add(normal)
+    return frozenset(paths)
+
+
+def declared_path_tokens(brief_text: str) -> tuple[str, ...]:
+    """Every path a brief declares, exact or glob, as written."""
+
+    return tuple(token for token in _declared_paths(brief_text) if token)
+
+
+def share_declared_path(first: frozenset[str], second: frozenset[str]) -> bool:
+    """The single owner of the path-overlap rule: two items overlap when they
+    declare at least one exact path in common."""
+
+    return not first.isdisjoint(second)
+
+
 def _declared_paths(brief_text: str) -> tuple[str, ...]:
     section = _section_after_heading(brief_text, _DECLARED_HEADING)
     if section is None:

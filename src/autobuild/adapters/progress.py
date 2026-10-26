@@ -10,6 +10,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from threading import Lock
 
 from autobuild.application.progress import CAMPAIGN_COMPLETED_PREFIX
 from autobuild.domain import RunRecordRef
@@ -20,10 +21,12 @@ class FileProgressAdapter:
 
     The log is opened once in ``begin`` and only ever appended to, so a reader
     that holds the file open cannot break the writer, and a detached launch keeps
-    every line already written."""
+    every line already written. Concurrent emitters each write one whole line:
+    the lock covers only that line's write and flush."""
 
     def __init__(self) -> None:
         self._handle = None
+        self._guard = Lock()
 
     def begin(self, record: RunRecordRef) -> None:
         try:
@@ -34,26 +37,35 @@ class FileProgressAdapter:
             self._handle = None
 
     def emit(self, line: str) -> None:
-        if self._handle is None:
+        handle = self._handle
+        if handle is None:
             return
+        text = line + "\n"
         try:
-            self._handle.write(line + "\n")
-            self._handle.flush()
+            with self._guard:
+                handle.write(text)
+                handle.flush()
         except (OSError, ValueError):
             return
 
 
 class StderrProgressAdapter:
     """Write and flush one line to stderr, so a detached launch with redirected
-    stderr keeps every line even if the process is later killed."""
+    stderr keeps every line even if the process is later killed. The lock covers
+    only that line's write and flush."""
+
+    def __init__(self) -> None:
+        self._guard = Lock()
 
     def begin(self, record: RunRecordRef) -> None:
         return None
 
     def emit(self, line: str) -> None:
+        text = line + "\n"
         try:
-            sys.stderr.write(line + "\n")
-            sys.stderr.flush()
+            with self._guard:
+                sys.stderr.write(text)
+                sys.stderr.flush()
         except (OSError, ValueError):
             return
 
@@ -70,6 +82,11 @@ class CommandHookProgressAdapter:
         self._command = tuple(command)
         self._timeout_seconds = timeout_seconds
         self.failures = 0
+        self._guard = Lock()
+
+    def _failed(self) -> None:
+        with self._guard:
+            self.failures += 1
 
     def begin(self, record: RunRecordRef) -> None:
         return None
@@ -88,10 +105,10 @@ class CommandHookProgressAdapter:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError, ValueError, UnicodeError):
-            self.failures += 1
+            self._failed()
             return
         if completed.returncode != 0:
-            self.failures += 1
+            self._failed()
 
 
 def is_completion_line(line: str) -> bool:

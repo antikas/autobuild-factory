@@ -1,6 +1,6 @@
 # Set up and run AutoBuild
 
-AutoBuild has two separate stages. The planning stage turns a build request into a reviewed plan and a registered work queue. The execution stage builds that approved queue one item at a time.
+AutoBuild has two separate stages. The planning stage turns a build request into a reviewed plan and a registered work queue. The execution stage builds that approved queue, several independent items at once when the host allows.
 
 The owner controls the boundary between them. Planning stops after queue registration. Execution starts only after the owner gives a separate launch instruction.
 
@@ -39,8 +39,8 @@ For each ready item, AutoBuild follows this sequence:
 6. Start a fresh read-only reviewer with the brief, diff, and validator evidence.
 7. Correct a blocking finding, ask a specialist when the finding names a specialist boundary, or park the item.
 8. Create a product commit and a separate tracker commit for accepted work.
-9. Deliver the item branch through the selected mode. Local PR delivery merges into the invoking branch and pushes only when separately authorised. Protected delivery merges into the default branch, pushes it, and verifies the remote revision.
-10. Continue until the queue is dry, the item limit is reached, or a structural evidence failure stops the campaign.
+9. Deliver the item branch through the selected mode, one delivery at a time. Delivery fetches the target branch, merges it into the item branch, and runs the validator again only when the merge brought a change that overlaps the item. A pushing delivery pushes that exact commit and only then moves the local target branch to it. Local PR delivery updates the invoking branch and pushes only when separately authorised. Protected delivery updates the default branch, pushes it, and verifies the remote revision.
+10. Continue until the queue is dry, the item limit is reached, or one hold on new admissions lasts `run.hold_limit_seconds`. An error in one item ends only that item.
 
 The reviewer does not receive the builder transcript. Accepted work must still match the diff that passed validation and review.
 
@@ -97,10 +97,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.8.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.8.0). Install the released command from PyPI:
+Release 0.9.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.9.0). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.8.0
+uv tool install autobuild-factory==0.9.0
 ```
 
 AutoBuild 0.7.0 needs pinax-tracker 0.2.1 or later when the project uses Pinax. From 0.7.0 Pinax commits every tracker change itself and AutoBuild only verifies that commit; an earlier Pinax leaves the change uncommitted and AutoBuild stops at the first claim. Do not use AutoBuild 0.6.0 or earlier with pinax-tracker 0.2.1 or later: those versions commit the tracker change themselves and refuse a tracker that has already committed it.
@@ -134,7 +134,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.8.0
+uv tool install autobuild-factory==0.9.0
 autobuild --help
 ```
 
@@ -422,7 +422,94 @@ allowed_roots = []
 
 `[run.item_classes]` maps a class name to its expected wall-clock cap in seconds, for example `large = 7200`. A brief selects its class with an `Item class: <class>` line; an undeclared or unknown class means `default`, which uses `seat_timeout_seconds`. AutoBuild acts at the class cap and raises the seat-timeout ceiling to the largest declared class so a class cap is never refused.
 
+While the host pressure level is `high` or `critical`, a running seat's cap grows by every second it spends there, up to twice its class cap. A `default` seat with a 3600-second cap that runs 1800 seconds at `high` has a cap of 5400 seconds; under pressure for its whole run its cap stops at 7200 seconds. The `seat.completed` event records the added seconds as `timeout_extension_seconds` when there are any. A serial campaign runs no pressure monitor, so its caps never stretch.
+
 `command_timeout_seconds` limits the validator process. The default is 600 seconds.
+
+`batch_validate_every` sets how many deliveries pass between batch validations. The default is 5. After that many deliveries, and once at campaign end when anything was delivered since the last one, AutoBuild runs the validator once on the delivery target head in a detached scratch worktree. See "Batch validation" under "Changes made by accepted and parked outcomes".
+
+`hold_limit_seconds` limits one hold on admissions. A hold starts when a condition blocks all new work, for example every lane is cooling, a tracker write is not committed yet, or the tracker does not answer; "Holds" lists every condition. When one hold lasts this long, the campaign ends with the `hold_limit` stop reason. The default is 21600 seconds (six hours). See "Holds" under "Campaign result".
+
+### Concurrency settings
+
+`concurrency` sets how many items a campaign builds at once, and `heavy_concurrency` how many heavy commands, such as full validators, may run at once. Each is `"auto"` or a positive integer, and both default to `"auto"`, so a profile that does not name them builds as many items at once as the host allows. Set `concurrency = 1` to build one item at a time: that is the serial setting, and it writes no scheduling progress lines or events. An integer replaces the automatic value, and an explicit `concurrency` above 64 is refused when the profile loads. The heavy value never exceeds the item value. A `BACKLOG.md` campaign builds one item at a time unless the profile names an integer, because the backlog cannot express dependencies. The optional `[capacity]` table sets the terms of the automatic formula:
+
+```toml
+[run]
+concurrency = "auto"
+heavy_concurrency = "auto"
+
+[capacity]
+reserve_gb = 8
+per_item_gb = 3
+max_concurrency = 8
+```
+
+Memory values are GiB (2^30 bytes). With `"auto"`, AutoBuild reads the host once and derives:
+
+- items: the smaller of `logical CPUs // 4` and `floor((available memory - reserve_gb) / per_item_gb)`, then held between 1 and `max_concurrency`;
+- heavy commands: `logical CPUs // 12`, held between 1 and the item value.
+
+When the host cannot measure available memory, the memory term is dropped. When it cannot count its CPUs, both values are 1. An explicit `concurrency` is not bounded by `max_concurrency`. AutoBuild refuses unknown `[capacity]` fields like any other unknown field.
+
+The default `reserve_gb` and `per_item_gb` are starting values, not measurements. Watch your own items' memory use and set `[capacity]` to match.
+
+With a concurrency above 1, every validator run that AutoBuild starts, for the reviewed candidate or for an integrated one, takes a heavy slot, and at most the heavy value run at once; the others wait for a slot. Commands a builder runs inside its own seat are outside AutoBuild's control; the pressure monitor below covers them, because its readings are system-wide.
+
+#### Host pressure
+
+A campaign with a concurrency above 1 watches system-wide CPU and memory while it runs, so the owner's other work and another campaign count. Every 10 seconds it reads the host, measuring CPU busy over 1 second. A window at time t holds the samples taken in [t - 60 s, t]. The levels are:
+
+- `high`: a mean CPU busy of at least 90% over a full 60-second window, available memory below the larger of 10% of total memory and 4 GiB, or commit headroom below 10% of the commit limit;
+- `critical`: available memory below the larger of 5% of total memory and 2 GiB;
+- `normal`: every CPU sample of the last 120 seconds below 75%, and available memory at least 2 GiB above the high line;
+- `recovering`: the span between leaving `high` or `critical` and reaching `normal`.
+
+On a 32 GiB host the high line is 4 GiB and the critical line 2 GiB; on a 64 GiB host they are 6.4 GiB and 3.2 GiB.
+
+Only `normal` admits new items. At `high` and `critical` no new heavy command starts either, and each further 5 minutes there lowers the effective item cap by one, down to 1. At `recovering` heavy commands start again but items are still not admitted. Back at `normal` the cap rises by one every 60 seconds, up to the concurrency. Back-off never stops anything that has started: a running seat, validator or reviewer runs to its own end or its own timeout. With nothing running, a pressure wait lasts until the level is back at `normal`; it is not a hold, and `run.hold_limit_seconds` does not bound it.
+
+A validator run that times out while the level was `high` or `critical` at any point of its run is suspected of failing from load. It is run once more, alone: it waits until no other heavy command runs, and no other starts until it ends. The rerun's verdict stands. A timeout without recorded pressure, or any other failure, is not run again.
+
+When the first reading cannot measure CPU busy or memory, the campaign records one warning and keeps its static concurrency without pressure control. After a measured reading, a read that fails or lacks a field is skipped: the level, the cap, the heavy-command hold and the window stay as they were, and the first failure of a run records one `campaign.pressure_read_failed` warning. After three failures in a row the campaign records one `campaign.pressure_fallback` event and keeps the current level and cap; it never raises the cap or lifts a hold on a failed read, and only measured readings move them again. A run record that cannot be written does not stop the monitor. A serial campaign does not run the monitor.
+
+The optional `[pressure]` table sets every threshold. These are the defaults; memory values are GiB:
+
+```toml
+[pressure]
+sample_seconds = 10
+read_seconds = 1
+window_seconds = 60
+calm_seconds = 120
+high_cpu_percent = 90
+calm_cpu_percent = 75
+high_memory_percent = 10
+high_memory_gb = 4
+critical_memory_percent = 5
+critical_memory_gb = 2
+high_commit_percent = 10
+calm_memory_gb = 2
+decrease_seconds = 300
+increase_seconds = 60
+```
+
+AutoBuild refuses unknown `[pressure]` fields, a non-number, a share outside 0 to 100, a non-positive interval, a `read_seconds` above `sample_seconds`, a `calm_cpu_percent` above `high_cpu_percent` and a negative memory value.
+
+With a concurrency above 1, the campaign admits every ready item it can, up to the concurrency, and builds each in its own worktree on its own worker. An item is admissible when the tracker lists it as ready (no unmet dependency, no live claim), it passes the allow and exclude lists, and it declares no exact file path under `## Declared paths` that an item in flight also declares. Only exact paths count: two items that declare only a glob such as `tests/**` run together. After every delivery or park the campaign reads the ready items again, so a dependant starts once its blocker has merged. `max_items` counts every item the campaign runs, including resumed ones. Deliveries go through one queue, one at a time; an item that reaches delivery while another delivers waits its turn.
+
+While the shared usage reading of the first lane is at or above `usage.warn_percent`, the campaign admits a new item only when nothing is running, so a run at the warning level behaves as a serial run. A lane without a meter, or one with no reading yet, holds nothing back. The stop level still applies before every seat.
+
+No item error, exhausted lanes or tracker failure stops the campaign: running items go on to their own end, and a condition that blocks all work holds new admissions instead (see "Holds" under "Campaign result"). A stop (the item bound, a dry queue or the hold limit) withholds new admissions, and items already running continue to their own end (delivered, parked, or kept with their worktree and evidence) before the campaign ends. The tracker lease is renewed every `lease_stale_seconds / 3` while the campaign runs, not only between items. A failed renewal is retried on the next beat. After three failures in a row the campaign records one `campaign.lease_withheld` event and admits nothing new until a renewal succeeds; running items continue. If nothing is running while admissions are withheld, the campaign renews once itself; when that fails it starts a `lease_renew_failed` hold, which the hold limit bounds.
+
+The progress log adds lines for each admission, for each wait with its reason (the concurrency cap, a declared path an item in flight also declares, the usage warning level, host pressure, or a tracker lease that is not renewing), for a stop that waits for running items, and for a delivery that waits behind others. A `pressure` wait is recorded once for each pressure episode in which a slot is free and an admissible item waits, however many items are queued; `high` and the `recovering` span after it are separate episodes. The log also has one line for each pressure level change with the CPU window mean and available memory, one for each change of the effective cap, one for an unmeasured host and one for each load-suspected validator rerun. A serial campaign writes none of these. Every campaign, serial or not, records `concurrency` (the item value, its source and the heavy value) in the run manifest, and its report adds a Schedule section with the concurrency, the most items that ran at once, the makespan from the first admission to the last completion, and the sum of every item's duration. With the pressure monitor running the section also gives the seconds spent at each level. The campaign result carries the schedule values under `schedule`, including `heavy_concurrency`.
+
+Read the host and the derived values once with:
+
+```text
+autobuild host --json --repository /path/to/repository
+```
+
+The command is read-only and needs only the concurrency settings, so it works with a profile that has no models or validator. It prints the logical CPU count, CPU busy percent over `--sample-seconds` (default 1), total and available memory, the commit limit and the commit available under it, a `measured` flag for each field, any diagnostics, the profile values, and the derived `items` and `heavy` with their source (`auto` or `profile`) and the CPU and memory terms. A profile that does not name `concurrency` shows `auto`, the default, and the text output then reminds you that `concurrency = 1` builds one item at a time. An unmeasured field prints as `null`. It exits 0, or 2 when the profile cannot be read or `--sample-seconds` is not a positive finite number. On Windows the readings come from the kernel's system times and memory status. On Linux they come from `/proc/stat` and `/proc/meminfo`; the commit fields are reported only when `vm.overcommit_memory` is 2, because only then does the kernel enforce the commit limit, and available memory needs the kernel's `MemAvailable` field. On other hosts only the CPU count is measured.
 
 ### Model settings
 
@@ -462,7 +549,18 @@ id = "project-check"
 argv = ["npm", "run", "check"]
 ```
 
-The validator is the deterministic acceptance authority. The model cannot replace or change it during a run.
+The validator is the deterministic acceptance authority. The model cannot replace or change it during a run. The builder prompt therefore tells the builder, as a constraint, to run only the tests for the files it changed and never the full suite or the validator command.
+
+`patient_argv` is optional. A validator run that starts while the host pressure level is `high` or `critical`, or was at that level during the previous 60 seconds, is patient. With `patient_argv` set it runs that argument list instead of `argv`:
+
+```toml
+[validator]
+id = "tests"
+argv = ["npm", "test"]
+patient_argv = ["npm", "test", "--", "--runInBand", "--testTimeout=30000"]
+```
+
+Without `patient_argv` it runs `argv` with `AUTOBUILD_HOST_PRESSURE=1` added to its environment, so a project validator script can choose a serial run or longer timeouts itself. At `normal` neither form applies. The `validation.completed` event carries `patient: true` for a patient run.
 
 ### Tool and path policy
 
@@ -533,7 +631,7 @@ specialist = "gpt-5.6"
 
 `run.lanes` names the lanes in order of preference. Each name must have a `[lanes.<harness>]` table with `builder` and `reviewer` model names; `specialist` is optional and defaults to the reviewer model. A lane table whose name is absent from `run.lanes` is parked: its present model names and effort values are checked, but its missing model keys are allowed. A parked lane is not resolved, probed, or selected by `--harness`, so it has no effect on the active lane order. Each lane table also accepts the optional `builder_effort`, `reviewer_effort`, and `specialist_effort` keys, with the values and defaults described in "Model settings". Effort belongs to the lane: a seat runs at the effort its current lane sets, so a seat that moves to the next lane after a limit takes that lane's effort, and a lane without the key passes no effort and uses its harness default. In the example the `github-copilot` lane sets no effort. A lane table also accepts `key_file`, which only the `claude-sdk` lane reads, as described in "Run overflow seats on API credit". `[models]` is not read when `run.lanes` is set, so an effort key there stops the launch with an error that names the key and points to the lane tables. Before any active lane is probed, AutoBuild refuses to launch when it sets an effort its harness adapter cannot pass, and the error names the lane and the seat. A name listed twice in `run.lanes` also stops the launch, with an error that names it. Lane choice is made at launch: preflight probes every listed lane, cools any lane whose executable is missing, unauthenticated or lacking a required capability with the `probe` signature, and starts the first capable lane. Pass `--harness <name>` to move a listed lane to the front for one launch.
 
-When a seat hits a structural limit on the active lane, that lane cools and the seat re-runs on the next capable lane. A limit is read only from the harness CLI's exit code and structured error fields, never from words in the event stream, so a report that mentions "rate limit" in prose with a clean exit and a valid result never cools a lane. When the vendor supplies a reset time the lane cools until then; otherwise it cools for `run.lane_cool_seconds` (default 3600). When no capable lane remains, the item parks with the lane signature, its worktree evidence is kept, and the campaign stops with the `lanes_exhausted` reason.
+When a seat hits a structural limit on the active lane, that lane cools and the seat re-runs on the next capable lane. A limit is read only from the harness CLI's exit code and structured error fields, never from words in the event stream, so a report that mentions "rate limit" in prose with a clean exit and a valid result never cools a lane. When the vendor supplies a reset time the lane cools until then; otherwise it cools for `run.lane_cool_seconds` (default 3600). When no capable lane remains, the item parks with the lane signature, its worktree evidence is kept, and the campaign holds new admissions until the earliest lane cooling resets, then probes the lanes again. Running items go on.
 
 `run.lane_state_root` is where the machine-local `lanes.json` cooling file lives. It defaults to the scratch root. Concurrent campaigns on one machine share this file under a lock, so a lane one campaign cooled is skipped by the others until it recovers. Pass `--lane-state-root` to override it for one launch.
 
@@ -553,12 +651,12 @@ on_probe_failure = "allow"
 
 Every key is optional, and the values above are the defaults. `stop_percent` binds the weekly limits; `five_hour_stop_percent` binds the five-hour session limit. A limit binds at or above its stop level. `warn_percent` must not exceed `stop_percent`, and every level is above 0 and at most 100. `on_probe_failure` is `allow` or `refuse`.
 
-Without a `[usage]` table AutoBuild never reads a meter, and runs behave exactly as before.
+Without a `[usage]` table AutoBuild never reads a meter.
 
 With the table, AutoBuild reads the meter of every metered lane:
 
 - At launch, before any claim. The launch is refused, with a message that names the limit, its percent and its reset time, only when every configured lane is metered and at its stop level. Otherwise each metered lane at its stop level is cooled until its reset, and the campaign starts on the next lane. An unmetered lane is never cooled by the meter. The `usage` preflight probe records the readings and any warning.
-- Before every seat on a metered lane. A session or weekly limit at its stop level cools the lane in the shared lane state until the latest reset among the binding limits, and the seat runs on the next capable lane. When none remains, the item parks with the `usage` signature and the campaign stops with `lanes_exhausted`.
+- Before every seat on a metered lane. A session or weekly limit at its stop level cools the lane in the shared lane state until the latest reset among the binding limits, and the seat runs on the next capable lane. When none remains, the item parks with the `usage` signature and the campaign holds new admissions with the `lanes_exhausted` condition until the earliest reset.
 - A weekly limit scoped to one model (for example a limit labelled `Fable`) never cools the lane. Only a seat whose model the label covers moves to the next lane; the other seats stay on the lane. The harness adapter decides whether a label covers a seat's model. When no other lane remains, the item parks with the `usage` signature.
 
 A limit at or above `warn_percent` records one `usage.warning` run event when it crosses the level, and another only after it falls below and crosses again. The other run events are `usage.stop`, `usage.seat_rerouted` and `usage.meter_failed`.
@@ -582,7 +680,7 @@ The meter needs `curl` on `PATH` and Claude Code's `.credentials.json` file in i
 The `claude-sdk` lane runs Claude Code seats through the Claude Agent SDK on an API key, so a campaign can keep building when the subscription lane is cooled. Install AutoBuild with the optional extra:
 
 ```text
-uv tool install "autobuild-factory[sdk]==0.8.0"
+uv tool install "autobuild-factory[sdk]==0.9.0"
 ```
 
 Create an API key in the Console organisation whose credit should pay for the seats, save it alone in a file, and name the file in the lane table. Put the lane last so it is used only when the earlier lanes are cooled:
@@ -603,7 +701,7 @@ key_file = "/path/to/secrets/anthropic-sdk.key"
 
 `key_file` is read only by the `claude-sdk` lane. A relative path resolves against the profile's folder, but keep the key outside the repository and out of version control: an absolute path to a folder only you can read is the safe choice. Give the key its own Console workspace with a monthly spend limit, so the limit caps what the lane can spend. AutoBuild never reads the key into the profile, a run record or an environment: the SDK's CLI reads the file through an `apiKeyHelper` command, so commands inside the seat do not inherit the key. The seat loads no user settings, hooks or skills, and the variables `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_OAUTH_TOKEN` are empty in its child. A deny rule stops the seat's Read tool opening the key file, but the seat runs as your user, so a shell command inside it could still read the file; treat the key as available to any seat on that lane.
 
-A missing or empty key file, or an installation without the extra, makes the lane's probe fail; the lane is cooled and never falls back to subscription credentials. When the API reports that the credit balance is too low, or that the workspace spend limit is reached, the lane cools with the `quota` signal and the seat moves to the next lane or the item parks with `lanes_exhausted`. Neither counts as a builder failure.
+A missing or empty key file, or an installation without the extra, makes the lane's probe fail; the lane is cooled and never falls back to subscription credentials. When the API reports that the credit balance is too low, or that the workspace spend limit is reached, the lane cools with the `quota` signal and the seat moves to the next lane, or the item parks with `lanes_exhausted` and the campaign holds new admissions. Neither counts as a builder failure.
 
 ## Choose the temporary work location
 
@@ -634,7 +732,7 @@ exclude = ["APP-007"]
 
 `exclude` is checked at every selection, including after a refill attempt. An excluded item is skipped; a campaign with only excluded work ready ends `queue_dry`.
 
-The allow-list is a hard fence. If the tracker offers an item outside the allow-list as its next item, AutoBuild stops the campaign with the `scope_fence_violation` stop reason and makes no claim, rather than build out-of-scope work.
+The allow-list is a hard fence. If the tracker offers an item outside the allow-list as its next item, AutoBuild records a `campaign.scope_fence_violation` event and makes no claim, rather than build out-of-scope work. The offered item is left alone for the rest of the campaign; when no allowed item is ready, the campaign ends with `queue_dry`.
 
 Extend the profile lists for a single run with repeatable command-line flags:
 
@@ -664,7 +762,7 @@ The probes are:
 - `validator-offline`: runs the validator once in the primary checkout with proxies pointed at a closed port and offline flags set, so any dependency download fails at once.
 - `validator-budget`: confirms `command_timeout_seconds` is not below the declared validator budget.
 - `transport`: confirms the harness streams a large instruction through stdin or a prompt file and keeps every argv element small. An in-process harness such as `claude-sdk` declares its own transport and child environment.
-- `briefs`: confirms the next ready item's brief file exists and is under 1 MiB.
+- `briefs`: confirms the next ready item's brief file exists and is under 1 MiB. With a concurrency above 1 it checks every ready item inside the selection fence, because any of them can be admitted at launch.
 - `usage`: runs only when the profile has a `[usage]` table. It reads every metered lane's meter, cools a metered lane at its stop level, and refuses the launch when every lane is at its stop level, as described in "Stop seats at a usage level".
 
 Configure the doctor in the project profile:
@@ -710,7 +808,7 @@ autobuild run --repository . --delivery-mode current-branch-pr --allow-delivery
 
 `--allow-delivery` is the human gate for repository changes. AutoBuild stops before adapter preflight when the flag is absent. It does not decide where the result is delivered.
 
-`current-branch-pr` captures the branch and revision of the checkout that starts the campaign. Accepted product and tracker commits merge into that branch. With Pinax, a claim made on that branch is committed there and not published, because Pinax publishes only from the remote default branch: AutoBuild accepts it in this mode, the claim is published with the pull request, and other machines do not see the claim until the pull request merges. In `protected-default`, the same unpublished claim stops the campaign with `tracker_environment`. AutoBuild does not check out, merge into, or push the default branch. It also does not push the current branch unless you add `--push-current-branch`. The mode refuses a current branch that is the detected default branch unless you also pass `--allow-current-branch-default`.
+`current-branch-pr` captures the branch and revision of the checkout that starts the campaign. Accepted product and tracker commits merge into that branch. With Pinax, a claim made on that branch is committed there and not published, because Pinax publishes only from the remote default branch: AutoBuild accepts it in this mode, the claim is published with the pull request, and other machines do not see the claim until the pull request merges. In `protected-default`, the same unpublished claim fails the item as a `tracker_environment` failure, and the campaign goes on. AutoBuild does not check out, merge into, or push the default branch. It also does not push the current branch unless you add `--push-current-branch`. The mode refuses a current branch that is the detected default branch unless you also pass `--allow-current-branch-default`.
 
 Use protected delivery only after a human has approved a merge and push to the default branch:
 
@@ -759,21 +857,56 @@ The command prints `autobuild.campaign-result.v1` JSON. It includes:
 - the committed repository report path
 - `progress_ref`, the absolute path of the plain-language progress log
 
-At the end of every campaign AutoBuild commits a report to `docs/campaigns/<campaign-id>.md` in the repository. The report lists Shipped items with their item and merged commits, Parked items with reasons, Failed items with errors, Follow-ups created during the campaign, the Next ready item, and a per-item table of each seat's lane, resolved model, requested effort, duration, and token usage. When the campaign runs with an allow-list, the report also lists every allowed item it left unbuilt with a reason: not ready, blocked, excluded, item bound, or lanes exhausted. The report commit is a tracker-class commit that touches only that path and is delivered through the selected delivery mode: pushed in `protected-default`, kept local in `current-branch-pr`.
+At the end of every campaign AutoBuild commits a report to `docs/campaigns/<campaign-id>.md` in the repository. The report lists Shipped items with their item and merged commits, Parked items with reasons, Failed items with errors, Unfinished items with their error and kept worktree when a park failed, Holds with the condition, duration and end of each hold when one occurred, Skipped ready items with their reason, Follow-ups created during the campaign, the Next ready item, and a per-item table of each seat's lane, resolved model, requested effort, duration, and token usage. When the campaign runs with an allow-list, the report also lists every allowed item it left unbuilt with a reason: not ready, blocked, excluded, item bound, or hold limit. The report commit is a tracker-class commit that touches only that path and is delivered through the selected delivery mode: pushed in `protected-default`, kept local in `current-branch-pr`.
 
 Every run event carries a real UTC timestamp and a JSON payload. The `campaign.started` payload names the harness, models, requested efforts, item bound, delivery mode, validator id, and manifest path. The harness, models and efforts describe the first lane in the resolved lane order, which is the lane AutoBuild probes first; when that lane cools at preflight and the campaign starts on the next capable lane, these three fields still describe the first lane, and the lane each seat actually ran on is in its `seat.completed` payload. The payload carries `null` for a seat that does not request an effort. A `seat.completed` payload is written for each builder, reviewer, and specialist invocation with the seat, model class, requested effort (`null` when the seat requested none), resolved model, outcome, exit code, start and end times, duration, input and output tokens, cost, and raw output and stderr references. The `validation.completed`, `review.completed`, `specialist.completed`, `item.parked`, `item.finalised`, and `campaign.completed` events carry their own payload fields. An `item.correcting` event is appended when an item enters a correction round, with its `round` and the `triggering_evidence_ref` of the review that asked for the change.
 
 Each run directory also holds `progress.log`, the plain-language progress lines rendered from those same events, one per line and prefixed with the event UTC timestamp. The lines cover the campaign start, each item claim, seat completion, validation, review decision, correction round, park, delivery, and the campaign completion counts and report path.
 
-The stop reason is one of:
+No error in an item ends a campaign. Apart from an interrupt or an internal scheduler error, it ends only for one of these stop reasons:
 
 - `queue_dry`: no runnable item remains
 - `item_bound`: the campaign reached `max_items`
-- `structural_failure`: required evidence or a contract was invalid
-- `scope_fence_violation`: the tracker offered an item outside the allow-list or inside the exclude-list; the campaign stopped without a claim
-- `lanes_exhausted`: every configured harness lane cooled on a subscription limit or spawn failure; the current item parked with the lane signature and its worktree evidence was kept
-- `tracker_environment`: a tracker write could not proceed in this environment. Either Pinax ended with exit 4 and the message states the cause Pinax reported (the remote could not be reached or read, the repository is inside another repository, or a claim was committed on a branch Pinax does not publish outside `current-branch-pr`), or the installed Pinax left its change uncommitted (pinax-tracker 0.2.1 or later is required). The item failed with that message; its worktree, if any, was kept and its worktree lease released
-- `tracker_refused`: Pinax refused a tracker write with exit 1 (unknown item), 2 (invalid actor), 5 (push rejected on every attempt), 6 (clock behind the newest published event) or 7 (commit refused, event left uncommitted); the item failed with the exit code and Pinax's message, no park was attempted, its worktree, if any, was kept and its worktree lease released
+- `hold_limit`: one hold on admissions lasted `run.hold_limit_seconds`; the `campaign.hold_limit` event and the report name the condition it waited for
+
+A stopped process (an interrupt or a kill) ends the campaign too; see "Recover an interrupted run". Campaign records written by AutoBuild 0.8.0 or earlier can also carry `structural_failure`, `scope_fence_violation`, `lanes_exhausted`, `tracker_environment` or `tracker_refused`; AutoBuild 0.9.0 and later never stop with them.
+
+### Item errors
+
+An error that belongs to one item ends that item and the campaign keeps admitting other items. Such errors are invalid evidence or a broken contract, a tracker refusal or environment error during that item's own write, an adapter error, and any delivery error.
+
+- A claimed item parks with the error as its reason and its evidence. Before the item's product commit exists, the park is recorded in its worktree as usual. Once the item branch holds its product commit, the park is recorded from the primary checkout and the worktree and branch are kept as evidence, so none of the item's commits reach the remote.
+- When the park itself fails, the item is unfinished: its disposition is `failed`, its worktree and evidence are kept, its worktree lease is released, the `item.park_failed` event names the error and the kept worktree, and the report lists it under Unfinished.
+- An item that fails before its claim is not picked again in the same campaign.
+- A failure while recording the follow-ups of a delivered item never undoes the delivery: the item stays accepted and the run record gains an `item.follow_up_failed` event.
+
+A tracker failure on an item's write is classified from the Pinax exit code. `tracker_environment` is exit 4, and the message states the cause Pinax reported (the remote could not be reached or read, the repository is inside another repository, or a claim was committed on a branch Pinax does not publish outside `current-branch-pr`), or an installed Pinax that left its change uncommitted (pinax-tracker 0.2.1 or later is required). `tracker_refused` is exit 1 (unknown item), 2 (invalid actor), 5 (push rejected on every attempt), 6 (clock behind the newest published event) or 7 (commit refused). The run record gains an `item.tracker_failed` event with the class, the exit code and Pinax's message. AutoBuild then asks the tracker to recover and holds admissions while the tracker is not clear.
+
+### Partial tracker writes
+
+Pinax exit 7 with the status `commit_refused` or `stage_failed` means Pinax appended its event and its commit was refused, so the event is left uncommitted and Pinax asks the caller to commit the shard and the projection. AutoBuild finishes that write itself, at once, before the item goes on:
+
+1. Under the primary-checkout lock, it commits only the leftover files under `.ergon/`, with the commit subject Pinax chose. When `pinax verify` reports that the projection no longer matches the log, it runs `pinax verify --fix` first. The commit must touch tracker paths only.
+2. A refused commit is tried again up to three times, after waits of 2, 5 and 10 seconds. The lock is released during each wait.
+3. Outside the lock, it publishes as Pinax would have: when the remote default branch is checked out, it pushes that branch, trying a failed push again after the same waits. A push that still fails leaves the commit unpublished; it goes out with the next push of its branch.
+
+AutoBuild never leaves the primary checkout dirty with a tracker write. A claim, a delivery or a campaign report that finds the primary checkout dirty with tracker files only runs the same recovery first. When the recovery still fails, the item's write fails as `tracker_refused` and the campaign holds admissions with the `tracker_pending` condition.
+
+### Holds
+
+A condition that blocks all work holds new admissions instead of stopping the campaign. Running items go on to their own end. Each hold is probed again on its own schedule:
+
+- `lanes_exhausted`: every lane is cooling. The hold waits until the earliest cooling reset, at least 1 and at most 600 seconds, then probes the lanes again.
+- `tracker_pending`: a partial tracker write is still uncommitted. The recovery is tried again every 60 seconds.
+- `tracker_unreachable`: the tracker's remote does not answer. The check is repeated with a backoff of 30, 60, 120, 240 and 480 seconds, then every 600 seconds, and the hold is released when the remote answers.
+- `tracker_read_failed`: reading the ready queue raised, for example Pinax exit 4 or an operating system error. The queue is read again with the same backoff, and the hold is released when it answers.
+- `batch_validation_failed`: the validator failed on the delivery target head. Every 600 seconds the hold fetches the target branch, checks whether the head moved and validates it if so; a passing batch releases the hold. See "Batch validation".
+
+A tracker-lease renewal that fails between items is counted as a heartbeat failure is: the third in a row records `campaign.lease_withheld` and withholds admissions until a renewal succeeds. When nothing is running, a renewal that fails starts a `lease_renew_failed` hold: the renewal is tried again every 30 seconds, the hold is released when one succeeds, and the hold limit applies. A lease, lane state or usage reading that cannot be read while deciding an admission is no signal: admission goes on, and each item and seat reads it again for itself. A refill that fails records `campaign.refill_failed` and the campaign ends with `queue_dry` as it would have.
+
+A ready item without an approved brief is never claimed. The run record gains one `item.skipped` event per item and campaign with the reason `no_brief`, and the report lists it under Skipped.
+
+The run record gains `campaign.hold_started` with the condition and the next check, `campaign.hold_retry` after each failed check, and `campaign.hold_released` with the hold's duration when it clears. A hold that lasts `run.hold_limit_seconds` records `campaign.hold_limit` and ends the campaign with `hold_limit`. The report lists each hold under Holds with its duration and how it ended.
 
 A claim that Pinax reports superseded (exit 3) is not a stop: another writer holds the item, the run record gains an `item.claim_taken` event, and the campaign selects the next item. A claim, park or proposal that Pinax committed without pushing is not a stop either: the run record gains a `tracker.unpublished` event, the progress log says so, and the report lists it under Unpublished tracker writes; it goes out with the next push of its branch. A park or proposal from the primary checkout is refused while that checkout holds staged or modified non-tracker files, and a tracker commit that touches any non-tracker path is refused.
 
@@ -814,9 +947,34 @@ The process exit code is:
 
 ## Changes made by accepted and parked outcomes
 
-An accepted item creates separate commits for product files and tracker state. In `current-branch-pr` mode, AutoBuild merges the item branch into the invoking branch and reports the resulting local commit with `pushed: false`. A human can inspect that branch and create a pull request. Add `--push-current-branch` only when the current branch should be pushed and verified.
+An accepted item creates separate commits for product files and tracker state. In `current-branch-pr` mode, AutoBuild delivers the item branch to the invoking branch and reports the resulting local commit with `pushed: false`. A human can inspect that branch and create a pull request. Add `--push-current-branch` only when the current branch should be pushed and verified.
 
-In `protected-default` mode, AutoBuild merges the item branch into the default branch with a merge commit, pushes the default branch, and checks that the remote points at that commit.
+In `protected-default` mode, AutoBuild delivers the item branch to the default branch, pushes the default branch, and checks that the remote points at that commit.
+
+Both modes deliver one item at a time in the same way:
+
+1. Fetch the target branch from `origin`. When `origin` has no such branch (a new `current-branch-pr` branch), AutoBuild integrates against the local branch only, and a pushing delivery creates the remote branch.
+2. In the item worktree, merge the fetched target and then the local target branch into the item branch. The local branch can hold tracker claims that are not yet published; they go out with this push. Integration never rebases. Each merge is a commit whose subject starts `MERGED: integrate`. A conflict only in `.ergon/board.md` or `.ergon/items/*.md` is settled by regenerating the Pinax projection from the merged log. A conflict in any other file stops the merge.
+3. When the merge brought a change to a path that intersects the item's own changed paths or its declared paths, run the item's validator again on the merged commit in the worktree. Two paths intersect when they are the same file or sit in the same top-level package: the first two path segments under `apps/` and `packages/`, the first segment otherwise. A declared path also covers every path its glob matches (`**` spans directories, and a glob that starts with a pattern, such as `**/*.ts`, covers everything) and every path under a declared directory. A changed file at the repository root, such as `pyproject.toml`, a lock file or `package.json`, overlaps every item. Changes confined to `.ergon/`, `docs/` or `*.md` files never revalidate. Each decision is recorded as a `delivery.revalidation` event with `run`, `reason` (`overlap`, `no_overlap`, `docs_only` or `unknown_scope`), the incoming paths and the overlapping ones.
+4. Under the primary-checkout lock, check that the local target branch is still part of the merged commit. When only tracker files moved there in the meantime, merge them in too, without another validator run. The local target branch does not move.
+5. Push that exact commit from the item worktree and check that the remote points at it.
+6. Only then, under the lock again, fast-forward the local target branch to the pushed commit, first merging in any tracker-only commits that landed on it meanwhile.
+
+A source change on the local target branch during step 4, or a rejected push, starts again at step 1. Delivery makes at most three such attempts. Because the local target branch moves only onto a commit the remote has accepted, it never holds an undelivered item commit. Without `--push-current-branch`, `current-branch-pr` has no push; the fast-forward in step 6 is then the delivery.
+
+The evidence rule is that the tree the validator passed equals the pushed commit's tree in every path that intersects the item. The pre-push check refuses a candidate that differs from the validated tree in such a path. An unchanged candidate is never validated twice.
+
+### Batch validation
+
+Changes from other packages reach the target without the item validating them, so the integration is checked in batches. After every `run.batch_validate_every` deliveries (default 5), and once at campaign end when anything was delivered since the last batch, AutoBuild runs the validator once on the current head of the delivery target branch in a detached scratch worktree, in a heavy slot and on its own thread, so admissions go on while it runs. A pass records `campaign.batch_validated`. A failure records `campaign.batch_validation_failed` with the head, the validator exit code and the commits delivered since the last batch that passed, and holds new admissions with the `batch_validation_failed` condition. Nothing is reverted and the campaign does not end. Every 600 seconds the hold fetches the target branch from `origin`, fast-forwards the local branch to it when the local head is part of it, and checks the head. An operator clears the hold by pushing a fix to the target branch; the moved head is then validated, and the hold is released only when a later batch passes. The hold limit applies as to any hold. With 6 deliveries the head is validated twice: after the fifth and at the end.
+
+A delivery that cannot finish parks the item from the primary checkout and keeps the item worktree and branch as evidence. Any other error after the item's product commit, such as a delivery check that refuses or a tracker close that fails, parks the same way. The park's own tracker commit is checked on its own: the item's product commit before it is outside that check, and a park commit that touches a non-tracker path is still refused. For every delivery park reason, none of the item's commits reach the remote. The park snapshot records only the item's own change, from the start commit to the item's tracker commit, never the target branch changes an integration merge brought in. The park reason starts with one of:
+
+- `delivery_conflict`: merging the target branch conflicted in a file other than the Pinax projection; the merge is aborted and the reason names the files
+- `delivery_revalidation_failed`: the merged commit failed the validator; the item's close never reaches the remote
+- `delivery_contended`: the target branch gained a source change, or the push was rejected, on all three attempts
+
+A pushed campaign report follows the same rule: it is committed in a detached worktree under the scratch root, pushed from there, and the local branch is fast-forwarded to it only after the remote accepted it.
 
 A parked item writes the reason to the selected tracker and delivers that tracker-only result through the selected delivery mode. AutoBuild does not merge the unaccepted product changes. Before it releases the worktree, AutoBuild snapshots the parked work into the run record so nothing is lost: the tracked changes as a binary patch against the start commit, every untracked product file copied verbatim, and a `snapshot.json` that lists the paths, their digests, and the park reason. The park reason and the `item.parked` event both name that snapshot directory. The isolated worktree is released only after the park record is delivered and the snapshot is written.
 
@@ -868,9 +1026,9 @@ The command must answer `--version`, and the fog ledger must already exist. Publ
 
 ## Recover an interrupted run
 
-Normal failures park the claimed item and release the isolated worktree. A killed process or machine restart can leave a claimed item, an AutoBuild branch, or a worktree under the scratch root.
+Normal failures park the claimed item and release the isolated worktree. A killed process or machine restart can leave a claimed item, an AutoBuild branch, or a worktree under the scratch root. A tracker write that Pinax appended and could not commit is recovered by AutoBuild while the campaign runs (see "Partial tracker writes"); a killed run can leave one behind on the primary checkout, and the next claim, delivery or report commits it the same way.
 
-At the start of every campaign, before it selects the first item, AutoBuild asks the tracker for items its builder actor still holds that are neither done nor parked, and reads each item's phase marker from the most recent run under the scratch root. An interrupted item resumes automatically when its state is good: the marker's worktree still exists as a registered worktree of the repository, the worktree head matches the marker, the product status digest still matches a `built`, `validated` or `reviewed` marker, the tracker still shows the item claimed, and no live lease from another campaign holds the worktree or the tracker root. A resumed item restarts from its marker: a build that is not yet trusted re-runs the builder, a `built` marker re-runs validation and review, a `validated` marker re-runs review, and a `reviewed` correction starts the next round with the same correction count. The run record notes `item.resumed` with the prior run id and marker state, and the campaign then continues to the rest of the queue.
+At the start of every campaign, before it selects the first item, AutoBuild asks the tracker for items its builder actor still holds that are neither done nor parked, and reads each item's phase marker from the most recent run under the scratch root. An interrupted item resumes automatically when its state is good: the marker's worktree still exists as a registered worktree of the repository, the worktree head matches the marker (a delivery integration merge on top of the recorded commit still matches), the product status digest still matches a `built`, `validated` or `reviewed` marker, the tracker still shows the item claimed, and no live lease from another campaign holds the worktree or the tracker root. A resumed item restarts from its marker: a build that is not yet trusted re-runs the builder, a `built` marker re-runs validation and review, a `validated` marker re-runs review, and a `reviewed` correction starts the next round with the same correction count. The run record notes `item.resumed` with the prior run id and marker state, and the campaign then continues to the rest of the queue.
 
 When the state is not good, AutoBuild parks the item with a stated reason and moves on rather than attaching to it. The reason is one of `resume:missing-worktree`, `resume:head-moved`, `resume:revision-changed`, `resume:lease-held`, `resume:tracker-mismatch` or `resume:missing-marker`. A parked item's worktree is snapshotted into the run record and left in place, so nothing is lost. A worktree under the scratch root that no claimed item owns is never attached; the campaign report lists it under Parked with reason `resume:orphan-worktree` and leaves it in place. These park cases still need a person: inspect the named worktree and reconcile it before you re-queue the item. Taking over a worktree that another live campaign holds is never automatic, so stop the named holder first.
 
