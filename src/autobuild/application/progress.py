@@ -43,12 +43,29 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
         )
     if event_type == "item.claimed":
         return f"item {item_id} claimed: {payload.get('title', '')}"
+    if event_type == "seat.started":
+        lane = payload.get("lane")
+        return (
+            f"item {item_id} seat {payload.get('seat', '')} started: "
+            f"{_seat_model(payload)}, effort {payload.get('effort') or 'default'}"
+            + (f", lane {lane}" if lane else "")
+        )
     if event_type == "seat.completed":
         return (
             f"item {item_id} seat {payload.get('seat', '')} "
             f"{payload.get('outcome', '')}"
             f"{_minutes(payload.get('duration_seconds'))}"
             f"{_cost(payload.get('cost'))}"
+        )
+    if event_type == "validation.started":
+        kinds = []
+        if payload.get("candidate") == "integrated":
+            kinds.append("revalidation at delivery")
+        if payload.get("rerun"):
+            kinds.append("load rerun")
+        return (
+            f"item {item_id} validation started: validator {payload.get('validator_id', '')}"
+            + (f" ({', '.join(kinds)})" if kinds else "")
         )
     if event_type == "validation.completed":
         exit_code = payload.get("exit_code")
@@ -71,6 +88,8 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
             f"continues it (continuation {payload.get('continuation', '?')} of "
             f"{payload.get('limit', '?')})"
         )
+    if event_type == "delivery.started":
+        return f"item {item_id} delivery started: target branch {payload.get('target_branch', '')}"
     if event_type == "item.finalised":
         return (
             f"item {item_id} delivered: item {_commit(payload.get('item_commit'))}, "
@@ -193,6 +212,11 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
             f"item {item_id} delivery skips revalidation "
             f"({_REVALIDATION_SKIPS.get(payload.get('reason', ''), payload.get('reason', ''))})"
         )
+    if event_type == "campaign.batch_started":
+        return (
+            f"batch validation {payload.get('batch', '?')} started: validator "
+            f"{payload.get('validator_id', '')} on {_commit(payload.get('revision'))}"
+        )
     if event_type == "campaign.batch_validated":
         return (
             f"batch validation {payload.get('batch', '?')} passed on "
@@ -265,6 +289,11 @@ def _efforts(efforts: Mapping[str, Any]) -> str:
     return ", ".join(f"{seat} {effort}" for seat, effort in configured)
 
 
+def _seat_model(payload: Mapping[str, Any]) -> str:
+    model = payload.get("model")
+    return f"model {model}" if model else f"model class {payload.get('model_class', '')}"
+
+
 def _minutes(duration_seconds: Any) -> str:
     if duration_seconds is None:
         return ""
@@ -278,8 +307,14 @@ def _seconds(value: Any) -> str:
         return "? s"
 
 
+def rounded_cost(cost: float) -> str:
+    """The harness's cost estimate as an owner reads it, to two decimal places."""
+
+    return f"{float(cost):.2f}"
+
+
 def _cost(cost: Any) -> str:
-    return "" if cost is None else f", cost {cost}"
+    return "" if cost is None else f", estimated cost {rounded_cost(cost)}"
 
 
 def _commit(value: Any) -> str:

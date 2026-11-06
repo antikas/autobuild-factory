@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -626,16 +627,20 @@ def run_heavy(
     clock,
     patient_argv: tuple[str, ...] = (),
     exclusive: bool = False,
+    on_start: Callable[[], None] | None = None,
 ):
     """Run one heavy command inside a heavy slot, which is released by every
     path. A command that starts while the level is ``high`` or ``critical``,
     or was in the previous ``PATIENT_LOOKBACK_SECONDS``, runs in its patient
-    form. Returns the result, whether it ran under pressure and whether it ran
-    patient."""
+    form. ``on_start`` is called once the slot is granted, just before the
+    command runs. Returns the result, whether it ran under pressure and whether
+    it ran patient."""
 
     ticket = slots.acquire(exclusive)
     try:
         patient = slots.pressured_within(clock(), PATIENT_LOOKBACK_SECONDS)
+        if on_start is not None:
+            on_start()
         command = commands.run(patient_request(request, patient_argv) if patient else request)
     finally:
         pressured = slots.release(ticket)
@@ -729,6 +734,12 @@ class ItemWorkflow:
         try:
             if notice_error is not None:
                 raise notice_error
+            self._event(
+                record,
+                "delivery.started",
+                spec.item.item_id,
+                payload={"target_branch": request.target_branch},
+            )
             return self._ports.workspace.deliver(workspace, request)
         finally:
             self._deliveries.done()
@@ -1548,6 +1559,7 @@ class ItemWorkflow:
         """Run the item's declared validator in its worktree and record one
         ``validation.completed`` event carrying ``detail``. The one place a
         validator runs, for the reviewed candidate and for an integrated one.
+        Each run records ``validation.started`` once it holds its slot.
 
         The run holds a heavy slot. A run that times out while the host
         pressure level withheld heavy commands is suspected of failing from
@@ -1562,7 +1574,23 @@ class ItemWorkflow:
             environment=self._ports.item_environment(spec.item.item_id),
             timeout_seconds=spec.command_timeout_seconds,
         )
-        command, pressured, patient = self._heavy_run(request, spec.validator_patient_argv)
+        candidate = detail.get("candidate", "reviewed")
+
+        def started(rerun: bool):
+            return lambda: self._event(
+                record,
+                "validation.started",
+                spec.item.item_id,
+                payload={
+                    "validator_id": spec.validator_id,
+                    "candidate": candidate,
+                    "rerun": rerun,
+                },
+            )
+
+        command, pressured, patient = self._heavy_run(
+            request, spec.validator_patient_argv, on_start=started(False)
+        )
         if command.timed_out and pressured:
             self._event(
                 record,
@@ -1589,6 +1617,7 @@ class ItemWorkflow:
                 ),
                 spec.validator_patient_argv,
                 exclusive=True,
+                on_start=started(True),
             )
         payload: dict[str, object] = {
             "validator_id": spec.validator_id,
@@ -1611,6 +1640,7 @@ class ItemWorkflow:
         request: CommandRequest,
         patient_argv: tuple[str, ...] = (),
         exclusive: bool = False,
+        on_start: Callable[[], None] | None = None,
     ):
         """Run one heavy command in the campaign's heavy slots; see ``run_heavy``."""
 
@@ -1621,6 +1651,7 @@ class ItemWorkflow:
             self._ports.schedule_clock,
             patient_argv,
             exclusive,
+            on_start,
         )
 
     @staticmethod
@@ -1738,12 +1769,12 @@ class ItemWorkflow:
     ) -> SeatResult:
         """Invoke one seat, moving lanes on a structural limit signal.
 
-        Every attempt is recorded as its own ``seat.completed`` event stamped with
-        the lane it ran on and carries the effort that lane sets for the seat. A
-        limit signal cools the lane and re-runs the same seat on the next capable
-        lane; when none remains ``current_lane`` raises ``LanesExhausted``. Before
-        each attempt on a metered lane the usage meter is read; see
-        ``_usage_admits``."""
+        Every attempt records ``seat.started`` just before the harness runs it,
+        and its own ``seat.completed`` event, which is stamped with the lane it
+        ran on and carries the effort that lane sets for the seat. A limit signal
+        cools the lane and re-runs the same seat on the next capable lane; when
+        none remains ``current_lane`` raises ``LanesExhausted``. Before each
+        attempt on a metered lane the usage meter is read; see ``_usage_admits``."""
 
         skip: set[str] = set()
         while True:
@@ -1755,6 +1786,18 @@ class ItemWorkflow:
                 request,
                 effort=spec.seat_effort(request.seat, lane.name),
                 timeout_extension=extension,
+            )
+            self._event(
+                record,
+                "seat.started",
+                attempt.item_id,
+                payload={
+                    "seat": attempt.seat.value,
+                    "model_class": attempt.model_class,
+                    "model": lane.models.get(attempt.model_class, ""),
+                    "effort": attempt.effort.value if attempt.effort is not None else None,
+                    "lane": lane.name,
+                },
             )
             result = lane.harness.invoke(attempt)
             extended = extension()

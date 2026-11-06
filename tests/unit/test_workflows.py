@@ -831,7 +831,7 @@ def test_report_seat_rows_name_actual_lane_model_and_requested_effort() -> None:
             12.0,
             3,
             5,
-            0.2,
+            0.46740859999999995,
             "raw:builder",
             "",
             lane="first",
@@ -863,9 +863,9 @@ def test_report_seat_rows_name_actual_lane_model_and_requested_effort() -> None:
     content = ports.workspace.reports[0].content
     assert (
         "| item | seat | lane | model | requested effort | duration seconds | input tokens | "
-        "output tokens | cost |" in content
+        "output tokens | estimated cost |" in content
     )
-    assert "| item-1 | builder | first | resolved-builder | high | 12.0 | 3 | 5 | 0.2 |" in content
+    assert "| item-1 | builder | first | resolved-builder | high | 12.0 | 3 | 5 | 0.47 |" in content
     assert "| item-1 | reviewer | second | resolved-reviewer | - | - | - | - | - |" in content
 
     empty_ports = make_ports([], [], diff_count=0)
@@ -1609,16 +1609,24 @@ def test_progress_sequence_for_one_accepted_and_one_parked_item() -> None:
     assert bodies == [
         "campaign started: harness , models , efforts none, up to 2 items",
         "item item-1 claimed: test item",
+        "item item-1 seat builder started: model class builder-class, effort default",
         "item item-1 seat builder succeeded",
+        "item item-1 validation started: validator validator",
         "item item-1 validation passed",
-        "item item-1 seat reviewer succeeded in 0.0 min, cost 0.01",
+        "item item-1 seat reviewer started: model class reviewer-class, effort default",
+        "item item-1 seat reviewer succeeded in 0.0 min, estimated cost 0.01",
         "item item-1 review pass with 0 finding(s)",
+        "item item-1 delivery started: target branch main",
         "item item-1 delivered: item item-commit, tracker tracker-commit, pushed True",
         "item item-2 claimed: second",
+        "item item-2 seat builder started: model class builder-class, effort default",
         "item item-2 seat builder succeeded",
+        "item item-2 validation started: validator validator",
         "item item-2 validation passed",
-        "item item-2 seat reviewer succeeded in 0.0 min, cost 0.01",
+        "item item-2 seat reviewer started: model class reviewer-class, effort default",
+        "item item-2 seat reviewer succeeded in 0.0 min, estimated cost 0.01",
         "item item-2 review park with 1 finding(s)",
+        "item item-2 delivery started: target branch main",
         "item item-2 parked: review disposition was park",
         "campaign completed: shipped 1, parked 1, failed 0; "
         "report docs/campaigns/campaign.md; stop item_bound",
@@ -1693,7 +1701,7 @@ def _event(event_type: str, item_id: str | None, payload: dict[str, object]) -> 
                 "item-1",
                 {"seat": "builder", "outcome": "succeeded", "duration_seconds": 120.0, "cost": 0.5},
             ),
-            "item item-1 seat builder succeeded in 2.0 min, cost 0.5",
+            "item item-1 seat builder succeeded in 2.0 min, estimated cost 0.50",
         ),
         (_event("validation.completed", "item-1", {"exit_code": 0}), "item item-1 validation passed"),
         (

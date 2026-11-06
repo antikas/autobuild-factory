@@ -1,8 +1,8 @@
 """Port bundle injected into the application layer by the composition root."""
 
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from threading import Event
 
 from autobuild.ports import (
@@ -58,6 +58,8 @@ class Lane:
     # label covers the model a seat of a given model class runs.
     meter_id: str | None = None
     meter_scope: Callable[[str, str], bool] | None = None
+    # The model this lane runs for each model class, as its harness resolves it.
+    models: Mapping[str, str] = field(default_factory=dict, hash=False)
 
     def meter_covers(self, scope: str | None, model_class: str) -> bool:
         """A scoped limit without a label covers every seat on the lane."""

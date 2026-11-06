@@ -20,7 +20,7 @@ from autobuild.application.item import (
     run_heavy,
     unpublished_write,
 )
-from autobuild.application.progress import render_progress_line
+from autobuild.application.progress import render_progress_line, rounded_cost
 from autobuild.domain import (
     CampaignContext,
     CampaignOutcome,
@@ -1419,7 +1419,8 @@ class CampaignRunner:
         final: bool,
     ) -> _BatchResult:
         """Run the validator once in ``checkout`` in a heavy slot, then remove
-        the checkout. A command that raises is a failed batch."""
+        the checkout. ``campaign.batch_started`` is recorded once the slot is
+        granted. A command that raises is a failed batch."""
 
         batch = schedule.batch
         assert batch is not None and schedule.heavy is not None
@@ -1435,6 +1436,25 @@ class CampaignRunner:
             environment=self._ports.item_environment(f"batch-{number}"),
             timeout_seconds=policy.timeout_seconds,
         )
+
+        def started() -> None:
+            # A start event that cannot be recorded says nothing about the
+            # head, so it must not turn into a failed batch and a hold.
+            try:
+                self._append(
+                    record,
+                    RunEvent(
+                        event_type="campaign.batch_started",
+                        payload={
+                            "batch": number,
+                            "revision": checkout.revision,
+                            "validator_id": policy.validator_id,
+                        },
+                    ),
+                )
+            except Exception:
+                pass
+
         try:
             command, _pressured, patient = run_heavy(
                 schedule.heavy,
@@ -1442,6 +1462,7 @@ class CampaignRunner:
                 request,
                 self._ports.schedule_clock,
                 policy.patient_argv,
+                on_start=started,
             )
         except Exception as exc:
             return _BatchResult(
@@ -2632,7 +2653,7 @@ def _render_report(
     lines.append("")
     lines.append(
         "| item | seat | lane | model | requested effort | duration seconds | "
-        "input tokens | output tokens | cost |"
+        "input tokens | output tokens | estimated cost |"
     )
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     any_seat = False
@@ -2644,7 +2665,8 @@ def _render_report(
                 f"{_seat_cell(seat.model)} | "
                 f"{_seat_cell(seat.effort.value if seat.effort is not None else None)} | "
                 f"{_seat_cell(seat.duration_seconds)} | {_seat_cell(seat.input_tokens)} | "
-                f"{_seat_cell(seat.output_tokens)} | {_seat_cell(seat.cost)} |"
+                f"{_seat_cell(seat.output_tokens)} | "
+                f"{_seat_cell(None if seat.cost is None else rounded_cost(seat.cost))} |"
             )
     if not any_seat:
         lines.append("| none | - | - | - | - | - | - | - | - |")
