@@ -62,6 +62,18 @@
     }
    },
    {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "effort": null,
+     "lane": "lane-one",
+     "model": "",
+     "model_class": "builder-class",
+     "seat": "builder"
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:one"
@@ -97,6 +109,18 @@
     }
    },
    {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "effort": null,
+     "lane": "lane-two",
+     "model": "",
+     "model_class": "builder-class",
+     "seat": "builder"
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:two"
@@ -121,6 +145,16 @@
     }
    },
    {
+    "event_type": "validation.started",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "candidate": "reviewed",
+     "rerun": false,
+     "validator_id": "validator"
+    }
+   },
+   {
     "event_type": "validation.completed",
     "evidence_refs": [
      "stdout:1"
@@ -134,6 +168,18 @@
      "stdout_ref": "stdout:1",
      "timed_out": false,
      "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "effort": null,
+     "lane": "lane-two",
+     "model": "",
+     "model_class": "reviewer-class",
+     "seat": "reviewer"
     }
    },
    {
@@ -191,6 +237,14 @@
     "payload": {
      "note": "committed on the pull request branch",
      "operation": "claim"
+    }
+   },
+   {
+    "event_type": "delivery.started",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "target_branch": "main"
     }
    },
    {
@@ -254,6 +308,18 @@
     }
    },
    {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "effort": null,
+     "lane": "lane-two",
+     "model": "",
+     "model_class": "builder-class",
+     "seat": "builder"
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:two-b"
@@ -278,6 +344,16 @@
     }
    },
    {
+    "event_type": "validation.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "candidate": "reviewed",
+     "rerun": false,
+     "validator_id": "validator"
+    }
+   },
+   {
     "event_type": "validation.completed",
     "evidence_refs": [
      "stdout:2"
@@ -291,6 +367,18 @@
      "stdout_ref": "stdout:2",
      "timed_out": false,
      "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "effort": null,
+     "lane": "lane-two",
+     "model": "",
+     "model_class": "reviewer-class",
+     "seat": "reviewer"
     }
    },
    {
@@ -329,6 +417,14 @@
      "evidence_ref": "verdict:2",
      "finding_codes": [],
      "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "delivery.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "target_branch": "main"
     }
    },
    {
@@ -524,19 +620,28 @@
    "campaign started: harness , models , efforts none, up to 3 items",
    "item item-1 claimed: test item",
    "item item-1 claim committed and not yet published; it goes out with the next push of its branch",
+   "item item-1 seat builder started: model class builder-class, effort default, lane lane-one",
    "item item-1 seat builder failed",
+   "item item-1 seat builder started: model class builder-class, effort default, lane lane-two",
    "item item-1 seat builder succeeded",
+   "item item-1 validation started: validator validator",
    "item item-1 validation passed",
-   "item item-1 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-1 seat reviewer started: model class reviewer-class, effort default, lane lane-two",
+   "item item-1 seat reviewer succeeded in 0.0 min, estimated cost 0.01",
    "item item-1 review pass with 0 finding(s)",
    "item item-1 claim committed and not yet published; it goes out with the next push of its branch",
+   "item item-1 delivery started: target branch main",
    "item item-1 delivered: item item-commit, tracker tracker-commit, pushed True",
    "item item-2 claimed: second",
    "item item-2 claim committed and not yet published; it goes out with the next push of its branch",
+   "item item-2 seat builder started: model class builder-class, effort default, lane lane-two",
    "item item-2 seat builder succeeded",
+   "item item-2 validation started: validator validator",
    "item item-2 validation passed",
-   "item item-2 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-2 seat reviewer started: model class reviewer-class, effort default, lane lane-two",
+   "item item-2 seat reviewer succeeded in 0.0 min, estimated cost 0.01",
    "item item-2 review pass with 0 finding(s)",
+   "item item-2 delivery started: target branch main",
    "item item-2 delivered: item item-commit, tracker tracker-commit, pushed True",
    "campaign completed: shipped 2, parked 0, failed 0; report docs/campaigns/campaign.md; stop queue_dry"
   ],
@@ -596,6 +701,18 @@
     }
    },
    {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "effort": null,
+     "lane": "",
+     "model": "",
+     "model_class": "builder-class",
+     "seat": "builder"
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:b1"
@@ -620,6 +737,16 @@
     }
    },
    {
+    "event_type": "validation.started",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "candidate": "reviewed",
+     "rerun": false,
+     "validator_id": "validator"
+    }
+   },
+   {
     "event_type": "validation.completed",
     "evidence_refs": [
      "stdout:1"
@@ -633,6 +760,18 @@
      "stdout_ref": "stdout:1",
      "timed_out": false,
      "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "effort": null,
+     "lane": "",
+     "model": "",
+     "model_class": "reviewer-class",
+     "seat": "reviewer"
     }
    },
    {
@@ -671,6 +810,14 @@
      "evidence_ref": "verdict:1",
      "finding_codes": [],
      "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "delivery.started",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "target_branch": "main"
     }
    },
    {
@@ -721,6 +868,18 @@
     }
    },
    {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "effort": null,
+     "lane": "",
+     "model": "",
+     "model_class": "builder-class",
+     "seat": "builder"
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:b2"
@@ -745,6 +904,16 @@
     }
    },
    {
+    "event_type": "validation.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "candidate": "reviewed",
+     "rerun": false,
+     "validator_id": "validator"
+    }
+   },
+   {
     "event_type": "validation.completed",
     "evidence_refs": [
      "stdout:2a"
@@ -758,6 +927,18 @@
      "stdout_ref": "stdout:2a",
      "timed_out": false,
      "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "effort": null,
+     "lane": "",
+     "model": "",
+     "model_class": "reviewer-class",
+     "seat": "reviewer"
     }
    },
    {
@@ -812,6 +993,18 @@
     }
    },
    {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "effort": null,
+     "lane": "",
+     "model": "",
+     "model_class": "builder-class",
+     "seat": "builder"
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:b2-fold"
@@ -836,6 +1029,16 @@
     }
    },
    {
+    "event_type": "validation.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "candidate": "reviewed",
+     "rerun": false,
+     "validator_id": "validator"
+    }
+   },
+   {
     "event_type": "validation.completed",
     "evidence_refs": [
      "stdout:2b"
@@ -849,6 +1052,18 @@
      "stdout_ref": "stdout:2b",
      "timed_out": false,
      "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "effort": null,
+     "lane": "",
+     "model": "",
+     "model_class": "reviewer-class",
+     "seat": "reviewer"
     }
    },
    {
@@ -887,6 +1102,14 @@
      "evidence_ref": "verdict:2b",
      "finding_codes": [],
      "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "delivery.started",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "target_branch": "main"
     }
    },
    {
@@ -945,6 +1168,18 @@
     }
    },
    {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-3",
+    "payload": {
+     "effort": null,
+     "lane": "",
+     "model": "",
+     "model_class": "builder-class",
+     "seat": "builder"
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:b3"
@@ -969,6 +1204,16 @@
     }
    },
    {
+    "event_type": "validation.started",
+    "evidence_refs": [],
+    "item_id": "item-3",
+    "payload": {
+     "candidate": "reviewed",
+     "rerun": false,
+     "validator_id": "validator"
+    }
+   },
+   {
     "event_type": "validation.completed",
     "evidence_refs": [
      "stdout:3"
@@ -982,6 +1227,18 @@
      "stdout_ref": "stdout:3",
      "timed_out": false,
      "validator_id": "validator"
+    }
+   },
+   {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-3",
+    "payload": {
+     "effort": null,
+     "lane": "",
+     "model": "",
+     "model_class": "reviewer-class",
+     "seat": "reviewer"
     }
    },
    {
@@ -1027,6 +1284,18 @@
     }
    },
    {
+    "event_type": "seat.started",
+    "evidence_refs": [],
+    "item_id": "item-3",
+    "payload": {
+     "effort": null,
+     "lane": "",
+     "model": "",
+     "model_class": "specialist-class",
+     "seat": "specialist"
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:review:3b"
@@ -1066,6 +1335,14 @@
       "finding"
      ],
      "non_blocking_finding_codes": []
+    }
+   },
+   {
+    "event_type": "delivery.started",
+    "evidence_refs": [],
+    "item_id": "item-3",
+    "payload": {
+     "target_branch": "main"
     }
    },
    {
@@ -1417,28 +1694,44 @@
   "progress": [
    "campaign started: harness , models , efforts none, up to 6 items",
    "item item-1 claimed: test item",
+   "item item-1 seat builder started: model class builder-class, effort default",
    "item item-1 seat builder succeeded",
+   "item item-1 validation started: validator validator",
    "item item-1 validation passed",
-   "item item-1 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-1 seat reviewer started: model class reviewer-class, effort default",
+   "item item-1 seat reviewer succeeded in 0.0 min, estimated cost 0.01",
    "item item-1 review pass with 0 finding(s)",
+   "item item-1 delivery started: target branch main",
    "item item-1 delivered: item item-commit, tracker tracker-commit, pushed True",
    "item item-2 claimed: second",
+   "item item-2 seat builder started: model class builder-class, effort default",
    "item item-2 seat builder succeeded",
+   "item item-2 validation started: validator validator",
    "item item-2 validation passed",
-   "item item-2 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-2 seat reviewer started: model class reviewer-class, effort default",
+   "item item-2 seat reviewer succeeded in 0.0 min, estimated cost 0.01",
    "item item-2 review correct with 1 finding(s)",
    "item item-2 correction round 1",
+   "item item-2 seat builder started: model class builder-class, effort default",
    "item item-2 seat builder succeeded",
+   "item item-2 validation started: validator validator",
    "item item-2 validation passed",
-   "item item-2 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-2 seat reviewer started: model class reviewer-class, effort default",
+   "item item-2 seat reviewer succeeded in 0.0 min, estimated cost 0.01",
    "item item-2 review pass with 0 finding(s)",
+   "item item-2 delivery started: target branch main",
    "item item-2 delivered: item item-commit, tracker tracker-commit, pushed True",
    "item item-3 claimed: third",
+   "item item-3 seat builder started: model class builder-class, effort default",
    "item item-3 seat builder succeeded",
+   "item item-3 validation started: validator validator",
    "item item-3 validation passed",
-   "item item-3 seat reviewer succeeded in 0.0 min, cost 0.01",
+   "item item-3 seat reviewer started: model class reviewer-class, effort default",
+   "item item-3 seat reviewer succeeded in 0.0 min, estimated cost 0.01",
    "item item-3 review escalate with 1 finding(s)",
-   "item item-3 seat specialist succeeded in 0.0 min, cost 0.01",
+   "item item-3 seat specialist started: model class specialist-class, effort default",
+   "item item-3 seat specialist succeeded in 0.0 min, estimated cost 0.01",
+   "item item-3 delivery started: target branch main",
    "item item-3 parked: review disposition was park",
    "item item-4 parked: nature:machine",
    "campaign completed: shipped 2, parked 2, failed 0; report docs/campaigns/campaign.md; stop queue_dry"

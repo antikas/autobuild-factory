@@ -97,10 +97,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.9.3 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.9.3). Install the released command from PyPI:
+Release 0.9.4 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.9.4). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.9.3
+uv tool install autobuild-factory==0.9.4
 ```
 
 AutoBuild 0.7.0 needs pinax-tracker 0.2.1 or later when the project uses Pinax. From 0.7.0 Pinax commits every tracker change itself and AutoBuild only verifies that commit; an earlier Pinax leaves the change uncommitted and AutoBuild stops at the first claim. Do not use AutoBuild 0.6.0 or earlier with pinax-tracker 0.2.1 or later: those versions commit the tracker change themselves and refuse a tracker that has already committed it.
@@ -134,7 +134,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.9.3
+uv tool install autobuild-factory==0.9.4
 autobuild --help
 ```
 
@@ -684,7 +684,7 @@ The meter needs `curl` on `PATH` and Claude Code's `.credentials.json` file in i
 The `claude-sdk` lane runs Claude Code seats through the Claude Agent SDK on an API key, so a campaign can keep building when the subscription lane is cooled. Install AutoBuild with the optional extra:
 
 ```text
-uv tool install "autobuild-factory[sdk]==0.9.3"
+uv tool install "autobuild-factory[sdk]==0.9.4"
 ```
 
 Create an API key in the Console organisation whose credit should pay for the seats, save it alone in a file, and name the file in the lane table. Put the lane last so it is used only when the earlier lanes are cooled:
@@ -861,11 +861,23 @@ The command prints `autobuild.campaign-result.v1` JSON. It includes:
 - the committed repository report path
 - `progress_ref`, the absolute path of the plain-language progress log
 
-At the end of every campaign AutoBuild commits a report to `docs/campaigns/<campaign-id>.md` in the repository. The report lists Shipped items with their item and merged commits, Parked items with reasons, Failed items with errors, Unfinished items with their error and kept worktree when a park failed, Holds with the condition, duration and end of each hold when one occurred, Skipped ready items with their reason, Follow-ups created during the campaign, the Next ready item, and a per-item table of each seat's lane, resolved model, requested effort, duration, and token usage. When the campaign runs with an allow-list, the report also lists every allowed item it left unbuilt with a reason: not ready, blocked, excluded, item bound, or hold limit. The report commit is a tracker-class commit that touches only that path and is delivered through the selected delivery mode: pushed in `protected-default`, kept local in `current-branch-pr`.
+At the end of every campaign AutoBuild commits a report to `docs/campaigns/<campaign-id>.md` in the repository. The report lists Shipped items with their item and merged commits, Parked items with reasons, Failed items with errors, Unfinished items with their error and kept worktree when a park failed, Holds with the condition, duration and end of each hold when one occurred, Skipped ready items with their reason, Follow-ups created during the campaign, the Next ready item, and a per-item table of each seat's lane, resolved model, requested effort, duration, token usage, and estimated cost. When the campaign runs with an allow-list, the report also lists every allowed item it left unbuilt with a reason: not ready, blocked, excluded, item bound, or hold limit. The report commit is a tracker-class commit that touches only that path and is delivered through the selected delivery mode: pushed in `protected-default`, kept local in `current-branch-pr`.
 
 Every run event carries a real UTC timestamp and a JSON payload. The `campaign.started` payload names the harness, models, requested efforts, item bound, delivery mode, validator id, and manifest path. The harness, models and efforts describe the first lane in the resolved lane order, which is the lane AutoBuild probes first; when that lane cools at preflight and the campaign starts on the next capable lane, these three fields still describe the first lane, and the lane each seat actually ran on is in its `seat.completed` payload. The payload carries `null` for a seat that does not request an effort. A `seat.completed` payload is written for each builder, reviewer, and specialist invocation with the seat, model class, requested effort (`null` when the seat requested none), resolved model, outcome, exit code, start and end times, duration, input and output tokens, cost, and raw output and stderr references. The `validation.completed`, `review.completed`, `specialist.completed`, `item.parked`, `item.finalised`, and `campaign.completed` events carry their own payload fields. An `item.correcting` event is appended when an item enters a correction round, with its `round` and the `triggering_evidence_ref` of the review that asked for the change.
 
-Each run directory also holds `progress.log`, the plain-language progress lines rendered from those same events, one per line and prefixed with the event UTC timestamp. The lines cover the campaign start, each item claim, seat completion, validation, review decision, correction round, park, delivery, and the campaign completion counts and report path.
+Each run directory also holds `progress.log`, the plain-language progress lines rendered from those same events, one per line and prefixed with the event UTC timestamp. The lines cover the campaign start, each item claim, seat start and completion, validation start and result, review decision, correction round, park, delivery start and result, batch validation start and result, and the campaign completion counts and report path.
+
+Each long stage of an item writes one line when it starts, so a silent log after a start line means that stage is still running:
+
+- `item <id> seat <seat> started: model <model>, effort <effort>`, for every builder, reviewer, specialist, continuation and correction seat and for every attempt after a lane failover. `<model>` is the model the seat's lane sets for it, on every lane. `effort default` means the harness's own effort is in force. The line ends `, lane <name>`, including on the first lane.
+- `item <id> validation started: validator <id>`, written when the command starts, after any wait for a heavy slot, so a validator waiting for a slot has no start line. A run on the integrated candidate adds `(revalidation at delivery)` and a rerun after a suspected load failure adds `(load rerun)`.
+- `item <id> delivery started: target branch <branch>`, written when the delivery takes its turn in the queue. The delivery that records a parked item writes it too.
+
+A batch validation writes one such line too: `batch validation <n> started: validator <id> on <revision>`, written when the command starts, after any wait for a heavy slot.
+
+A seat completion line that has a cost ends `, estimated cost 0.47`. The figure is the harness's API-price estimate, rounded to two decimal places; it is not a charge on a subscription lane. The `seat.completed` event keeps the exact number, and the report's `estimated cost` column uses the same rounding. A seat with no reported cost shows none on its line and `-` in the report.
+
+A start event (`seat.started`, `validation.started`, `delivery.started`, `campaign.batch_started`) records no cost and no outcome, and the campaign report does not read it. A killed run can leave a start event with no completion; neither `autobuild watch` nor resume treats that as an error.
 
 No error in an item ends a campaign. Apart from an interrupt or an internal scheduler error, it ends only for one of these stop reasons:
 
@@ -971,7 +983,7 @@ The evidence rule is that the tree the validator passed equals the pushed commit
 
 ### Batch validation
 
-Changes from other packages reach the target without the item validating them, so the integration is checked in batches. After every `run.batch_validate_every` deliveries (default 5), and once at campaign end when anything was delivered since the last batch, AutoBuild runs the validator once on the current head of the delivery target branch in a detached scratch worktree, in a heavy slot and on its own thread, so admissions go on while it runs. A pass records `campaign.batch_validated`. A failure records `campaign.batch_validation_failed` with the head, the validator exit code and the commits delivered since the last batch that passed, and holds new admissions with the `batch_validation_failed` condition. Nothing is reverted and the campaign does not end. Every 600 seconds the hold fetches the target branch from `origin`, fast-forwards the local branch to it when the local head is part of it, and checks the head. An operator clears the hold by pushing a fix to the target branch; the moved head is then validated, and the hold is released only when a later batch passes. The hold limit applies as to any hold. With 6 deliveries the head is validated twice: after the fifth and at the end.
+Changes from other packages reach the target without the item validating them, so the integration is checked in batches. After every `run.batch_validate_every` deliveries (default 5), and once at campaign end when anything was delivered since the last batch, AutoBuild runs the validator once on the current head of the delivery target branch in a detached scratch worktree, in a heavy slot and on its own thread, so admissions go on while it runs. It records `campaign.batch_started` when the command starts, after any wait for a heavy slot. A pass records `campaign.batch_validated`. A failure records `campaign.batch_validation_failed` with the head, the validator exit code and the commits delivered since the last batch that passed, and holds new admissions with the `batch_validation_failed` condition. Nothing is reverted and the campaign does not end. Every 600 seconds the hold fetches the target branch from `origin`, fast-forwards the local branch to it when the local head is part of it, and checks the head. An operator clears the hold by pushing a fix to the target branch; the moved head is then validated, and the hold is released only when a later batch passes. The hold limit applies as to any hold. With 6 deliveries the head is validated twice: after the fifth and at the end.
 
 Only staged or modified tracked files, and untracked tracker files, make the primary checkout dirty for a claim, a delivery, a park or a campaign report. An untracked product file, such as a brief written by hand during a campaign, stays where it is and does not block them. It still blocks a delivery that brings in a file at its path, or a folder that holds it: the delivery refuses before the push with `untracked files in the primary checkout are at paths the delivery brings in`, names them, and the item parks from the primary checkout.
 

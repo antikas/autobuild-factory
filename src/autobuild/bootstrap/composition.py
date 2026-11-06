@@ -162,11 +162,7 @@ def _build_lanes(
         config: dict[str, object] = {
             "command_port": command,
             "output_root": scratch / "harness" / (lane.name or "lane"),
-            "model_map": {
-                "builder": lane.builder_model,
-                "reviewer": lane.reviewer_model,
-                "specialist": lane.specialist_model,
-            },
+            "model_map": _lane_models(lane),
         }
         if single and settings.harness_command is not None:
             config["command"] = settings.harness_command
@@ -552,7 +548,11 @@ def _ports(
     usage_meter=None,
 ) -> WorkflowPorts:
     policy = PolicyGateway(_policy_config(settings, scratch, delivery_mode))
-    wrapped_lanes = tuple(_lane(name, policy.harness(adapter), adapter) for name, adapter in lanes_raw)
+    models = {lane.name: _lane_models(lane) for lane in settings.lanes}
+    wrapped_lanes = tuple(
+        _lane(name, policy.harness(adapter), adapter, models.get(name, {}))
+        for name, adapter in lanes_raw
+    )
     active_harness = next(
         (lane.harness for lane in wrapped_lanes if lane.name == active_name),
         policy.harness(harness),
@@ -582,9 +582,19 @@ def _item_environment(scratch: Path):
     return lambda item_id: item_scratch_environment(root, item_id)
 
 
-def _lane(name: str, harness, adapter: object) -> Lane:
-    """Bind a lane to its policy-wrapped harness and the raw adapter's meter
-    declaration, which the policy wrapper does not carry."""
+def _lane_models(lane: LaneProfile) -> dict[str, str]:
+    """The lane's model per model class, which its harness adapter also maps."""
+
+    return {
+        "builder": lane.builder_model,
+        "reviewer": lane.reviewer_model,
+        "specialist": lane.specialist_model,
+    }
+
+
+def _lane(name: str, harness, adapter: object, models: dict[str, str]) -> Lane:
+    """Bind a lane to its policy-wrapped harness, its model map and the raw
+    adapter's meter declaration, which the policy wrapper does not carry."""
 
     meter_id = getattr(adapter, "meter_id", None)
     return Lane(
@@ -592,6 +602,7 @@ def _lane(name: str, harness, adapter: object) -> Lane:
         harness,
         meter_id=meter_id,
         meter_scope=getattr(adapter, "meter_scope_covers", None) if meter_id else None,
+        models=models,
     )
 
 

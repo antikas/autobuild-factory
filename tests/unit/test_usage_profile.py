@@ -125,8 +125,8 @@ def test_with_usage_the_launch_picks_the_meter_the_lanes_declare(tmp_path: Path)
 def test_the_composed_lane_carries_the_raw_adapter_meter_declaration() -> None:
     adapter = FakeHarnessAdapter(identity("h"), meter_id="m", meter_scopes={"Fable": frozenset({"reviewer"})})
 
-    lane = composition._lane("claude-code", object(), adapter)
-    bare = composition._lane("codex", object(), FakeHarnessAdapter(identity("h")))
+    lane = composition._lane("claude-code", object(), adapter, {})
+    bare = composition._lane("codex", object(), FakeHarnessAdapter(identity("h")), {})
 
     assert lane.meter_id == "m"
     assert lane.meter_covers("Fable", "reviewer") and not lane.meter_covers("Fable", "builder")
