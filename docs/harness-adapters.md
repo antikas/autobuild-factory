@@ -72,10 +72,23 @@ Blocking decisions use `correct`, `escalate` or `park` and require at least one 
 
 | Adapter | Programmatic command | Fresh context and permissions | Result handling |
 |---|---|---|---|
-| Claude Code | `claude --print` | New session id, no persistence, safe mode, explicit tools, `dontAsk` permission mode | `--output-format json` with `--json-schema` |
+| Claude Code | `claude --print` | New session id, no persistence, safe mode (a strict builder seat: no setting sources, strict MCP configuration and no slash commands instead), explicit tools, `dontAsk` permission mode | `--output-format json` with `--json-schema` |
 | Codex | `codex ... exec` | Ephemeral session, ignored project rules, `never` approval policy, workspace-write builder or read-only reviewer sandbox | JSONL events, `--output-schema`, and `--output-last-message` |
 | GitHub Copilot | `copilot --prompt` | New session id, explicit available and allowed tools, no user questions, no remote export, no custom instructions | `--output-format json` JSONL normalised to the shared contract |
-| Claude Agent SDK | `query()` in process, driving the SDK's bundled Claude Code CLI | The Claude Code seat vector translated to SDK options, no setting sources, a fresh empty configuration directory, hooks disabled | `output_format` JSON schema; the message stream is kept as JSONL |
+| Claude Agent SDK | `query()` in process, driving the SDK's bundled Claude Code CLI | The Claude Code seat vector translated to SDK options, no setting sources, a fresh empty configuration directory, hooks disabled (a strict builder seat: AutoBuild's test hook only) | `output_format` JSON schema; the message stream is kept as JSONL |
+
+A builder seat in the strict build process carries a pre-command test check. The Claude Code command adds `--settings` with a `PreToolUse` hook on the Bash tool, and the Claude Agent SDK lane passes the same hook in its flag settings. The hook passes each shell command line to the strict refusal rule and denies a whole-suite test run with the rule's one sentence. The Codex and GitHub Copilot commands carry no such check, so on those lanes the builder brief alone states the rule. See "Build process" in the run guide.
+
+`--safe-mode` switches off every customization, hooks included, so a seat started with it never calls the test hook. A seat that carries the hook is therefore started without `--safe-mode` and isolated by these options instead:
+
+| Option | What it keeps out |
+|---|---|
+| `--setting-sources ""` | User, project and local settings, and with them the user's and the project's CLAUDE.md, hooks, enabled plugins, custom agents and commands, and output style |
+| `--strict-mcp-config` | Every MCP server not passed on the command line; the seat is passed none |
+| `--disable-slash-commands` | Skills and slash commands |
+| `--settings <json>` | Nothing; it carries the test hook, the only hook the seat runs |
+
+Stated differences from `--safe-mode`: settings from a managed policy still load, as they load for any Claude Code session that an administrator manages. No flag stops a plugin, agent or output style that such a policy enables, and a managed policy that sets `disableAllHooks` or `allowManagedHooksOnly` switches the test hook off without AutoBuild being told. Whether `--strict-mcp-config` also keeps account connectors from claude.ai off a subscription seat is not confirmed. These flags are not known to switch off Claude Code's per-project auto memory, so a strict builder seat may read the memory Claude Code keeps for its working directory. On Claude Code 2.1.316 a settings hook was observed not to fire with `--safe-mode` and to fire with `--setting-sources ""` plus `--strict-mcp-config` and `--disable-slash-commands` (probe of 2026-11-16). That no user or project customization loads under these flags is not yet confirmed by a real strict builder seat. Every seat without a hook (flow builders, reviewers, specialists) keeps `--safe-mode`. The adapter refuses a seat vector that carries a hook in `--settings` together with `--safe-mode`.
 
 The GitHub Copilot command also uses `--disallow-temp-dir`. The child environment points every temporary and cache path at the active temporary work root.
 
@@ -120,12 +133,12 @@ A meter can report a weekly limit scoped to a model, labelled with the meter's o
 
 The `claude-sdk` adapter runs Claude Code seats on an API key instead of a subscription. It runs in the campaign process through the Claude Agent SDK, which starts the SDK's own bundled Claude Code CLI. The SDK is the optional extra `autobuild-factory[sdk]`; AutoBuild imports it only when a `claude-sdk` lane is probed or runs a seat, so a profile without the lane imports nothing from it and the core keeps no runtime dependency.
 
-The seat contract is the Claude Code lane's own. The adapter builds the argument vector the `claude-code` adapter would run for the seat and translates each option into an SDK option: tools and allowed tools, model, effort, permission mode, session id, the contract prompt, the result schema, safe mode and no session persistence. An option it cannot carry refuses the seat before the SDK starts. The builder result file fallback works as on the Claude Code lane.
+The seat contract is the Claude Code lane's own. The adapter builds the argument vector the `claude-code` adapter would run for the seat and translates each option into an SDK option: tools and allowed tools, model, effort, permission mode, session id, the contract prompt, the result schema, safe mode and no session persistence. For a strict builder seat it carries the isolating options in place of safe mode: `--setting-sources ""` becomes the SDK's own empty `setting_sources`, and `--strict-mcp-config` and `--disable-slash-commands` reach the CLI through `extra_args`, as `--safe-mode` does for every other seat. The SDK passes `extra_args` to its bundled CLI unchanged, so `--safe-mode` there stops the hook exactly as on the Claude Code lane; the lane refuses a seat whose settings carry a hook while its flags hold safe mode. An option it cannot carry refuses the seat before the SDK starts. The builder result file fallback works as on the Claude Code lane.
 
 The API key never enters an environment, a command line or a file AutoBuild writes. The lane table names the key file with `key_file`, and the adapter passes the SDK's CLI an `apiKeyHelper` command in flag settings that prints the file. The CLI child also gets:
 
 - a fresh, empty `CLAUDE_CONFIG_DIR` under the lane's output directory for every seat, so no user settings, credentials, skills or plugins load;
-- no setting sources, `disableAllHooks`, and a `permissions.deny` rule `Read(<key_file>)` so the seat's Read tool cannot open the key file;
+- no setting sources, `disableAllHooks`, and a `permissions.deny` rule `Read(<key_file>)` so the seat's Read tool cannot open the key file. A builder seat in the strict build process instead carries AutoBuild's own test hook in the same flag settings, with `disableAllHooks` lifted and without `--safe-mode`; with no setting sources it is the only hook the seat runs;
 - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_OAUTH_TOKEN` set to empty values. The SDK merges the parent environment into its child and cannot remove a variable, and the bundled CLI treats an empty value as unset.
 
 The helper reads the file as UTF-8 with an optional byte-order mark, strips surrounding whitespace and writes bytes, so the console code page cannot break it. The probe checks that the key file exists and is readable and not empty after stripping, and that the SDK imports. When the API refuses the key, the CLI announces a retry with `authentication_failed`; the adapter stops the seat at the first such retry and returns an `auth` signal, which cools the lane instead of waiting through the CLI's retries. It never reads an OAuth credential and never runs a model. A missing key file fails the probe, which cools the lane; the lane never falls back to subscription credentials. A seat whose key file has gone fails with an `auth` signal before the SDK starts.

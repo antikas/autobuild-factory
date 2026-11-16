@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,13 @@ from autobuild.domain import (
     UsagePolicy,
     UsageProbeFailure,
 )
-from autobuild.domain.models import PressurePolicy
+from autobuild.domain.models import (
+    PressurePolicy,
+    ProcessMode,
+    ProcessPolicy,
+    ReviewBoundary,
+    TestCoverage,
+)
 
 
 class ConfigurationError(ValueError):
@@ -122,6 +129,8 @@ class RunSettings:
     batch_validate_every: int = 5
     # ``[validator] patient_argv``: the validator argv under recent host pressure.
     validator_patient_argv: tuple[str, ...] = ()
+    # The ``[process]`` table: ``flow`` unless the profile opts into ``strict``.
+    process: ProcessPolicy = ProcessPolicy()
 
 
 def _batch_validate_every(run: Mapping[str, Any]) -> int:
@@ -316,7 +325,7 @@ _PROFILE_ALLOWED_KEYS: dict[str, frozenset[str]] = {
         {
             "run", "models", "validator", "harness", "policy", "tracker", "preflight",
             "refill", "knowledge", "selection", "progress", "lanes", "usage",
-            "capacity", "pressure",
+            "capacity", "pressure", "process",
         }
     ),
     "run": frozenset(
@@ -343,6 +352,7 @@ _PROFILE_ALLOWED_KEYS: dict[str, frozenset[str]] = {
     "lanes.*": frozenset({"builder", "reviewer", "specialist", "key_file", *_EFFORT_KEYS}),
     "capacity": frozenset({"reserve_gb", "per_item_gb", "max_concurrency"}),
     "pressure": frozenset(_PRESSURE_KEYS),
+    "process": frozenset({"mode", "test_command", "test_map", "boundaries"}),
 }
 
 
@@ -730,6 +740,88 @@ def _pressure(document: Mapping[str, Any]) -> PressurePolicy:
         raise ConfigurationError(str(exc)) from exc
 
 
+def _test_coverage(pattern: str, value: object) -> TestCoverage:
+    label = f"process.test_map.{pattern}"
+    if isinstance(value, str):
+        try:
+            command = tuple(shlex.split(value))
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"{label} is not a command line the shell can split: {exc}."
+            ) from exc
+        if not command:
+            raise ConfigurationError(f"{label} must name test paths or a test command")
+        return TestCoverage(pattern, command=command)
+    if not isinstance(value, list) or not value or not all(
+        isinstance(part, str) and part.strip() for part in value
+    ):
+        raise ConfigurationError(
+            f"{label} must be a command line or a non-empty list of test path strings."
+        )
+    return TestCoverage(pattern, tests=tuple(value))
+
+
+_BOUNDARY_KEYS = frozenset({"paths", "invariants"})
+
+
+def _boundary(name: str, value: object) -> ReviewBoundary:
+    if not name.strip():
+        raise ConfigurationError("Every boundary in [process.boundaries] needs a name that is not blank.")
+    label = f"process.boundaries.{name}"
+    if not isinstance(value, Mapping):
+        raise ConfigurationError(
+            f"{label} must be a table with paths and an optional invariants file."
+        )
+    message = _unknown_fields(label, value, _BOUNDARY_KEYS)
+    if message is not None:
+        raise ConfigurationError(message)
+    paths = value.get("paths")
+    if not isinstance(paths, list) or not paths or not all(
+        isinstance(path, str) and path.strip() for path in paths
+    ):
+        raise ConfigurationError(f"{label}.paths must be a non-empty list of path pattern strings.")
+    invariants = value.get("invariants")
+    if invariants is not None and (not isinstance(invariants, str) or not invariants.strip()):
+        raise ConfigurationError(f"{label}.invariants must be the path of a file, as a string.")
+    return ReviewBoundary(name, tuple(paths), invariants)
+
+
+def _boundaries(table: Mapping[str, Any]) -> tuple[ReviewBoundary, ...]:
+    raw = table.get("boundaries", {})
+    if not isinstance(raw, Mapping):
+        raise ConfigurationError("[process.boundaries] must be a table of named boundaries.")
+    return tuple(_boundary(name, value) for name, value in raw.items())
+
+
+def _process(document: Mapping[str, Any]) -> ProcessPolicy:
+    """Validate the optional ``[process]`` table.
+
+    ``mode`` is ``flow`` (the default when the table or key is absent) or
+    ``strict``. ``test_map`` pairs a source path pattern with a test path array,
+    run after ``test_command``, or with one test command line. ``boundaries``
+    names sensitive areas, each with path patterns and an optional invariants
+    file; it is checked in both modes and read only in strict mode."""
+
+    table = _table(document, "process")
+    mode = table.get("mode", ProcessMode.FLOW.value)
+    if not isinstance(mode, str) or mode not in {choice.value for choice in ProcessMode}:
+        raise ConfigurationError(f'process.mode must be "flow" or "strict", not {mode!r}.')
+    test_command = (
+        _string_list(table["test_command"], "process.test_command")
+        if "test_command" in table
+        else ()
+    )
+    raw_map = table.get("test_map", {})
+    if not isinstance(raw_map, Mapping):
+        raise ConfigurationError("[process.test_map] must be a TOML table")
+    test_map = tuple(_test_coverage(pattern, value) for pattern, value in raw_map.items())
+    boundaries = _boundaries(table)
+    try:
+        return ProcessPolicy(ProcessMode(mode), test_command, test_map, boundaries)
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
 def _concurrency(run: Mapping[str, Any], key: str, default: int | str = "auto") -> int | None:
     value = run.get(key, default)
     if value == "auto":
@@ -975,4 +1067,5 @@ def load_settings(
         hold_limit_seconds=hold_limit,
         batch_validate_every=_batch_validate_every(run),
         validator_patient_argv=_patient_argv(validator),
+        process=_process(document),
     )
