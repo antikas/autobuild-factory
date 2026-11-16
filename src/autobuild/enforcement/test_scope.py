@@ -46,10 +46,26 @@ def _pattern_regex(pattern: str) -> re.Pattern[str]:
 
 
 def _normal(path: str) -> str:
+    """``path`` with forward slashes and its ``.`` and ``..`` segments resolved,
+    so ``tests/unit/../..`` is ``.``; a ``..`` above the start is kept."""
+
     text = path.strip().replace("\\", "/")
-    while text.startswith("./"):
-        text = text[2:]
-    return text.rstrip("/")
+    if not text:
+        return ""
+    absolute = text.startswith("/")
+    parts: list[str] = []
+    for segment in text.split("/"):
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            if parts and parts[-1] != "..":
+                parts.pop()
+            elif not absolute:
+                parts.append("..")
+            continue
+        parts.append(segment)
+    joined = "/".join(parts)
+    return f"/{joined}" if absolute else joined or "."
 
 
 def path_matches(pattern: str, path: str) -> bool:
@@ -183,9 +199,16 @@ def runner_arguments(policy: ProcessPolicy, argv: tuple[str, ...]) -> tuple[str,
     spelling of the same runner count: the bare program, a path ending in it,
     ``python -m`` and ``uv run`` in front of either."""
 
-    if _starts_with(argv, policy.test_command):
-        return argv[len(policy.test_command) :]
-    runner = _runner(policy.test_command) if policy.test_command else None
+    return _command_arguments(policy.test_command, argv)
+
+
+def _command_arguments(test_command: tuple[str, ...], argv: tuple[str, ...]) -> tuple[str, ...] | None:
+    """The arguments ``argv`` passes to the runner ``test_command`` starts, or
+    None when ``argv`` does not run that runner."""
+
+    if _starts_with(argv, test_command):
+        return argv[len(test_command) :]
+    runner = _runner(test_command) if test_command else None
     found = _program(argv)
     if runner is None or found is None:
         return None
@@ -254,6 +277,99 @@ def _within(target: str, test_path: str) -> bool:
     return file_part == root or file_part.startswith(f"{root}/")
 
 
+# Shell reserved words that may open a simple command, as in ``{ pytest; }``,
+# ``if true; then pytest; fi`` or ``! pytest``.
+_LEADING_RESERVED = frozenset({"!", "{", "if", "then", "else", "elif", "do", "while", "until"})
+# Leading words that run the command after them: for each, the options that
+# read the next word as their value and the operands before the command, such
+# as the duration of ``timeout 600 pytest``.
+_WRAPPERS: dict[str, tuple[frozenset[str], int]] = {
+    "env": (frozenset({"-u", "--unset", "-C", "--chdir"}), 0),
+    "time": (frozenset({"-f", "--format", "-o", "--output"}), 0),
+    "timeout": (frozenset({"-s", "--signal", "-k", "--kill-after"}), 1),
+    "nice": (frozenset({"-n", "--adjustment"}), 0),
+    "nohup": (frozenset(), 0),
+    "command": (frozenset(), 0),
+    "exec": (frozenset({"-a"}), 0),
+}
+# Shells whose ``-c`` option runs a command string.
+_SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ksh"})
+_SHELL_VALUE_FLAGS = frozenset({"-o", "+o", "-O", "+O"})
+_SHELL_DEPTH = 4
+
+
+def _shell_string(argv: tuple[str, ...]) -> str | None:
+    """The command string ``bash -c``, ``sh -c`` or ``bash -lc`` runs, or None
+    when ``argv`` is not such a shell call."""
+
+    if _basename(argv[0]) not in _SHELLS:
+        return None
+    runs_string = False
+    index = 1
+    while index < len(argv):
+        option = argv[index]
+        if option == "--":
+            index += 1
+            break
+        if not option or option[0] not in "-+" or option in {"-", "+"}:
+            break
+        if option in _SHELL_VALUE_FLAGS:
+            index += 2
+            continue
+        if not option.startswith("--") and "c" in option[1:]:
+            runs_string = True
+        index += 1
+    return argv[index] if runs_string and index < len(argv) else None
+
+
+def _commands_run(argv: tuple[str, ...], depth: int = 0) -> tuple[tuple[str, ...], ...]:
+    """The simple commands ``argv`` runs: past leading reserved words and the
+    wrappers in ``_WRAPPERS`` with their options, assignments and operands,
+    and, for a shell ``-c`` call, the commands in its command string. A
+    ``command -v`` lookup runs nothing."""
+
+    index = 0
+    while index < len(argv):
+        word = argv[index]
+        if word in _LEADING_RESERVED:
+            index += 1
+            continue
+        name = _basename(word)
+        if name not in _WRAPPERS:
+            break
+        value_flags, operands = _WRAPPERS[name]
+        index += 1
+        while index < len(argv):
+            option = argv[index]
+            if name == "env" and (option == "-" or _ASSIGNMENT.match(option)):
+                index += 1
+                continue
+            if option == "--":
+                index += 1
+                break
+            if not option.startswith("-"):
+                break
+            if name == "command" and option in {"-v", "-V"}:
+                return ()
+            index += 2 if option in value_flags else 1
+        while name == "env" and index < len(argv) and _ASSIGNMENT.match(argv[index]):
+            index += 1
+        index += operands
+    inner = argv[index:]
+    if not inner:
+        return ()
+    string = _shell_string(inner)
+    if string is None:
+        return (inner,)
+    if depth >= _SHELL_DEPTH:
+        return ()
+    try:
+        lines = shell_commands(string)
+    except ValueError:
+        return ()
+    return tuple(command for line in lines for command in _commands_run(line, depth + 1))
+
+
 def builder_test_refusal(
     policy: ProcessPolicy,
     seat: Seat,
@@ -263,19 +379,38 @@ def builder_test_refusal(
     """The refusal sentence for a builder seat's test run, or None to admit it.
 
     ``covering`` is the item's covering entries; when the item declares no
-    mapped path every map entry counts as covering."""
+    mapped path every map entry counts as covering. ``argv`` is judged by the
+    commands it runs: past leading wrapper words such as ``env``, ``timeout``
+    and ``time``, and inside a ``bash -c`` or ``sh -c`` command string."""
 
     if not policy.strict or seat is not Seat.BUILDER or not argv:
         return None
+    for command in _commands_run(argv):
+        refusal = _command_refusal(policy, command, covering)
+        if refusal is not None:
+            return refusal
+    return None
+
+
+def _command_refusal(
+    policy: ProcessPolicy, argv: tuple[str, ...], covering: tuple[TestCoverage, ...]
+) -> str | None:
+    """The refusal sentence for one simple command a strict builder runs.
+
+    A test-path entry's runs are judged by the paths they select. A mapped
+    command line is admitted only exactly as written: any other run of the
+    same runner, such as ``npm test -- api`` beside ``npm test -- web``, or a
+    covering line of an entry that does not cover the change, is refused."""
+
     entries = covering or policy.test_map
     if any(entry.command and argv == entry.command for entry in entries):
         return None
     arguments = runner_arguments(policy, argv)
-    is_partial_command = any(
-        entry.command and len(argv) < len(entry.command) and _starts_with(entry.command, argv)
+    runs_mapped_command = any(
+        entry.command and _command_arguments(entry.command, argv) is not None
         for entry in policy.test_map
     )
-    if arguments is None and not is_partial_command:
+    if arguments is None and not runs_mapped_command:
         return None
     allowed = tuple(path for entry in entries for path in entry.tests)
     runner = _runner(policy.test_command)

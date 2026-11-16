@@ -500,6 +500,119 @@ def test_shell_commands_keep_a_quoted_angle_bracket_as_an_argument() -> None:
     )
 
 
+# --- paths with dot segments -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "tests/unit/test_profile.py/../..",
+        "tests/unit/test_profile.py/../../..",
+        "tests/unit/test_profile.py/..",
+        "./tests/unit/../unit/test_profile.py/..",
+    ],
+)
+def test_a_path_that_climbs_out_of_a_covering_test_is_refused(target: str) -> None:
+    argv = ("uv", "run", "pytest", target)
+
+    assert builder_test_refusal(strict_policy(), Seat.BUILDER, argv, covering()) is not None
+
+
+@pytest.mark.parametrize("target", ["tests/unit/./test_profile.py", "tests/other/../unit/test_profile.py"])
+def test_a_path_whose_dot_segments_stay_inside_a_covering_test_is_admitted(target: str) -> None:
+    argv = ("uv", "run", "pytest", target)
+
+    assert builder_test_refusal(strict_policy(), Seat.BUILDER, argv, covering()) is None
+
+
+def test_a_path_that_climbs_out_of_a_covering_directory_is_refused() -> None:
+    policy = ProcessPolicy(
+        ProcessMode.STRICT, ("uv", "run", "pytest"), (TestCoverage("src/app/api/**", tests=("tests/unit/api",)),)
+    )
+    api = item_covering_entries(policy, "## Declared paths\n\n`src/app/api/routes.py`\n")
+
+    assert builder_test_refusal(policy, Seat.BUILDER, ("pytest", "tests/unit/api/../.."), api) is not None
+    assert builder_test_refusal(policy, Seat.BUILDER, ("pytest", "tests/unit/api/../other"), api) is not None
+    assert builder_test_refusal(policy, Seat.BUILDER, ("pytest", "tests/unit/api/sub/../test_a.py"), api) is None
+
+
+# --- wrappers, shell strings and groups --------------------------------------------------------
+
+WRAPPED_WHOLE_SUITE = [
+    "timeout 600 uv run pytest",
+    "timeout -s KILL --kill-after 5 600 pytest",
+    "timeout --preserve-status 10m pytest tests",
+    "env pytest",
+    "env FOO=1 BAR=2 pytest",
+    "env -u HOME pytest",
+    "env -i PATH=/usr/bin pytest",
+    "time pytest",
+    "time -p pytest",
+    "nice pytest",
+    "nice -n 5 uv run pytest",
+    "nohup pytest",
+    "command pytest",
+    "exec pytest",
+    "timeout 600 env FOO=1 nice -n 5 pytest",
+    'bash -c "pytest"',
+    "sh -c pytest",
+    "bash -lc 'cd sub && uv run pytest'",
+    "bash -e -c 'pytest -q'",
+    "bash -o pipefail -c 'pytest | tail'",
+    "bash -c \"bash -c 'pytest'\"",
+    "{ pytest; }",
+    "( pytest )",
+    "(cd sub; pytest)",
+    "if true; then pytest; fi",
+    "! pytest",
+]
+
+
+@pytest.mark.parametrize("line", WRAPPED_WHOLE_SUITE)
+def test_a_runner_behind_a_wrapper_shell_string_or_group_is_judged(line: str) -> None:
+    assert shell_command_refusal(guard(), line) is not None
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "timeout 600 uv run pytest tests/unit/test_profile.py",
+        "env FOO=1 pytest tests/unit/test_profile.py",
+        "time -p nice -n 5 pytest -q tests/unit/test_profile.py",
+        "bash -lc 'uv run pytest tests/unit/test_profile.py'",
+        "{ pytest tests/unit/test_profile.py; }",
+    ],
+)
+def test_a_covering_run_behind_a_wrapper_is_admitted(line: str) -> None:
+    assert shell_command_refusal(guard(), line) is None
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["command -v pytest", "bash scripts/check.sh", "env", "timeout 5 git status", "sh -c 'git status'"],
+)
+def test_a_wrapper_around_a_command_that_is_not_a_test_run_is_not_judged(line: str) -> None:
+    assert shell_command_refusal(guard(), line) is None
+
+
+# --- a mapped command line for a runner other than the configured one -------------------------
+
+
+def test_a_mapped_command_line_is_admitted_only_as_written() -> None:
+    web = item_covering_entries(strict_policy(), "## Declared paths\n\n`src/app/web/page.ts`\n")
+
+    assert builder_test_refusal(strict_policy(), Seat.BUILDER, ("npm", "test", "--", "api"), web) is not None
+    assert builder_test_refusal(strict_policy(), Seat.BUILDER, ("npm", "test", "--", "web", "-x"), web) is not None
+    assert builder_test_refusal(strict_policy(), Seat.BUILDER, ("npm", "test", "--", "web"), web) is None
+    assert builder_test_refusal(strict_policy(), Seat.BUILDER, ("npm", "install"), web) is None
+
+
+def test_a_mapped_command_line_that_does_not_cover_the_change_is_refused() -> None:
+    argv = ("npm", "test", "--", "web")
+
+    assert builder_test_refusal(strict_policy(), Seat.BUILDER, argv, covering()) is not None
+
+
 # --- which seat the workflow gives the pre-command check -----------------------------------
 
 

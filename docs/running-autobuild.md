@@ -576,7 +576,7 @@ The builder receives the isolated worktree plus the configured external roots. T
 
 ### Build process
 
-The optional `[process]` table selects the build process. `mode` is `flow` or `strict`. A profile without the table, or a table without `mode`, runs `flow`, which changes nothing for an existing profile. Any other value is refused when the profile loads.
+The optional `[process]` table selects the build process. `mode` is `flow` or `strict`. A profile without the table, or a table without `mode`, runs `flow`, which builds and reviews an existing profile's items as 0.9.4 did; the one change in both modes is the seat environment variable described at the end of this section. Any other value is refused when the profile loads.
 
 `strict` limits each builder seat to the tests that cover what it changed. It needs a test map:
 
@@ -595,18 +595,24 @@ test_command = ["uv", "run", "pytest"]
 
 In strict mode the builder brief names the covering tests for the paths listed under the item's `## Declared paths` heading, and says a whole-suite run is not allowed. When no declared path matches an entry, the brief lists the whole map.
 
-The rule is also enforced where the builder's commands run. A builder seat in strict mode gets a pre-command check that passes every shell command line it runs to the refusal rule. The rule splits the line into its commands at `&&`, `||`, `;`, pipes and new lines, also when a redirection follows with no space, as in `echo hi;>x pytest`, and ignores leading variable assignments. Only an unquoted `<` or `>` is a redirection; the rule drops it and its target. A quoted or escaped one, as in `-k "a>b"`, is part of an argument. It admits a test run only when every test it selects is a covering test.
+The rule is also checked where the builder's commands run. A builder seat in strict mode gets a pre-command check that passes every shell command line it runs to the refusal rule. The rule splits the line into its commands at `&&`, `||`, `;`, pipes, new lines and `( )` groups, also when a redirection follows with no space, as in `echo hi;>x pytest`, and ignores leading variable assignments. Only an unquoted `<` or `>` is a redirection; the rule drops it and its target. A quoted or escaped one, as in `-k "a>b"`, is part of an argument.
 
-A test run is any command that starts the project's test runner, however it is spelled. AutoBuild reads the runner from `test_command`, past any `uv run` and `python -m` in front of it. With `test_command = ["uv", "run", "pytest"]` the runner is `pytest`, so `pytest`, `python -m pytest`, `python3 -m pytest`, `uv run pytest`, `uv run python -m pytest`, `uv run --native-tls python -m pytest`, `uv -q run pytest` with a `uv` option before `run`, and a path ending in `/pytest` such as `.venv/bin/pytest` are all test runs. With `test_command = ["npm", "test"]` the runner is `npm test`, and `npm install` is not a test run.
+The rule looks past leading words that run the command after them: `env` with its options and assignments, `time`, `timeout` with its options and duration, `nice`, `nohup`, `command` and `exec`, and the reserved words `{`, `!`, `if`, `then`, `else`, `elif`, `do`, `while` and `until`. It reads the command string of `bash -c`, `sh -c` and their option clusters such as `bash -lc`, and judges each command inside it. So `timeout 600 uv run pytest`, `env CI=1 pytest`, `bash -lc "uv run pytest"` and `{ pytest; }` are judged like `pytest`.
+
+A test run of the project's runner is any command that starts it. AutoBuild reads the runner from `test_command`, past any `uv run` and `python -m` in front of it. With `test_command = ["uv", "run", "pytest"]` the runner is `pytest`, so `pytest`, `python -m pytest`, `python3 -m pytest`, `uv run pytest`, `uv run python -m pytest`, `uv run --native-tls python -m pytest`, `uv -q run pytest` with a `uv` option before `run`, and a path ending in `/pytest` such as `.venv/bin/pytest` are all test runs. Such a run is admitted only when every test it selects is a covering test. A path is judged after its `.` and `..` segments are resolved, so `tests/unit/api/../..` is the whole `tests` directory.
+
+A mapped command line, such as `"web/**" = "npm test -- web"`, is admitted only exactly as written and only when its entry covers the change. Any other command that starts the same program and the words before its first option, here `npm test`, is a run of that runner and is refused: `npm test`, `npm test -- api` and `npm test -- web --watch` are refused, and `npm install` is not a test run.
 
 These are whole-suite runs and are refused with one sentence that names the covering tests:
 
 - a run of the runner that selects no test path;
 - a run that names a directory, including a bare `tests` or `.` with no slash, even alongside a covering test;
 - a run that names a test outside the covering tests;
-- the bare start of a mapped command line, such as `npm test`.
+- a run of a mapped command line's runner that is not a covering line exactly as written.
 
 Every bare word in a runner's arguments selects a test, also straight after an option such as `-q`, and every word after `--`. The one exception is the value of a runner option that takes one. AutoBuild keeps a small table of these per runner; for `pytest` it holds options such as `-k`, `-m`, `-p`, `--maxfail` and `--tb`, so the `profile` in `-k profile` selects no test. For a runner without a table, give an option's value as `--option=value`. A command that is not a test run, such as `git status`, always runs.
+
+The check is a net for an ordinary mistake by a builder. It is not a barrier against a builder set on getting round it, and the reviewer and the validator remain the checks on the result. It does not see a test run inside a script or a Make target, behind an alias, a shell function, `eval`, `xargs`, `sudo` or a command substitution such as `$(echo pytest)`, through another spelling of a mapped command such as `npm run test`, through a runner the configured test command does not name such as `py.test` or `uvx pytest`, or in Python code such as `python -c "import pytest; pytest.main()"`.
 
 How each lane carries the check:
 
@@ -616,6 +622,8 @@ How each lane carries the check:
 | `claude-sdk` | The same hook in the seat's flag settings, with the same options in place of `--safe-mode`. For a strict builder seat the lane lifts `disableAllHooks`; the seat loads no setting sources, so this hook is the only one it runs. |
 | `codex` | None. The lane has no pre-command hook AutoBuild can install, so the brief alone carries the rule. |
 | `github-copilot` | None. The lane has no pre-command hook AutoBuild can install, so the brief alone carries the rule. |
+
+On the Claude Code lanes a managed policy can switch the hook off, for example with `disableAllHooks` or `allowManagedHooksOnly`, and AutoBuild is not told; the seat then runs with the brief alone carrying the rule.
 
 The check is installed for builder seats in strict mode only. Flow mode, reviewer and specialist seats get no check. The validator that runs after the builder, the delivery revalidation and the batch validation are run by AutoBuild, not by a seat. They carry no check and still run the full `[validator] argv`.
 
@@ -648,7 +656,7 @@ A blank boundary name, an unknown key in a boundary, a boundary that is not a ta
 
 In `flow` none of this applies. The test map and the boundary map may stay in the profile, so switching modes is one key. Flow runs the one blind reviewer whatever the change touches.
 
-Every seat runs with `CLAUDE_UNATTENDED=1` in its environment in both modes: builder, reviewer and specialist, on every harness lane. Nobody can answer a seat's question during a campaign, so a seat never stops to ask one.
+AutoBuild sets `CLAUDE_UNATTENDED=1` in the environment of every seat in both modes: builder, reviewer and specialist, on every harness lane. The variable does nothing by itself. A hook or tool of your own may read it to refuse to ask a question in a seat nobody is watching.
 
 ### Custom harness command
 
