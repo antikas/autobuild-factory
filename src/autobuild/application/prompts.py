@@ -5,6 +5,26 @@ from __future__ import annotations
 from pathlib import Path
 
 from autobuild.domain import ItemExecutionSpec, Seat
+from autobuild.domain.models import ReviewBoundary
+from autobuild.enforcement.test_scope import covering_label, item_covering_entries
+
+
+def _strict_test_constraint(spec: ItemExecutionSpec) -> str:
+    entries = item_covering_entries(spec.process, spec.brief_text)
+    if entries:
+        named = f"The covering tests for this item's declared paths are: {covering_label(entries)}."
+    else:
+        mapped = "; ".join(
+            f"{entry.pattern} is covered by {entry.label()}" for entry in spec.process.test_map
+        )
+        named = (
+            "This item's declared paths match no test-map entry. Run only the mapped tests "
+            f"for the files you change: {mapped}."
+        )
+    return (
+        "Process (strict): run only the tests that cover what you changed. "
+        f"{named} A whole-suite run is not allowed."
+    )
 
 
 def render_seat_instructions(
@@ -13,7 +33,12 @@ def render_seat_instructions(
     context_refs: tuple[str, ...],
     brief_path: Path | None = None,
     continuation: bool = False,
+    boundary: ReviewBoundary | None = None,
 ) -> str:
+    """The instructions for ``seat``. A specialist given ``boundary`` reviews
+    the change for that boundary, with its name and invariants file; a
+    specialist without one adjudicates an escalated finding."""
+
     acceptance = "\n".join(f"- {criterion}" for criterion in spec.item.acceptance)
     context = "\n".join(f"- {reference}" for reference in context_refs) or "- None"
     common = (
@@ -36,6 +61,8 @@ def render_seat_instructions(
             "Never run the repository's full test suite or the validator command; the validator "
             "runs after you finish and is the acceptance authority."
         )
+        if spec.process.strict:
+            role += "\n" + _strict_test_constraint(spec)
         if continuation:
             role += (
                 "\nContinuation: A previous builder seat timed out in this workspace before it "
@@ -60,6 +87,29 @@ def render_seat_instructions(
             '{"decision":"pass|correct|escalate|park","findings":['
             '{"code":"...","consequence":"...","evidence_ref":"...",'
             '"blocking":true,"specialist_boundary":null}],"evidence_ref":"..."}.'
+        )
+    elif boundary is not None:
+        invariants = (
+            f"Read the invariants file {boundary.invariants} first and judge the change against "
+            "each invariant it lists."
+            if boundary.invariants
+            else "No invariants file is named for this boundary; judge the change against what "
+            "a change to this area must preserve."
+        )
+        role = (
+            f"Specialist review for the {boundary.name} boundary. This change touches paths in "
+            f"that boundary ({', '.join(boundary.patterns)}). Review the actual brief, diff and "
+            "validator evidence from a fresh context, for this boundary only; a blind reviewer "
+            f"covers the rest. {invariants} Mark a finding blocking only for a concrete "
+            "consequence you would not merge under your own name; record everything else as a "
+            "non-blocking finding with decision pass. Return correct or escalate only with a "
+            "blocking finding."
+        )
+        contract = (
+            'Return only JSON matching review-verdict-v1: '
+            '{"decision":"pass|correct|escalate|park","findings":['
+            '{"code":"...","consequence":"...","evidence_ref":"...",'
+            f'"blocking":true,"specialist_boundary":"{boundary.name}"}}],"evidence_ref":"..."}}.'
         )
     else:
         role = (

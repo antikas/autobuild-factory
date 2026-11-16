@@ -61,9 +61,21 @@ from autobuild.domain import (
     review_verdict_rule_error,
     validator_command_id,
 )
-from autobuild.domain.models import BuilderContinuation, DeliveryParked, RevalidationDecision
+from autobuild.domain.models import (
+    BuilderContinuation,
+    DeliveryParked,
+    RevalidationDecision,
+    ReviewBoundary,
+)
 from autobuild.enforcement import classify_item_nature
 from autobuild.enforcement.pressure import PATIENT_LOOKBACK_SECONDS, stretched_seat_cap
+from autobuild.enforcement.review_scope import (
+    BLIND_REVIEWER,
+    boundary_findings,
+    combined_verdict,
+    review_seats,
+)
+from autobuild.enforcement.test_scope import seat_test_guard
 from autobuild.enforcement.triage import declared_path_tokens
 from autobuild.ports import RunRecordPort
 
@@ -1470,6 +1482,7 @@ class ItemWorkflow:
                 context_refs=context_refs,
                 progress_deadline_seconds=spec.seat_stall_seconds,
                 progress_digest=self._progress_digest(workspace),
+                test_guard=seat_test_guard(spec, Seat.BUILDER),
             ),
         )
         if builder.outcome is not SeatOutcome.SUCCEEDED:
@@ -1547,7 +1560,113 @@ class ItemWorkflow:
             reviewer.payload.evidence_ref,
             payload=self._verdict_payload(reviewer.payload),
         )
-        return reviewer.payload, diff, validation
+        choices = review_seats(spec.process, self._review_paths(spec, diff))
+        if choices[0] != BLIND_REVIEWER:
+            raise EvidenceError("a review round starts with the one blind reviewer")
+        boundaries = tuple(choice.boundary for choice in choices[1:] if choice.boundary)
+        if not boundaries:
+            return reviewer.payload, diff, validation
+        verdicts = (reviewer.payload,) + tuple(
+            self._boundary_review(
+                spec, workspace, boundary, (diff.patch_ref, command.stdout_ref), record, seats, router
+            )
+            for boundary in boundaries
+        )
+        evidence_ref = self._ports.records.write_evidence(
+            record,
+            f"{spec.item.item_id}-review-round-{len(seats)}",
+            json.dumps(
+                {
+                    "seats": ["blind"] + [boundary.name for boundary in boundaries],
+                    "verdicts": [self._verdict_payload(verdict) for verdict in verdicts],
+                },
+                indent=2,
+            ),
+        )
+        verdict = combined_verdict(verdicts, evidence_ref)
+        rule_error = review_verdict_rule_error(verdict)
+        if rule_error is not None:
+            raise EvidenceError(f"combined review verdict: {rule_error}")
+        self._event(
+            record,
+            "review.combined",
+            spec.item.item_id,
+            evidence_ref,
+            payload={
+                **self._verdict_payload(verdict),
+                "boundaries": [boundary.name for boundary in boundaries],
+            },
+        )
+        return verdict, diff, validation
+
+    @staticmethod
+    def _review_paths(spec: ItemExecutionSpec, diff: DiffEvidence) -> tuple[str, ...]:
+        """The paths review effort follows: the brief's declared paths and the
+        paths the diff changed."""
+
+        return declared_path_tokens(spec.brief_text) + tuple(
+            changed.path.as_posix() for changed in diff.changed_paths
+        )
+
+    def _boundary_review(
+        self,
+        spec: ItemExecutionSpec,
+        workspace: WorkspaceRef,
+        boundary: ReviewBoundary,
+        context_refs: tuple[str, ...],
+        record: RunRecordRef,
+        seats: list[SeatObservation],
+        router: _LaneRouter,
+    ) -> ReviewVerdict:
+        """One specialist seat that reviews the change for ``boundary``, given
+        its name and invariants file in the seat's brief."""
+
+        brief_path = self._workspace_brief(spec, workspace)
+        reviewer_policy = self._workspace_policy(
+            spec.reviewer_tool_policy or self._read_only_policy(spec), workspace
+        )
+        refs = context_refs + ((boundary.invariants,) if boundary.invariants else ())
+        result = self._invoke_seat(
+            router,
+            record,
+            seats,
+            spec,
+            SeatRequest(
+                run_id=record.run_id,
+                item_id=spec.item.item_id,
+                seat=Seat.SPECIALIST,
+                model_class=spec.specialist_model_class,
+                brief_path=brief_path,
+                workspace=workspace,
+                tool_policy=reviewer_policy,
+                instructions=render_seat_instructions(
+                    spec, Seat.SPECIALIST, refs, brief_path, boundary=boundary
+                ),
+                result_contract="review-verdict-v1",
+                timeout_seconds=spec.seat_timeout_seconds,
+                context_refs=refs,
+                progress_deadline_seconds=spec.seat_stall_seconds,
+                progress_digest=self._progress_digest(workspace),
+            ),
+        )
+        if result.outcome is not SeatOutcome.SUCCEEDED:
+            raise self._seat_failure(Seat.SPECIALIST, result)
+        if not isinstance(result.payload, ReviewVerdict):
+            raise EvidenceError("specialist result did not contain a typed ReviewVerdict")
+        if result.payload.item_id != spec.item.item_id:
+            raise EvidenceError("specialist verdict item does not match the selected item")
+        rule_error = review_verdict_rule_error(result.payload)
+        if rule_error is not None:
+            raise EvidenceError(rule_error)
+        verdict = boundary_findings(result.payload, boundary)
+        self._event(
+            record,
+            "specialist.completed",
+            spec.item.item_id,
+            verdict.evidence_ref,
+            payload={**self._verdict_payload(verdict), "boundary": boundary.name},
+        )
+        return verdict
 
     def _run_validator(
         self,

@@ -97,10 +97,10 @@ Start with a clean working tree. AutoBuild refuses to claim an item from a dirty
 
 ## Install AutoBuild
 
-Release 0.9.4 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.9.4). Install the released command from PyPI:
+Release 0.10.0 is published to PyPI as `autobuild-factory` and provides a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.10.0). Install the released command from PyPI:
 
 ```text
-uv tool install autobuild-factory==0.9.4
+uv tool install autobuild-factory==0.10.0
 ```
 
 AutoBuild 0.7.0 needs pinax-tracker 0.2.1 or later when the project uses Pinax. From 0.7.0 Pinax commits every tracker change itself and AutoBuild only verifies that commit; an earlier Pinax leaves the change uncommitted and AutoBuild stops at the first claim. Do not use AutoBuild 0.6.0 or earlier with pinax-tracker 0.2.1 or later: those versions commit the tracker change themselves and refuse a tracker that has already committed it.
@@ -134,7 +134,7 @@ Install `uv` with Homebrew, then install AutoBuild:
 
 ```text
 brew install uv
-uv tool install autobuild-factory==0.9.4
+uv tool install autobuild-factory==0.10.0
 autobuild --help
 ```
 
@@ -380,7 +380,7 @@ autobuild run --repository . --tracker backlog --backlog docs/QUEUE.md --deliver
 
 Create `.autobuild.toml` at the repository root. This file supplies facts that AutoBuild must not guess.
 
-AutoBuild refuses unknown top-level profile fields and unknown fields in every profile table. It reports every unknown field in one error. `[run.item_classes]` class names and `[lanes]` lane names remain open names; a class value must be a positive number of seconds, and a lane table must use the documented fields.
+AutoBuild refuses unknown top-level profile fields and unknown fields in every profile table. It reports every unknown field in one error. `[run.item_classes]` class names, `[lanes]` lane names and `[process.test_map]` patterns remain open names; a class value must be a positive number of seconds, and a lane table must use the documented fields.
 
 ```toml
 [run]
@@ -553,7 +553,7 @@ id = "project-check"
 argv = ["npm", "run", "check"]
 ```
 
-The validator is the deterministic acceptance authority. The model cannot replace or change it during a run. The builder prompt therefore tells the builder, as a constraint, to run only the tests for the files it changed and never the full suite or the validator command.
+The validator is the deterministic acceptance authority. The model cannot replace or change it during a run. The builder prompt therefore tells the builder, as a constraint, to run only the tests for the files it changed and never the full suite or the validator command. The opt-in [strict build process](#build-process) names those tests in the brief and forbids a whole-suite run.
 
 `patient_argv` is optional. A validator run that starts while the host pressure level is `high` or `critical`, or was at that level during the previous 60 seconds, is patient. With `patient_argv` set it runs that argument list instead of `argv`:
 
@@ -573,6 +573,82 @@ Without `patient_argv` it runs `argv` with `AUTOBUILD_HOST_PRESSURE=1` added to 
 `allowed_roots` adds approved directories outside the repository. Use it for an external brief or shared read-only reference. Paths can be absolute or relative to the profile.
 
 The builder receives the isolated worktree plus the configured external roots. The reviewer receives read access to the same roots.
+
+### Build process
+
+The optional `[process]` table selects the build process. `mode` is `flow` or `strict`. A profile without the table, or a table without `mode`, runs `flow`, which changes nothing for an existing profile. Any other value is refused when the profile loads.
+
+`strict` limits each builder seat to the tests that cover what it changed. It needs a test map:
+
+```toml
+[process]
+mode = "strict"
+test_command = ["uv", "run", "pytest"]
+
+[process.test_map]
+"src/app/profile/**" = ["tests/unit/test_profile.py"]
+"src/app/api/**" = ["tests/unit/api", "tests/contract/test_api.py"]
+"web/**" = "npm test -- web"
+```
+
+`test_command` is the argument list that starts the project's test runner. Each `test_map` key is a path pattern for source files: `**` spans directories, while `*` and `?` stay inside one path segment. Each value names the tests that cover matching files. An array lists test paths, which run after `test_command`; an array that is empty or holds anything but non-empty strings is refused when the profile loads, with one sentence that names the key. A string is one complete test command line, split by shell quoting rules, so `"npm test -- --grep 'profile page'"` keeps `profile page` as one argument; a string with an unclosed quote is refused. A map with test paths needs `test_command`. Strict mode without a test map is refused.
+
+In strict mode the builder brief names the covering tests for the paths listed under the item's `## Declared paths` heading, and says a whole-suite run is not allowed. When no declared path matches an entry, the brief lists the whole map.
+
+The rule is also enforced where the builder's commands run. A builder seat in strict mode gets a pre-command check that passes every shell command line it runs to the refusal rule. The rule splits the line into its commands at `&&`, `||`, `;`, pipes and new lines, also when a redirection follows with no space, as in `echo hi;>x pytest`, and ignores leading variable assignments. Only an unquoted `<` or `>` is a redirection; the rule drops it and its target. A quoted or escaped one, as in `-k "a>b"`, is part of an argument. It admits a test run only when every test it selects is a covering test.
+
+A test run is any command that starts the project's test runner, however it is spelled. AutoBuild reads the runner from `test_command`, past any `uv run` and `python -m` in front of it. With `test_command = ["uv", "run", "pytest"]` the runner is `pytest`, so `pytest`, `python -m pytest`, `python3 -m pytest`, `uv run pytest`, `uv run python -m pytest`, `uv run --native-tls python -m pytest`, `uv -q run pytest` with a `uv` option before `run`, and a path ending in `/pytest` such as `.venv/bin/pytest` are all test runs. With `test_command = ["npm", "test"]` the runner is `npm test`, and `npm install` is not a test run.
+
+These are whole-suite runs and are refused with one sentence that names the covering tests:
+
+- a run of the runner that selects no test path;
+- a run that names a directory, including a bare `tests` or `.` with no slash, even alongside a covering test;
+- a run that names a test outside the covering tests;
+- the bare start of a mapped command line, such as `npm test`.
+
+Every bare word in a runner's arguments selects a test, also straight after an option such as `-q`, and every word after `--`. The one exception is the value of a runner option that takes one. AutoBuild keeps a small table of these per runner; for `pytest` it holds options such as `-k`, `-m`, `-p`, `--maxfail` and `--tb`, so the `profile` in `-k profile` selects no test. For a runner without a table, give an option's value as `--option=value`. A command that is not a test run, such as `git status`, always runs.
+
+How each lane carries the check:
+
+| Lane | Pre-command check |
+|---|---|
+| `claude-code` | A `PreToolUse` hook on the Bash tool, passed in the seat's `--settings` launch argument. The hook denies a refused command, and the seat sees the refusal sentence. `--safe-mode` would switch the hook off, so this seat starts with `--setting-sources ""`, `--strict-mcp-config` and `--disable-slash-commands` instead; every other seat keeps `--safe-mode`. |
+| `claude-sdk` | The same hook in the seat's flag settings, with the same options in place of `--safe-mode`. For a strict builder seat the lane lifts `disableAllHooks`; the seat loads no setting sources, so this hook is the only one it runs. |
+| `codex` | None. The lane has no pre-command hook AutoBuild can install, so the brief alone carries the rule. |
+| `github-copilot` | None. The lane has no pre-command hook AutoBuild can install, so the brief alone carries the rule. |
+
+The check is installed for builder seats in strict mode only. Flow mode, reviewer and specialist seats get no check. The validator that runs after the builder, the delivery revalidation and the batch validation are run by AutoBuild, not by a seat. They carry no check and still run the full `[validator] argv`.
+
+#### Review that follows what a change touches
+
+The optional boundary map names sensitive areas of the project. Each boundary is a table under `[process.boundaries]`: its key is the boundary's name, `paths` is a non-empty list of path patterns, matched like test-map keys, and `invariants` is the optional repository path of a file that lists what a change there must preserve.
+
+```toml
+[process.boundaries.sign-in]
+paths = ["src/app/auth/**", "src/app/session.py"]
+invariants = "docs/invariants/sign-in.md"
+
+[process.boundaries.payments]
+paths = ["src/app/billing/**"]
+invariants = "docs/invariants/payments.md"
+
+[process.boundaries.personal-data]
+paths = ["src/app/profile/**", "src/app/export/**"]
+
+[process.boundaries.schema]
+paths = ["migrations/**", "src/app/models.py"]
+invariants = "docs/invariants/schema.md"
+```
+
+In strict mode each review round runs the one blind reviewer, as in flow. When the item's paths touch a boundary, AutoBuild adds one specialist seat per boundary touched, in map order. The item's paths are the paths under its `## Declared paths` heading and the paths its diff changed. Each specialist's brief names its boundary and its invariants file, or says that none is named, and it reviews the change for that boundary only. A specialist finding that names no boundary is recorded under its seat's boundary. An item that touches no boundary gets the one blind reviewer only.
+
+The round's verdict is the most severe of all its seats' verdicts: park, then escalate, then correct, then pass. It carries every seat's findings and is checked by the same verdict rule as each seat's own verdict. AutoBuild writes the seats' verdicts to one evidence file and records a `review.combined` event; a correction round receives that file. Each boundary seat records a `specialist.completed` event that names its boundary. A specialist that escalation calls in is a separate seat and works as it does in flow.
+
+A blank boundary name, an unknown key in a boundary, a boundary that is not a table, a missing or empty `paths`, a path that is not a string, or an `invariants` value that is not a file path string is refused when the profile loads, with one sentence that names the boundary when it has a name. The map is checked in both modes.
+
+In `flow` none of this applies. The test map and the boundary map may stay in the profile, so switching modes is one key. Flow runs the one blind reviewer whatever the change touches.
+
+Every seat runs with `CLAUDE_UNATTENDED=1` in its environment in both modes: builder, reviewer and specialist, on every harness lane. Nobody can answer a seat's question during a campaign, so a seat never stops to ask one.
 
 ### Custom harness command
 
@@ -684,7 +760,7 @@ The meter needs `curl` on `PATH` and Claude Code's `.credentials.json` file in i
 The `claude-sdk` lane runs Claude Code seats through the Claude Agent SDK on an API key, so a campaign can keep building when the subscription lane is cooled. Install AutoBuild with the optional extra:
 
 ```text
-uv tool install "autobuild-factory[sdk]==0.9.4"
+uv tool install "autobuild-factory[sdk]==0.10.0"
 ```
 
 Create an API key in the Console organisation whose credit should pay for the seats, save it alone in a file, and name the file in the lane table. Put the lane last so it is used only when the earlier lanes are cooled:

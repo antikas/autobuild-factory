@@ -66,7 +66,11 @@ _ASSISTANT_ERRORS: dict[str, LaneSignalKind] = {
 
 # Seat-vector options and how each reaches the SDK. The SDK always runs its CLI
 # in streaming print mode, so the print and output-format options are its own.
-_SDK_FLAGS = frozenset({"--safe-mode", "--no-session-persistence"})
+# Flags reach the CLI through ``extra_args``; ``--setting-sources`` is the SDK's
+# own ``setting_sources`` option, which it passes to the CLI itself.
+_SDK_FLAGS = frozenset(
+    {"--safe-mode", "--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands"}
+)
 _SDK_OWNED = frozenset({"--print"})
 _VALUE_OPTIONS = frozenset(
     {
@@ -79,6 +83,8 @@ _VALUE_OPTIONS = frozenset(
         "--allowedTools",
         "--output-format",
         "--json-schema",
+        "--settings",
+        "--setting-sources",
     }
 )
 _POLL_SECONDS = 0.2
@@ -353,6 +359,14 @@ class ClaudeSdkHarnessAdapter(ClaudeCodeHarnessAdapter):
             raise CapabilityError("the claude-sdk lane needs the seat's structured JSON result")
         tools = tuple(part for part in values.get("--tools", "").split(",") if part)
         allowed = tuple(part for part in values.get("--allowedTools", "").split(",") if part)
+        sources = tuple(part for part in values.get("--setting-sources", "").split(",") if part)
+        if sources:
+            raise CapabilityError("the claude-sdk lane loads no setting source")
+        settings = self._seat_settings(values.get("--settings"))
+        if "safe-mode" in flags and settings.get("hooks"):
+            raise CapabilityError(
+                "a Claude Code seat cannot carry a hook and --safe-mode, which switches every hook off"
+            )
         return SdkSeatSpec(
             prompt=Path(stdin_ref).read_text(encoding="utf-8"),
             cwd=request.workspace.root,
@@ -365,9 +379,24 @@ class ClaudeSdkHarnessAdapter(ClaudeCodeHarnessAdapter):
             session_id=values["--session-id"],
             effort=values.get("--effort"),
             flags=tuple(flags),
-            settings=self._settings() if self._key_file is not None else {},
+            settings=settings,
             environment=self._child_environment(config_dir, request.item_id),
+            setting_sources=sources,
         )
+
+    def _seat_settings(self, seat_settings: str | None) -> dict[str, Any]:
+        """The lane's flag settings plus the seat vector's own. A seat vector
+        carrying hooks (the strict builder's test hook) lifts
+        ``disableAllHooks``; no setting source loads, so its hooks are the only
+        hooks the seat runs."""
+
+        settings = self._settings() if self._key_file is not None else {}
+        if seat_settings is None:
+            return settings
+        extra = json.loads(seat_settings)
+        if "hooks" in extra:
+            settings.pop("disableAllHooks", None)
+        return {**settings, **extra}
 
     def seat_transport(self, request: SeatRequest) -> SeatTransport:
         """How a seat reaches the SDK's CLI, for the preflight doctor."""

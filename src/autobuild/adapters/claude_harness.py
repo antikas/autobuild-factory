@@ -9,12 +9,40 @@ import shutil
 from pathlib import Path
 from uuid import uuid4
 
+from autobuild.adapters.claude_test_hook import hook_settings, write_guard
 from autobuild.adapters.claude_usage import CLAUDE_SUBSCRIPTION_METER
 from autobuild.adapters.harness_cli import CliHarnessAdapter, _safe_name, result_schema
-from autobuild.domain import EffortLevel, LaneSignal, Seat, SeatRequest, SeatResult
+from autobuild.domain import (
+    CapabilityError,
+    EffortLevel,
+    LaneSignal,
+    Seat,
+    SeatRequest,
+    SeatResult,
+)
 from autobuild.ports import CommandPort
 
 SEAT_RESULT_FILE = ".autobuild-seat-result.json"
+
+
+def refuse_hook_under_safe_mode(argv: tuple[str, ...]) -> None:
+    """Refuse a seat vector that carries a hook in its ``--settings`` value and
+    also ``--safe-mode``, which switches every hook off: the hook would be
+    installed and never called."""
+
+    if "--safe-mode" not in argv:
+        return
+    for index, option in enumerate(argv[:-1]):
+        if option != "--settings":
+            continue
+        try:
+            settings = json.loads(argv[index + 1])
+        except ValueError:
+            continue
+        if isinstance(settings, dict) and settings.get("hooks"):
+            raise CapabilityError(
+                "a Claude Code seat cannot carry a hook and --safe-mode, which switches every hook off"
+            )
 
 
 class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
@@ -132,10 +160,11 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
         prompts.mkdir(parents=True, exist_ok=True)
         prompt = prompts / f"{_safe_name(run_ref)}.md"
         prompt.write_text(request.instructions, encoding="utf-8")
+        hook = self._test_hook_arguments(request, run_ref)
         argv = (
             *self._command,
             "--print",
-            "--safe-mode",
+            *self._isolation_arguments(bool(hook)),
             "--no-session-persistence",
             "--permission-mode",
             "dontAsk",
@@ -154,8 +183,42 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
             "json",
             "--json-schema",
             json.dumps(result_schema(request.result_contract), separators=(",", ":")),
+            *hook,
         )
+        refuse_hook_under_safe_mode(argv)
         return argv, None, str(prompt)
+
+    @staticmethod
+    def _isolation_arguments(carries_hook: bool) -> tuple[str, ...]:
+        """How the seat is kept from the user's and the project's own
+        customizations.
+
+        ``--safe-mode`` switches all of them off, hooks included, so a seat
+        that carries the application's hook would never call it. Such a seat
+        instead loads no settings source (no user, project or local settings,
+        and with them no CLAUDE.md, enabled plugins, custom agents, commands
+        or output style), uses only the MCP servers it is given (none), and
+        has skills and slash commands switched off. Its only hooks are the
+        ones in the ``--settings`` value the application passes."""
+
+        if not carries_hook:
+            return ("--safe-mode",)
+        return ("--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands")
+
+    def _test_hook_arguments(self, request: SeatRequest, run_ref: str) -> tuple[str, ...]:
+        """``--settings`` carrying the strict test hook, for a strict builder
+        seat only; every other seat gets no argument."""
+
+        if request.test_guard is None or request.seat is not Seat.BUILDER:
+            return ()
+        guard = write_guard(
+            request.test_guard, self._output_root / "test-guards" / f"{_safe_name(run_ref)}.json"
+        )
+        try:
+            settings = hook_settings(guard)
+        except ValueError as exc:
+            raise CapabilityError(str(exc)) from exc
+        return ("--settings", json.dumps(settings, separators=(",", ":")))
 
     def _contract_prompt(self, request: SeatRequest) -> str:
         schema = json.dumps(result_schema(request.result_contract), separators=(",", ":"))

@@ -721,6 +721,95 @@ class ToolPolicy:
     allow_protected_merge: bool = False
 
 
+class ProcessMode(str, Enum):
+    """The build process a profile opts into. ``flow`` is the default;
+    ``strict`` limits a builder seat to the tests that cover its change."""
+
+    FLOW = "flow"
+    STRICT = "strict"
+
+
+@dataclass(frozen=True, slots=True)
+class TestCoverage:
+    """One test-map entry: source paths matching ``pattern`` are covered by
+    the test paths in ``tests`` or by the full argument list ``command``."""
+
+    __test__ = False
+
+    pattern: str
+    tests: tuple[str, ...] = ()
+    command: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.pattern.strip():
+            raise ValueError("a test-map pattern must not be empty")
+        if bool(self.tests) == bool(self.command):
+            raise ValueError("a test-map entry names test paths or a test command")
+
+    def label(self) -> str:
+        """How the brief and a refusal name this entry's covering tests."""
+
+        return " ".join(self.command) if self.command else ", ".join(self.tests)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewBoundary:
+    """One named sensitive area of the boundary map: a change to a path that
+    matches one of ``patterns`` touches it. ``invariants`` is the repository
+    path of the file listing what a change there must preserve, if any."""
+
+    name: str
+    patterns: tuple[str, ...]
+    invariants: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("a boundary name must not be empty")
+        if not self.patterns or not all(pattern.strip() for pattern in self.patterns):
+            raise ValueError(f"boundary {self.name} needs at least one path pattern")
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessPolicy:
+    """The profile's ``[process]`` table. ``test_command`` is the argument list
+    that starts the project's test runner; covering test paths follow it.
+    ``boundaries`` is the boundary map; only strict mode reads it."""
+
+    mode: ProcessMode = ProcessMode.FLOW
+    test_command: tuple[str, ...] = ()
+    test_map: tuple[TestCoverage, ...] = ()
+    boundaries: tuple[ReviewBoundary, ...] = ()
+
+    @property
+    def strict(self) -> bool:
+        return self.mode is ProcessMode.STRICT
+
+    def __post_init__(self) -> None:
+        if self.strict and not self.test_map:
+            raise ValueError("strict process mode needs a test map")
+        if any(entry.tests for entry in self.test_map) and not self.test_command:
+            raise ValueError("a test map with test paths needs a test command")
+        names = [boundary.name for boundary in self.boundaries]
+        if len(names) != len(set(names)):
+            raise ValueError("boundary names must be unique")
+
+
+@dataclass(frozen=True, slots=True)
+class TestGuard:
+    """The pre-command check a strict builder seat carries: the process policy
+    and the item's covering entries the refusal rule judges a command against.
+    Only a builder seat in strict mode carries one."""
+
+    __test__ = False
+
+    policy: ProcessPolicy
+    covering: tuple[TestCoverage, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.policy.strict:
+            raise ValueError("a test guard needs the strict process mode")
+
+
 @dataclass(frozen=True, slots=True)
 class ItemExecutionSpec:
     item: WorkItem
@@ -750,6 +839,9 @@ class ItemExecutionSpec:
     # starts under recent host pressure runs instead. Empty means the normal
     # argv with the host-pressure variable set.
     validator_patient_argv: tuple[str, ...] = ()
+    # The profile's ``[process]`` table; in strict mode the builder brief names
+    # the covering tests for the item's declared paths.
+    process: ProcessPolicy = ProcessPolicy()
 
     def seat_effort(self, seat: Seat, lane: str) -> EffortLevel | None:
         """The effort ``seat`` asks for on ``lane``, or None to leave the harness
@@ -813,6 +905,9 @@ class SeatRequest:
     # Seconds added to ``timeout_seconds`` so far, read again on every check:
     # the cap stretches while the host is under recorded pressure.
     timeout_extension: Callable[[], float] | None = field(default=None, compare=False)
+    # The strict-process pre-command check; set for a strict builder seat only.
+    # A harness that can carry it installs it where the seat's shell commands run.
+    test_guard: TestGuard | None = None
 
     def current_timeout_seconds(self) -> float:
         return timeout_with_extension(self.timeout_seconds, self.timeout_extension)
@@ -824,6 +919,8 @@ class SeatRequest:
             raise ValueError("seat instructions must not be empty")
         if self.progress_deadline_seconds < 0:
             raise ValueError("seat progress deadline must not be negative")
+        if self.test_guard is not None and self.seat is not Seat.BUILDER:
+            raise ValueError("only a builder seat carries a test guard")
 
 
 @dataclass(frozen=True, slots=True)

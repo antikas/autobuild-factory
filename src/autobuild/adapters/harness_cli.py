@@ -284,6 +284,9 @@ class CliHarnessAdapter:
     # subscription seat never bills an API key that happens to be set in the
     # parent environment.
     removed_environment: tuple[str, ...] = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+    # Set for every seat in every lane and process mode: nobody can answer a
+    # seat's question, so an unattended seat never stops to ask one.
+    unattended_environment: tuple[tuple[str, str], ...] = (("CLAUDE_UNATTENDED", "1"),)
     # The effort levels this adapter can pass to its command. A seat asking for any
     # other level is refused, never run without its effort.
     effort_levels: frozenset[EffortLevel] = frozenset()
@@ -542,6 +545,7 @@ class CliHarnessAdapter:
 
         environment = dict(self._scratch_environment())
         environment.update(item_scratch_environment(self._output_root / "scratch", item_id))
+        environment.update(self.unattended_environment)
         return tuple(environment.items())
 
     def _model(self, model_class: str) -> str:

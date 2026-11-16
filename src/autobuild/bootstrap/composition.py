@@ -866,6 +866,7 @@ def _specification(
             delivery_target_revision=target_revision,
             push_current_branch=push_current_branch,
             allow_current_branch_default=allow_current_branch_default,
+            process=settings.process,
         )
 
     return for_item
