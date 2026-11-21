@@ -212,3 +212,101 @@ def test_pinax_resumable_claims_lists_builder_claimed_and_not_terminal(tmp_path:
     claims = tracker.resumable_claims(campaign)
     assert [claim.item_id for claim in claims] == [item_id]
     assert claims[0].brief_ref == "docs/brief.md"
+
+
+@pytest.mark.usefixtures("self_committing_pinax")
+def test_pinax_known_item_ids_lists_created_items_in_every_status(tmp_path: Path) -> None:
+    repo, ready_id = pinax_repo(tmp_path)
+    campaign = CampaignRef("campaign", repo)
+    tracker = PinaxTrackerAdapter(repo)
+
+    def add(title: str) -> str:
+        created = json.loads(
+            pinax(
+                repo, "add", "--title", title, "--prefix", "tst",
+                "--actor", "coordinator@proof", "--json",
+            )
+        )
+        return str(created.get("item_id") or created["id"])
+
+    blocked_id = add("Blocked behind a gate")
+    pinax(repo, "block", blocked_id, "--gate", "proposal", "--actor", "coordinator@proof", "--json")
+    done_id = add("Already done")
+    pinax(repo, "status", done_id, "done", "--actor", "coordinator@proof", "--json")
+
+    def status_of(item_id: str) -> str:
+        text = (repo / ".ergon" / "items" / f"{item_id}.md").read_text(encoding="utf-8")
+        line = next(line for line in text.splitlines() if line.startswith("status:"))
+        return line.partition(":")[2].strip()
+
+    assert status_of(blocked_id) == "blocked"
+    assert status_of(done_id) == "done"
+    assert status_of(ready_id) != "blocked"
+
+    assert tracker.known_item_ids(campaign) == frozenset({ready_id, blocked_id, done_id})
+    assert [item.item_id for item in tracker.ready_items(campaign)] == [ready_id]
+
+    late_id = add("Created after launch")
+    assert late_id in tracker.known_item_ids(campaign)
+
+
+def test_pinax_known_item_ids_refuses_another_repository(tmp_path: Path) -> None:
+    repo, _ = pinax_repo(tmp_path)
+    tracker = PinaxTrackerAdapter(repo)
+
+    with pytest.raises(AdapterError):
+        tracker.known_item_ids(CampaignRef("campaign", tmp_path / "other"))
+
+
+def _add_with_brief(repo: Path, title: str) -> str:
+    created = json.loads(
+        pinax(
+            repo, "add", "--title", title, "--prefix", "tst",
+            "--actor", "coordinator@proof", "--json",
+        )
+    )
+    item_id = str(created.get("item_id") or created["id"])
+    pinax(
+        repo, "note", "add", item_id, "--ref", "docs/brief.md",
+        "--caption", "Measurable acceptance.", "--actor", "coordinator@proof", "--json",
+    )
+    return item_id
+
+
+@pytest.mark.usefixtures("self_committing_pinax")
+def test_pinax_ready_items_lead_with_the_pinax_next_head(tmp_path: Path) -> None:
+    repo, first_id = pinax_repo(tmp_path)
+    campaign = CampaignRef("campaign", repo)
+    tracker = PinaxTrackerAdapter(repo)
+    second_id = _add_with_brief(repo, "Second ready item")
+    lower, higher = sorted((first_id, second_id))
+    pinax(repo, "priority", higher, "top", "--actor", "coordinator@proof", "--json")
+    pinax(repo, "priority", lower, "50", "--actor", "coordinator@proof", "--json")
+
+    head = tracker.next_item(campaign)
+    items = tracker.ready_items(campaign)
+
+    assert head is not None and head.item_id == higher
+    assert [item.item_id for item in items] == [higher, lower]
+    assert items[0].item_id == head.item_id
+
+
+@pytest.mark.usefixtures("self_committing_pinax")
+def test_pinax_blocked_item_ids_names_gated_items_and_unfinished_dependencies(
+    tmp_path: Path,
+) -> None:
+    repo, ready_id = pinax_repo(tmp_path)
+    campaign = CampaignRef("campaign", repo)
+    tracker = PinaxTrackerAdapter(repo)
+    actor = ("--actor", "coordinator@proof", "--json")
+
+    gated_id = _add_with_brief(repo, "Blocked behind a gate")
+    pinax(repo, "block", gated_id, "--gate", "proposal", *actor)
+    waiting_id = _add_with_brief(repo, "Waits on an unfinished item")
+    pinax(repo, "dep", "add", ready_id, "--blocks", waiting_id, *actor)
+    finished_id = _add_with_brief(repo, "Finished dependency")
+    pinax(repo, "status", finished_id, "done", *actor)
+    freed_id = _add_with_brief(repo, "Its dependency is done")
+    pinax(repo, "dep", "add", finished_id, "--blocks", freed_id, *actor)
+
+    assert tracker.blocked_item_ids(campaign) == frozenset({gated_id, waiting_id})

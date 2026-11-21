@@ -2,8 +2,9 @@
 
 The meter is the endpoint the Claude Code client reads for its own usage view:
 ``GET https://api.anthropic.com/api/oauth/usage`` with the subscription's OAuth
-bearer token. The endpoint is undocumented, so every failure becomes a reading
-with ``ok=False`` and is never raised.
+bearer token. The endpoint is undocumented and unsupported, and it may change
+or stop working without notice, so every failure becomes a reading with
+``ok=False`` and is never raised.
 
 The token is read from the Claude Code credentials file on every call and handed
 to curl on standard input through a pipe (curl reads the header with ``-H @-``).

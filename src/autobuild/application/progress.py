@@ -2,8 +2,8 @@
 
 One run event is the single source for both its recorded payload and its owner
 progress line, so the two can never drift. The rendering is pure and clock-free:
-the timestamp it carries is the event's own ``occurred_at``, which the run-record
-adapter stamps, so no wall clock is read here."""
+the timestamp it carries is the event's own ``occurred_at``, stamped from the
+run-record port's clock, so no wall clock is read here."""
 
 from __future__ import annotations
 
@@ -22,7 +22,9 @@ def render_progress_line(event: RunEvent) -> str:
     """Render one owner-facing progress line, or an empty string for an event
     that carries no owner-level meaning.
 
-    The line is ASCII and carries no absolute filesystem path. When the event has
+    The line is ASCII and carries no absolute filesystem path, except the
+    validator output reference of a batch validation that failed at campaign
+    end, which is the evidence the completion line must name. When the event has
     an ``occurred_at`` it prefixes the line in the UTC ISO 8601 form the
     run-record adapter stamped."""
 
@@ -82,6 +84,11 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
         return f"item {item_id} correction round {payload.get('round', '?')}"
     if event_type == "item.parked":
         return f"item {item_id} parked: {payload.get('reason', '')}"
+    if event_type == "item.effort_raised":
+        return (
+            f"item {item_id} validator did not pass; a fresh builder retries at effort "
+            f"{payload.get('effort', '?')} (was {payload.get('from_effort', '?')})"
+        )
     if event_type == "item.builder_continued":
         return (
             f"item {item_id} builder timed out; claim and worktree kept, a fresh builder "
@@ -144,6 +151,11 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
         return f"item {item_id} skipped: {payload.get('reason', '')}; it is not claimed"
     if event_type == "campaign.refill_failed":
         return f"refill failed: {payload.get('error', '')}"
+    if event_type == "campaign.launch_set_failed":
+        return (
+            f"the tracker could not list its items at launch: {payload.get('error', '')}; "
+            "nothing is admitted and the campaign ends"
+        )
     if event_type == "campaign.scope_fence_violation":
         return "the tracker offered an item outside the selection fence; it is not claimed"
     if event_type == "item.admitted":
@@ -157,6 +169,19 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
             f"waiting to admit: {_WAIT_REASONS.get(payload.get('reason', ''), payload.get('reason', ''))}"
             f"{_items(payload.get('items', ()))}; "
             f"{payload.get('running', '?')} of {payload.get('concurrency', '?')} running"
+        )
+    if event_type == "campaign.pause_requested":
+        running = [str(name) for name in payload.get("running", ())]
+        if running:
+            return (
+                f"pause requested: no new admissions; waiting for "
+                f"{', '.join(running)} to finish, then the campaign stops"
+            )
+        return "pause requested: nothing is running, the campaign stops now"
+    if event_type == "campaign.resumed":
+        return (
+            f"resuming paused run {payload.get('prior_run_id', '')}: "
+            "its pause request is lifted"
         )
     if event_type == "campaign.draining":
         return (
@@ -194,6 +219,13 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
         return (
             f"tracker lease renewal failed {payload.get('failures', '?')} times in a row; "
             "no new admissions until it renews"
+        )
+    if event_type == "campaign.pause_check_failed":
+        if payload.get("consecutive") != 1:
+            return ""
+        return (
+            f"pause check failed: {payload.get('error', '')}; "
+            "a pause request is seen at the next admission decision"
         )
     if event_type == "campaign.lease_restored":
         return "tracker lease renewed again; admissions resume"
@@ -236,6 +268,7 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
         return (
             f"{CAMPAIGN_COMPLETED_PREFIX}: shipped {payload.get('accepted', 0)}, "
             f"parked {payload.get('parked', 0)}, failed {payload.get('failed', 0)}; "
+            f"{_batch_failure(payload)}"
             f"report {payload.get('report', '')}; "
             f"stop {payload.get('stop_reason', '')}"
         )
@@ -315,6 +348,28 @@ def rounded_cost(cost: float) -> str:
 
 def _cost(cost: Any) -> str:
     return "" if cost is None else f", estimated cost {rounded_cost(cost)}"
+
+
+def _batch_failure(payload: Mapping[str, Any]) -> str:
+    if payload.get("batch_validation") != "failed":
+        return ""
+    revision = payload.get("batch_revision") or "unknown"
+    stdout_ref = _one_ascii_line(payload.get("batch_stdout_ref"))
+    error = _one_ascii_line(payload.get("batch_error"))
+    if stdout_ref:
+        evidence = f"output {stdout_ref}"
+    elif error:
+        evidence = f"error {error}"
+    else:
+        evidence = "output none"
+    return f"batch validation failed on {revision}; {evidence}; "
+
+
+def _one_ascii_line(value: Any) -> str:
+    if value is None:
+        return ""
+    flat = " ".join(str(value).split())
+    return flat.encode("ascii", "backslashreplace").decode("ascii")
 
 
 def _commit(value: Any) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,6 +40,27 @@ class EffortLevel(str, Enum):
     HIGH = "high"
     XHIGH = "xhigh"
     MAX = "max"
+
+
+# A failed outcome check raises a seat's effort no further than this; going past
+# it is for the next model up, not for the same model.
+EFFORT_RAISE_CEILING = EffortLevel.HIGH
+
+
+def raised_effort(level: EffortLevel | None, raises: int) -> EffortLevel | None:
+    """``level`` raised ``raises`` steps, capped at ``EFFORT_RAISE_CEILING``.
+
+    A level at or past the ceiling is kept as it is, and no level (the harness
+    default) stays no level, because there is nothing known to raise from."""
+
+    if level is None or raises <= 0:
+        return level
+    order = list(EffortLevel)
+    ceiling = order.index(EFFORT_RAISE_CEILING)
+    current = order.index(level)
+    if current >= ceiling:
+        return level
+    return order[min(current + raises, ceiling)]
 
 
 class SeatOutcome(str, Enum):
@@ -111,6 +133,10 @@ class CampaignStopReason(str, Enum):
     TRACKER_REFUSED = "tracker_refused"
     # A hold on admissions lasted ``run.hold_limit_seconds`` without clearing.
     HOLD_LIMIT = "hold_limit"
+    # The operator asked for a pause; the next run on the repository resumes.
+    PAUSED = "paused"
+    # The tracker could not list its items at launch, so no launch set exists.
+    LAUNCH_SET_UNREADABLE = "launch_set_unreadable"
 
 
 class HoldCondition(str, Enum):
@@ -639,13 +665,18 @@ class ResumePlan:
     had run, and ``prior_run_id`` names the run the marker came from.
     ``continuations`` counts the builder seats that timed out on this item in
     this campaign; above zero the resumed builder continues their partial work
-    in the same worktree."""
+    in the same worktree. ``builder_raises`` and ``builder_context_refs`` carry
+    the effort raises and the context references of a builder attempt that
+    timed out, so its continuation is the same attempt; a plan made from a
+    phase marker carries neither."""
 
     marker_state: str
     worktree_root: Path
     correction_count: int
     prior_run_id: str
     continuations: int = 0
+    builder_raises: int = 0
+    builder_context_refs: tuple[str, ...] = ()
 
 
 class SurfaceKind(str, Enum):
@@ -727,6 +758,20 @@ class ProcessMode(str, Enum):
 
     FLOW = "flow"
     STRICT = "strict"
+
+
+class ReviewLane(str, Enum):
+    """The review lane a strict item with a boundary map runs in, chosen by
+    what its paths touch. ``small`` touches no boundary and gets one review
+    and one correction; ``material`` touches one and gets two reviews and two
+    corrections. Named apart from the harness lane a seat runs on."""
+
+    SMALL = "small"
+    MATERIAL = "material"
+
+    @property
+    def correction_limit(self) -> int:
+        return 1 if self is ReviewLane.SMALL else 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -882,6 +927,18 @@ def timeout_with_extension(
 
 
 @dataclass(frozen=True, slots=True)
+class SeatLaunch:
+    """The launch a harness gave one seat: its argument vector and the names of
+    the environment variables it set and removed. It holds names only, so a
+    record built from it can never carry an environment value."""
+
+    argv: tuple[str, ...]
+    set_environment: tuple[str, ...]
+    removed_environment: tuple[str, ...]
+    in_process: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class SeatRequest:
     run_id: str
     item_id: str
@@ -908,6 +965,8 @@ class SeatRequest:
     # The strict-process pre-command check; set for a strict builder seat only.
     # A harness that can carry it installs it where the seat's shell commands run.
     test_guard: TestGuard | None = None
+    # Called by the harness with the seat's launch just before the seat runs.
+    on_launch: Callable[[SeatLaunch], None] | None = field(default=None, compare=False)
 
     def current_timeout_seconds(self) -> float:
         return timeout_with_extension(self.timeout_seconds, self.timeout_extension)
@@ -1100,11 +1159,53 @@ class ReviewFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class InspectedPath:
+    """A path a review seat reports it read, with the line ranges it read
+    (``"1-120,300-340"`` or ``"all"``)."""
+
+    path: str
+    lines: str
+
+
+class ClauseOutcome(str, Enum):
+    MET = "met"
+    UNMET = "unmet"
+    NOT_CHECKED = "not_checked"
+
+
+@dataclass(frozen=True, slots=True)
+class ClauseCheck:
+    """A review seat's judgement of one numbered acceptance clause (``A1``)."""
+
+    clause: str
+    outcome: ClauseOutcome
+    evidence_ref: str
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewVerdict:
     item_id: str
     decision: ReviewDecision
     findings: tuple[ReviewFinding, ...]
     evidence_ref: str
+    inspected: tuple[InspectedPath, ...] = ()
+    acceptance: tuple[ClauseCheck, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewDepth:
+    """How deeply one review seat reviewed, as the seat reported it and
+    checked against the diff. ``boundary`` names a specialist's boundary."""
+
+    seat: Seat
+    boundary: str | None
+    duration_seconds: float | None
+    changed_paths: int
+    inspected_changed_paths: int
+    clauses: int
+    clauses_checked: int
+    shallow: bool
+    reasons: tuple[str, ...] = ()
 
 
 def review_verdict_rule_error(verdict: ReviewVerdict) -> str | None:
@@ -1121,6 +1222,11 @@ def review_verdict_rule_error(verdict: ReviewVerdict) -> str | None:
     if decision is ReviewDecision.PASS:
         if has_blocking:
             return "a pass verdict must not carry a blocking finding"
+        unmet = [
+            check.clause for check in verdict.acceptance if check.outcome is ClauseOutcome.UNMET
+        ]
+        if unmet:
+            return f"a pass verdict must not report acceptance clause {unmet[0]} unmet"
         return None
     if decision is ReviewDecision.PARK:
         if not findings:
@@ -1139,6 +1245,11 @@ class CloseEvidence:
     validation: ValidationEvidence
     verdict: ReviewVerdict
     trajectory_ref: str
+    # Set when the final round ended on a `correct` verdict over a green
+    # validation; the close gate accepts that verdict only with this mark.
+    accepted_at_round_limit: bool = False
+    # The lane the builder last settled on; empty when no lane is known.
+    builder_lane: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1279,6 +1390,14 @@ class Proposal:
     question: str
     rationale: str
     brief_ref: str
+    # Set for a reviewer-finding follow-up; a refill proposal leaves them empty.
+    parent_item: str = ""
+    evidence_ref: str = ""
+    finding_code: str = ""
+    blocking: bool | None = None
+    # The campaign report that holds the full text; the note caption points
+    # here, and to ``brief_ref`` only when it is empty.
+    report_ref: str = ""
 
     def __post_init__(self) -> None:
         if not all(
@@ -1298,6 +1417,43 @@ class ProposalRef:
     def __post_init__(self) -> None:
         if self.runnable:
             raise ValueError("workflow-created proposals must remain non-runnable")
+
+
+@dataclass(frozen=True, slots=True)
+class FollowUpRecord:
+    """One proposal the campaign registered, with the id the tracker gave it."""
+
+    proposal_id: str
+    proposal: Proposal
+
+
+def fenced_block(text: str) -> str:
+    """``text`` verbatim inside a Markdown code fence one backtick longer than
+    its longest backtick run, and never shorter than three, so no line of the
+    text can close the fence or open a section of the surrounding document.
+    The line break before the closing fence is always added, so a text that
+    ends in one keeps it."""
+
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{text}\n{fence}"
+
+
+def labelled_value(label: str, value: str) -> list[str]:
+    """``value`` after ``label`` as one Markdown list line, or, when it holds a
+    line break, the label line followed by ``value`` verbatim in a fenced block,
+    so no line of it can open a section of the surrounding document."""
+
+    if "\n" not in value and "\r" not in value:
+        return [f"- {label}: {value}"]
+    return [f"- {label}:", "", fenced_block(value)]
+
+
+def heading_text(text: str) -> str:
+    """``text`` on one line: each run of whitespace holding a line break
+    becomes one space, because a Markdown heading ends at its line break."""
+
+    return re.sub(r"\s*[\r\n]\s*", " ", text)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1352,7 +1508,7 @@ class ItemOutcome:
     structural_failure: bool = False
     title: str = ""
     seats: tuple[SeatObservation, ...] = ()
-    follow_ups: tuple[str, ...] = ()
+    follow_ups: tuple[FollowUpRecord, ...] = ()
     # Lane failover outcome. ``lane_signature`` is set when a lane signal parked
     # the item, so the selector never re-picks it in this campaign;
     # ``lanes_exhausted`` is true when no capable lane remained, so the campaign
@@ -1365,6 +1521,7 @@ class ItemOutcome:
     # admissions while the tracker is not clear; it never stops for it.
     tracker_stop: CampaignStopReason | None = None
     tracker_exit_code: int | None = None
+    review_depths: tuple[ReviewDepth, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1407,6 +1564,47 @@ class CampaignReport:
     allow_current_branch_default: bool = False
 
 
+class BatchVerdict(str, Enum):
+    """Whether the delivery target head is proven at campaign end: the result
+    of the last batch validation, or ``none`` when no batch ran."""
+
+    NONE = "none"
+    PASSED = "passed"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class BatchValidationRun:
+    """One batch validation of the delivery target head, as the campaign
+    reports it. ``revision`` is ``unknown`` when the checkout could not open,
+    and ``error`` is set when the validator command or checkout raised."""
+
+    number: int
+    final: bool
+    revision: str
+    passed: bool
+    exit_code: int | None = None
+    stdout_ref: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class BatchValidationSummary:
+    """Every batch validation of a campaign, in the order they finished."""
+
+    runs: tuple[BatchValidationRun, ...] = ()
+
+    @property
+    def verdict(self) -> BatchVerdict:
+        if not self.runs:
+            return BatchVerdict.NONE
+        return BatchVerdict.PASSED if self.runs[-1].passed else BatchVerdict.FAILED
+
+    @property
+    def last(self) -> BatchValidationRun | None:
+        return self.runs[-1] if self.runs else None
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignOutcome:
     campaign_id: str
@@ -1422,6 +1620,7 @@ class CampaignOutcome:
     peak_concurrency: int = 0
     makespan_seconds: float = 0.0
     item_seconds: float = 0.0
+    batch_validation: BatchValidationSummary = BatchValidationSummary()
 
 
 # Memory sizes in readings, profile values and output are binary gigabytes.

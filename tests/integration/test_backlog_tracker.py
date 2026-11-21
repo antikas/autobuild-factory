@@ -187,3 +187,42 @@ def test_backlog_resumable_claims_lists_only_builder_claimed_rows(tmp_path: Path
 
     assert [item.item_id for item in claims] == ["TST-001"]
     assert claims[0].brief_ref == "docs/brief.md"
+
+
+def test_backlog_known_item_ids_lists_every_row_in_any_status(tmp_path: Path) -> None:
+    repo = backlog_repo(tmp_path)
+    (repo / "BACKLOG.md").write_text(
+        "# Backlog\n\n"
+        "| Item | Title | Status | Brief |\n"
+        "|---|---|---|---|\n"
+        "| TST-001 | Ready row | Ready | docs/brief.md |\n"
+        "| TST-002 | Blocked row | Blocked | docs/brief.md |\n"
+        "| TST-003 | Done row | Done | docs/brief.md |\n"
+        "| TST-004 | Proposed row | Proposed: later | docs/brief.md |\n",
+        encoding="utf-8",
+    )
+    tracker = BacklogTrackerAdapter(repo)
+
+    assert tracker.known_item_ids(CampaignRef("campaign", repo)) == frozenset(
+        {"TST-001", "TST-002", "TST-003", "TST-004"}
+    )
+
+
+def test_backlog_blocked_item_ids_lists_only_blocked_rows(tmp_path: Path) -> None:
+    repo = backlog_repo(tmp_path)
+    (repo / "BACKLOG.md").write_text(
+        "# Backlog\n\n"
+        "| Item | Title | Status | Brief |\n"
+        "|---|---|---|---|\n"
+        "| TST-001 | Ready row | Ready | docs/brief.md |\n"
+        "| TST-002 | Blocked row | Blocked | docs/brief.md |\n"
+        "| TST-003 | Gated row | Blocked: waiting on TST-001 | docs/brief.md |\n"
+        "| TST-004 | Done row | Done | docs/brief.md |\n"
+        "| TST-005 | Parked row | Parked: later | docs/brief.md |\n",
+        encoding="utf-8",
+    )
+    tracker = BacklogTrackerAdapter(repo)
+
+    assert tracker.blocked_item_ids(CampaignRef("campaign", repo)) == frozenset(
+        {"TST-002", "TST-003"}
+    )

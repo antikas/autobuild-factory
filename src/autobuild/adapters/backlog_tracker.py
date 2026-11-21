@@ -138,6 +138,22 @@ class BacklogTrackerAdapter:
             if self._status_kind(row.status) == "ready"
         )
 
+    def blocked_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
+        root = campaign.repository.resolve(strict=False)
+        if root != self._repository:
+            raise AdapterError("campaign repository does not match the bound BACKLOG repository")
+        return frozenset(
+            row.item_id
+            for row in self._read(root).rows
+            if self._status_kind(row.status) == "blocked"
+        )
+
+    def known_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
+        root = campaign.repository.resolve(strict=False)
+        if root != self._repository:
+            raise AdapterError("campaign repository does not match the bound BACKLOG repository")
+        return frozenset(row.item_id for row in self._read(root).rows)
+
     def resumable_claims(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
         root = campaign.repository.resolve(strict=False)
         if root != self._repository:
@@ -250,7 +266,11 @@ class BacklogTrackerAdapter:
         cells[table.columns["title"]] = proposal.title
         question = " ".join(proposal.question.replace("|", "/").split())
         rationale = " ".join(proposal.rationale.replace("|", "/").split())
-        cells[table.columns["status"]] = f"Proposed: {question} {rationale}"
+        status = f"Proposed: {question} {rationale}"
+        if proposal.evidence_ref:
+            evidence = " ".join(proposal.evidence_ref.replace("|", "/").split())
+            status = f"{status} Evidence: {evidence}"
+        cells[table.columns["status"]] = status
         cells[table.columns["brief"]] = proposal.brief_ref
         lines = list(table.lines)
         insert_at = table.rows[-1].line_index + 1 if table.rows else table.separator_index + 1

@@ -161,6 +161,38 @@ def test_park_delivers_only_tracker_state_and_discards_product_work(tmp_path: Pa
     assert (repo / ".ergon" / "state.txt").read_text(encoding="utf-8") == "parked\n"
 
 
+def test_a_refused_integration_merge_names_git_s_own_message(tmp_path: Path) -> None:
+    repo, remote = repository(tmp_path)
+    adapter = GitWorkspaceAdapter(tmp_path / "scratch")
+    item = WorkItem("item-staged", "Park staged deletion", "brief", ("parked",))
+    workspace = adapter.create_isolated(CampaignRef("campaign", repo), item)
+    git(workspace.root, "rm", "--quiet", "README.md")
+    (workspace.root / ".ergon" / "state.txt").write_text("parked\n", encoding="utf-8")
+    tracker_commit = adapter.commit_tracker(workspace, "item-staged", item_commit=None)
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "--quiet", str(remote), str(other))
+    git(other, "config", "user.name", "Upstream Writer")
+    git(other, "config", "user.email", "upstream@example.invalid")
+    (other / "upstream.txt").write_text("unrelated\n", encoding="utf-8")
+    git(other, "add", "upstream.txt")
+    git(other, "commit", "-m", "upstream change")
+    git(other, "push", "origin", "HEAD:main")
+
+    with pytest.raises(AdapterError) as refused:
+        adapter.deliver(
+            workspace,
+            DeliveryRequest(
+                "item-staged", None, tracker_commit, DeliveryMode.PROTECTED_DEFAULT, "main",
+                git(repo, "rev-parse", "HEAD"),
+            ),
+        )
+
+    message = str(refused.value)
+    assert "integration merge of" in message
+    assert "README.md" in message
+    assert git(workspace.root, "diff", "--cached", "--name-only") == "README.md"
+
+
 def test_current_branch_delivery_keeps_default_branch_local_and_remote_unchanged(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -521,6 +553,28 @@ def test_list_worktrees_reports_a_built_worktree_matching_its_marker(tmp_path: P
     assert status.workspace_revision == diff.workspace_revision
     assert status.branch == workspace.branch
     adapter.release(workspace)
+
+
+def test_a_created_worktree_belongs_to_its_item_and_not_to_a_prefix_sharing_one(
+    tmp_path: Path,
+) -> None:
+    repo, _ = repository(tmp_path)
+    adapter = GitWorkspaceAdapter(tmp_path / "scratch")
+    campaign = CampaignRef("campaign", repo)
+    short = adapter.create_isolated(campaign, WorkItem("abp-1", "Short", "brief", ("done",)))
+    long = adapter.create_isolated(campaign, WorkItem("abp-12", "Long", "brief", ("done",)))
+
+    statuses = {status.root: status for status in adapter.list_worktrees(campaign)}
+    short_status = statuses[short.root.resolve()]
+    long_status = statuses[long.root.resolve()]
+
+    assert adapter.worktree_belongs_to(short_status, "abp-1")
+    assert not adapter.worktree_belongs_to(short_status, "abp-12")
+    assert not adapter.worktree_belongs_to(short_status, "abp")
+    assert adapter.worktree_belongs_to(long_status, "abp-12")
+    assert not adapter.worktree_belongs_to(long_status, "abp-1")
+    adapter.release(short)
+    adapter.release(long)
 
 
 def test_adopt_worktree_takes_a_working_handle_on_an_existing_worktree(tmp_path: Path) -> None:

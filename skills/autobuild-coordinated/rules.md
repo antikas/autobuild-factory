@@ -37,8 +37,9 @@ Each rule states the failure it prevents. A brief that departs from one names th
 
 ## Findings and disposition
 
-- A blocking finding names the violated acceptance criterion, an actual defect, or a consequential risk. The coordinator directs or dispatches its correction through a builder and obtains a fresh review of the affected claim before accepting that claim.
-- An advisory finding is explicitly recorded, scheduled, or dismissed with its reason. It does not reopen acceptance merely because it exists.
+- A finding blocks only under the severity rubric in [the reviewer brief](templates/reviewer-brief.md); this file does not restate it. The coordinator directs or dispatches a blocker's correction through a builder and obtains a fresh review of the affected claim before accepting that claim.
+- Every non-blocking finding is registered in the backlog with gate `scope` (`scripts/register_findings.py`). It is never fixed in the running campaign and does not reopen acceptance.
+- After the final round the lane's round limit in `SKILL.md` applies: green validation merges with open findings registered as follow-ups; red validation parks the item with its evidence and the campaign continues. No question goes to the owner.
 - A capability-sized follow-up is a separately authorised item. A coordinator does not fold it into the delivery candidate.
 
 ## Fixtures and scope
@@ -55,6 +56,6 @@ Each rule states the failure it prevents. A brief that departs from one names th
 
 ## Seats and tiers
 
-- Fresh seats and a blind reviewer are the mechanism, not the ceremony. A first blind review regularly finds a defect the green validator missed, often at the level of the contract. The builder's own validator run is pre-review evidence, never acceptance.
+- Fresh seats and a blind reviewer are the mechanism, not the ceremony. A first blind review regularly finds a defect the green validator missed, often at the level of the contract. The builder's focused test run is pre-review evidence, never acceptance. Builders never run the full suite or the validator. The coordinator runs it once per item, and again when integration overlaps.
 - Design-heavy items take the review-tier model for the builder as well; mechanical items take the build tier and are corrected once each. The profile table that supplies a seat's model also supplies its optional effort: `builder_effort` for a builder, `reviewer_effort` for a reviewer, and `specialist_effort` for a specialist. A specialist without `specialist_effort` uses `reviewer_effort`; any other unset effort remains unset. A campaign record may name an item-level effort that overrides the profile value, and records that choice. The coordinator raises a design-heavy item's builder to the reviewer tier while keeping the resolved builder effort unless the campaign record overrides it.
 - The meter is read before every seat and after every item; the gates are recorded even when they never bind.

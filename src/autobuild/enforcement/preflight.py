@@ -15,6 +15,7 @@ from typing import Callable
 
 from autobuild.domain import (
     CommandRequest,
+    ItemNature,
     LaneSignal,
     LaneSignalKind,
     LeaseSurface,
@@ -33,6 +34,8 @@ from autobuild.ports import (
     NetworkProbePort,
     UsageMeterPort,
 )
+from autobuild.enforcement.brief_git import MAX_QUOTED_LINE, git_staging_lines
+from autobuild.enforcement.triage import declared_item_nature, out_of_fence_paths
 
 # Environment names that redirect trust or interception on a child process. The
 # child must not carry any of these unless the profile accepts the name.
@@ -105,6 +108,10 @@ class PreflightRequest:
     removed_environment: tuple[str, ...] = ()
     max_brief_bytes: int = 1_048_576
     max_argv_bytes: int = 8_192
+    # The roots the claim-time triage receives. Without a repository root the
+    # validator's repository stands in.
+    repository_root: Path | None = None
+    allowed_roots: tuple[Path, ...] = ()
 
 
 def _fail(name: str, cause: str) -> PreflightError:
@@ -394,6 +401,7 @@ def _transport(request: PreflightRequest) -> PreflightProbe:
 
 def _briefs(request: PreflightRequest, filesystem: FilesystemProbePort) -> PreflightProbe:
     name = "briefs"
+    warnings: list[str] = []
     for brief in request.briefs:
         if not filesystem.is_file(brief.brief_path):
             raise _fail(name, f"brief for {brief.item_id} is missing: {brief.brief_path}")
@@ -403,8 +411,65 @@ def _briefs(request: PreflightRequest, filesystem: FilesystemProbePort) -> Prefl
                 f"brief for {brief.item_id} exceeds {request.max_brief_bytes} bytes: "
                 f"{brief.brief_path}",
             )
+        try:
+            text = filesystem.read_text(brief.brief_path)
+        except Exception as exc:
+            raise _fail(
+                name, f"brief for {brief.item_id} cannot be read as text: {exc}"
+            ) from exc
+        _brief_nature(request, brief, text)
+        warning = _brief_git(brief, text)
+        if warning is not None:
+            warnings.append(warning)
     checked = ", ".join(brief.item_id for brief in request.briefs) or "none ready"
-    return PreflightProbe(name, True, f"brief files present and bounded: {checked}")
+    if not warnings:
+        return PreflightProbe(
+            name,
+            True,
+            "brief files present and bounded, declared paths inside the fence, "
+            f"no git staging instructions: {checked}",
+        )
+    return PreflightProbe(
+        name,
+        True,
+        f"brief files present and bounded, declared paths inside the fence: {checked}; "
+        + "; ".join(warnings),
+    )
+
+
+def _brief_nature(request: PreflightRequest, brief: BriefCheck, text: str) -> None:
+    if declared_item_nature(text) is not ItemNature.REPOSITORY:
+        return
+    root = request.repository_root or request.validator.repository
+    outside = out_of_fence_paths(
+        text, repository_root=root, allowed_roots=request.allowed_roots
+    )
+    if not outside:
+        return
+    tokens = ", ".join(f"`{token}`" for token in outside)
+    verb = "resolves" if len(outside) == 1 else "resolve"
+    raise _fail(
+        "briefs",
+        f"brief for {brief.item_id} declares {tokens}, which {verb} outside the "
+        "repository and the allowed roots, so the campaign would park the item as "
+        f"`{ItemNature.CROSS_REPOSITORY.value}` at claim: {brief.brief_path}",
+    )
+
+
+def _brief_git(brief: BriefCheck, text: str) -> str | None:
+    refused = git_staging_lines(text)
+    if not refused:
+        return None
+    lines = "; ".join(
+        f"line {line.line_number} `{'`, `'.join(line.invocations)}`: "
+        f"{line.text[:MAX_QUOTED_LINE]}"
+        for line in refused
+    )
+    return (
+        f"warning: brief for {brief.item_id} tells the builder to stage, commit or "
+        f"remove through git ({lines}); the item will be parked `brief:git-staging` "
+        f"at claim and the launch goes on: {brief.brief_path}"
+    )
 
 
 @dataclass(frozen=True, slots=True)

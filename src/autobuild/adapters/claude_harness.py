@@ -7,11 +7,17 @@ import os
 import re
 import shutil
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from autobuild.adapters.claude_test_hook import hook_settings, write_guard
 from autobuild.adapters.claude_usage import CLAUDE_SUBSCRIPTION_METER
-from autobuild.adapters.harness_cli import CliHarnessAdapter, _safe_name, result_schema
+from autobuild.adapters.harness_cli import (
+    CliHarnessAdapter,
+    _kind_for_code,
+    _safe_name,
+    result_schema,
+)
 from autobuild.domain import (
     CapabilityError,
     EffortLevel,
@@ -105,7 +111,9 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
     # whose ``type`` follows the Anthropic error taxonomy (``rate_limit_error``,
     # ``overloaded_error``, ``authentication_error``); the subscription usage
     # window surfaces as ``rate_limit_error``. Older builds also carry ``subtype``.
-    # A limit reported only in the ``result`` prose is deliberately not scanned.
+    # A failed API call also sets an integer ``api_error_status`` on the
+    # ``is_error`` result, read after the code fields. A limit reported only in
+    # the ``result`` prose is deliberately not scanned.
     _limit_code_keys = ("code", "type", "subtype", "error_type", "error_code", "reason")
     effort_levels = frozenset(EffortLevel)
     meter_id = CLAUDE_SUBSCRIPTION_METER
@@ -125,6 +133,16 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
         """Read a lane signal from Claude Code's structured result fields only."""
 
         return self._structural_lane_signal(result)
+
+    def _candidate_signal(self, candidate: dict[str, Any]) -> LaneSignal | None:
+        signal = super()._candidate_signal(candidate)
+        if signal is not None:
+            return signal
+        status = candidate.get("api_error_status")
+        if candidate.get("is_error") is not True or not isinstance(status, int) or isinstance(status, bool):
+            return None
+        kind = _kind_for_code(str(status))
+        return LaneSignal(kind, detail=f"api {status}") if kind is not None else None
 
     def _version_argv(self) -> tuple[str, ...]:
         return (*self._command, "--version")

@@ -274,6 +274,21 @@ def test_strict_runs_one_specialist_per_boundary_with_its_name_and_invariants_fi
     assert [event.payload["boundary"] for event in completed] == ["sign-in", "schema"]
 
 
+def test_a_boundary_specialist_gets_the_builder_report_its_blind_reviewer_got() -> None:
+    _, ports = run(
+        bounded(),
+        brief("src/app/auth/login.py"),
+        [review(ReviewDecision.PASS), review(ReviewDecision.PASS, "sign-in")],
+    )
+
+    _, reviewer, sign_in = ports.harness.requests
+    report = reviewer.context_refs[2]
+    assert "builder-report" in report
+    assert report in sign_in.context_refs
+    assert "docs/invariants/sign-in.md" in sign_in.context_refs
+    assert "raw:builder" not in sign_in.context_refs
+
+
 def test_a_boundary_without_an_invariants_file_says_so() -> None:
     _, ports = run(
         bounded(),
@@ -339,3 +354,40 @@ def test_a_specialist_correction_starts_a_correction_round_with_the_combined_evi
     assert [event.payload["decision"] for event in combined] == ["correct", "pass"]
     assert combined[0].payload["boundaries"] == ["sign-in"]
     assert ports.harness.requests[3].context_refs == combined[0].evidence_refs
+
+
+def test_the_combined_evidence_of_the_first_review_is_named_round_one() -> None:
+    outcome, ports = run(
+        bounded(),
+        brief("src/app/auth/login.py"),
+        [review(ReviewDecision.PASS), review(ReviewDecision.PASS, "sign-in")],
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    combined = [e for e in ports.records.events if e.event_type == "review.combined"]
+    item_id = spec().item.item_id
+    assert [event.evidence_refs[0] for event in combined] == [
+        f"evidence:{item_id}-review-round-1"
+    ]
+
+
+def test_the_review_after_one_correction_is_named_round_two() -> None:
+    _, ports = run(
+        bounded(),
+        brief("src/app/auth/login.py"),
+        [
+            review(ReviewDecision.PASS),
+            review(ReviewDecision.CORRECT, "sign-in"),
+            builder("builder-2"),
+            review(ReviewDecision.PASS, "2"),
+            review(ReviewDecision.PASS, "sign-in-2"),
+        ],
+        rounds=2,
+    )
+
+    combined = [e for e in ports.records.events if e.event_type == "review.combined"]
+    item_id = spec().item.item_id
+    assert [event.evidence_refs[0] for event in combined] == [
+        f"evidence:{item_id}-review-round-1",
+        f"evidence:{item_id}-review-round-2",
+    ]

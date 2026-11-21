@@ -69,3 +69,6 @@ class LocalFilesystemProbe:
 
     def size(self, path: Path) -> int:
         return path.stat().st_size
+
+    def read_text(self, path: Path) -> str:
+        return path.read_text(encoding="utf-8")

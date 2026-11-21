@@ -18,9 +18,12 @@ from autobuild.domain import (
     AdapterIdentity,
     BuilderReport,
     CapabilityError,
+    ClauseCheck,
+    ClauseOutcome,
     CommandRequest,
     EffortLevel,
     EvidenceError,
+    InspectedPath,
     LaneSignal,
     LaneSignalKind,
     ProbeResult,
@@ -34,6 +37,7 @@ from autobuild.domain import (
     SeatUsage,
     review_verdict_rule_error,
 )
+from autobuild.domain.models import SeatLaunch
 from autobuild.ports import CommandPort
 
 
@@ -103,8 +107,33 @@ REVIEW_SCHEMA: dict[str, Any] = {
             },
         },
         "evidence_ref": {"type": "string"},
+        "inspected": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "lines": {"type": "string", "minLength": 1},
+                },
+                "required": ["path", "lines"],
+                "additionalProperties": False,
+            },
+        },
+        "acceptance": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "clause": {"type": "string", "minLength": 1},
+                    "outcome": {"enum": [outcome.value for outcome in ClauseOutcome]},
+                    "evidence_ref": {"type": "string"},
+                },
+                "required": ["clause", "outcome", "evidence_ref"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["decision", "findings", "evidence_ref"],
+    "required": ["decision", "findings", "evidence_ref", "inspected", "acceptance"],
     "additionalProperties": False,
 }
 
@@ -140,18 +169,22 @@ def scratch_environment(root: Path) -> tuple[tuple[str, str], ...]:
 _TEMPORARY_VARIABLES = ("TMPDIR", "TEMP", "TMP")
 
 
-def item_scratch_environment(root: Path, item_id: str) -> tuple[tuple[str, str], ...]:
-    """The temporary environment for one item's commands and seats.
+def item_scratch_environment(
+    root: Path, run_id: str, name: str
+) -> tuple[tuple[str, str], ...]:
+    """The temporary environment for one item's or batch's commands and seats
+    in one run.
 
-    Only the temporary directory variables point under the item's own directory
-    below ``root``, and ``PYTEST_ADDOPTS`` carries a pytest base temporary
-    directory beside them, so two items never share, or clear, each other's
+    Only the temporary directory variables point under a directory below
+    ``root`` keyed on both ``run_id`` and ``name``, and ``PYTEST_ADDOPTS``
+    carries a pytest base temporary directory beside them, so two items, two
+    batches or two concurrent runs never share, or clear, each other's
     temporary trees. Package caches are not set here: they stay the shared
     campaign values, which their tools lock themselves. The inherited pytest
     options are kept except any ``--basetemp``, which this one replaces. The
     process environment is read and never changed."""
 
-    item_root = root / _item_directory(item_id)
+    item_root = root / _item_directory(run_id, name)
     temporary = item_root / "tmp"
     temporary.mkdir(parents=True, exist_ok=True)
     values = {name: str(temporary) for name in _TEMPORARY_VARIABLES}
@@ -161,11 +194,14 @@ def item_scratch_environment(root: Path, item_id: str) -> tuple[tuple[str, str],
     return tuple(values.items())
 
 
-def _item_directory(item_id: str) -> str:
-    # The cleaned id stays readable; the hash of the raw id keeps two ids that
-    # clean to the same name apart.
-    digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()[:8]
-    return f"{_safe_name(item_id)}-{digest}"
+def _item_directory(run_id: str, name: str) -> str:
+    # The cleaned name stays readable; the digest of the run id and the raw
+    # name keeps two runs, and two names that clean alike, apart. The full run
+    # id is left out of the path so pytest's nested folders stay well inside
+    # the Windows path length limit.
+    keyed = f"{run_id}\0{name}".encode("utf-8")
+    digest = hashlib.sha256(keyed).hexdigest()[:12]
+    return f"{_safe_name(name)}-{digest}"
 
 
 def _with_basetemp(inherited: str, basetemp: Path) -> str:
@@ -230,6 +266,13 @@ def _walk(value: Any):
             yield from _walk(child)
 
 
+def _stderr_ref(diagnostics: tuple[str, ...]) -> str:
+    for entry in diagnostics:
+        if entry.startswith("stderr="):
+            return entry.removeprefix("stderr=")
+    return ""
+
+
 def _documents(text: str) -> list[Any]:
     documents: list[Any] = []
     whole = _json_value(text)
@@ -240,6 +283,43 @@ def _documents(text: str) -> list[Any]:
         if parsed is not None:
             documents.append(parsed)
     return documents
+
+
+def _whole_document(text: str) -> Any | None:
+    try:
+        parsed = json.loads(text.strip())
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, (dict, list)) else None
+
+
+def _strict_documents(text: str) -> list[Any]:
+    documents: list[Any] = []
+    whole = _whole_document(text)
+    if whole is not None:
+        documents.append(whole)
+    for line in text.splitlines():
+        parsed = _whole_document(line)
+        if parsed is not None:
+            documents.append(parsed)
+    return documents
+
+
+def _strict_walk(value: Any):
+    """Yield every dict in a document, descending into a string only when the
+    whole string is one JSON object or array; JSON quoted inside prose is text."""
+
+    if isinstance(value, str):
+        parsed = _whole_document(value)
+        if parsed is not None:
+            yield from _strict_walk(parsed)
+    elif isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _strict_walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _strict_walk(child)
 
 
 def _contract_object(text: str, contract: str) -> dict[str, Any]:
@@ -337,12 +417,21 @@ class CliHarnessAdapter:
         run_ref = f"{request.run_id}:{request.item_id}:{request.seat.value}:{self.adapter_name}"
         prepared = replace(request, instructions=self._materialise_evidence(request))
         invocation, extra_output, stdin_ref = self._invocation(prepared, run_ref)
+        environment = self._seat_environment(request.run_id, request.item_id)
+        if request.on_launch is not None:
+            request.on_launch(
+                SeatLaunch(
+                    argv=invocation,
+                    set_environment=tuple(sorted(name for name, _ in environment)),
+                    removed_environment=tuple(self.removed_environment),
+                )
+            )
         command = self._commands.run(
             CommandRequest(
                 command_id=run_ref,
                 argv=invocation,
                 cwd=request.workspace.root,
-                environment=self._seat_environment(request.item_id),
+                environment=environment,
                 timeout_seconds=request.timeout_seconds,
                 stdin_ref=stdin_ref,
                 progress_deadline_seconds=request.progress_deadline_seconds,
@@ -437,28 +526,38 @@ class CliHarnessAdapter:
 
         Only a seat the process itself ended in error is classified. A successful
         seat, or one the harness killed for stalling, timing out or cancellation,
-        never cools a lane. A failure that produced no structured output at all is
-        a spawn failure; otherwise the CLI's structured error fields are read for a
-        limit or quota code. Free text is never scanned, so a report that mentions
-        a limit in prose does not cool the lane."""
+        never cools a lane. The CLI's structured error fields are read from both
+        streams, standard output first and then the error stream named by the
+        seat result's ``stderr=`` diagnostic, for a limit, quota or auth code; a
+        code on standard output wins. A structured document is a JSON object or
+        array that forms the whole stream or one whole line, parsed as it
+        stands; JSON after text on a line, and a bare number, string, boolean
+        or null, are not documents. Inside a document, a string field is read
+        as structure only when its whole text is one JSON object or array. A failure that produced no structured
+        document on either stream is a spawn failure. Free text is never
+        scanned, so a report that mentions a limit in prose does not cool the
+        lane."""
 
         if result.outcome is not SeatOutcome.FAILED:
             return None
-        documents = self._output_documents(result)
-        if not documents:
+        stdout_documents = self._stream_documents(result.raw_output_ref)
+        stderr_documents = self._stream_documents(_stderr_ref(result.diagnostics))
+        if not stdout_documents and not stderr_documents:
             return LaneSignal(LaneSignalKind.SPAWN, detail="no structured output before exit")
-        return self._limit_signal(documents)
+        return self._limit_signal(stdout_documents + stderr_documents)
 
-    def _output_documents(self, result: SeatResult) -> list[Any]:
+    def _stream_documents(self, reference: str) -> list[Any]:
+        if not reference:
+            return []
         try:
-            raw = self._read(result.raw_output_ref)
+            raw = self._read(reference)
         except EvidenceError:
             return []
-        return _documents(raw)
+        return _strict_documents(raw)
 
     def _limit_signal(self, documents: list[Any]) -> LaneSignal | None:
         for document in documents:
-            for candidate in _walk(document):
+            for candidate in _strict_walk(document):
                 if not isinstance(candidate, dict):
                     continue
                 signal = self._candidate_signal(candidate)
@@ -519,7 +618,38 @@ class CliHarnessAdapter:
                 )
             except KeyError as exc:
                 raise EvidenceError("review finding is incomplete") from exc
-        verdict = ReviewVerdict(request.item_id, decision, tuple(findings), evidence_ref)
+        raw_inspected = data.get("inspected")
+        if not isinstance(raw_inspected, list):
+            raise EvidenceError("review inspected must be a list")
+        inspected: list[InspectedPath] = []
+        for value in raw_inspected:
+            if not isinstance(value, dict) or "path" not in value or "lines" not in value:
+                raise EvidenceError("review inspected entry is incomplete")
+            inspected.append(InspectedPath(str(value["path"]), str(value["lines"])))
+        raw_acceptance = data.get("acceptance")
+        if not isinstance(raw_acceptance, list):
+            raise EvidenceError("review acceptance must be a list")
+        acceptance: list[ClauseCheck] = []
+        for value in raw_acceptance:
+            if not isinstance(value, dict) or any(
+                key not in value for key in ("clause", "outcome", "evidence_ref")
+            ):
+                raise EvidenceError("review acceptance entry is incomplete")
+            try:
+                outcome = ClauseOutcome(str(value["outcome"]))
+            except ValueError as exc:
+                raise EvidenceError("review acceptance outcome is invalid") from exc
+            acceptance.append(
+                ClauseCheck(str(value["clause"]), outcome, str(value["evidence_ref"]))
+            )
+        verdict = ReviewVerdict(
+            request.item_id,
+            decision,
+            tuple(findings),
+            evidence_ref,
+            tuple(inspected),
+            tuple(acceptance),
+        )
         rule_error = review_verdict_rule_error(verdict)
         if rule_error is not None:
             raise EvidenceError(rule_error)
@@ -540,12 +670,15 @@ class CliHarnessAdapter:
     def _scratch_environment(self) -> tuple[tuple[str, str], ...]:
         return (*scratch_environment(self._output_root / "scratch"), *self.telemetry_environment)
 
-    def _seat_environment(self, item_id: str) -> tuple[tuple[str, str], ...]:
+    def _seat_environment(self, run_id: str, item_id: str) -> tuple[tuple[str, str], ...]:
         """The adapter's child environment with the temporary directories of
-        ``item_id``, so concurrent seats of different items never share them."""
+        ``item_id`` in ``run_id``, so concurrent seats of different items, or of
+        one item in two runs, never share them."""
 
         environment = dict(self._scratch_environment())
-        environment.update(item_scratch_environment(self._output_root / "scratch", item_id))
+        environment.update(
+            item_scratch_environment(self._output_root / "scratch", run_id, item_id)
+        )
         environment.update(self.unattended_environment)
         return tuple(environment.items())
 

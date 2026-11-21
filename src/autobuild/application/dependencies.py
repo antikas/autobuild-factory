@@ -35,7 +35,7 @@ class _NoOpProgressPort:
 _NO_OP_PROGRESS: ProgressPort = _NoOpProgressPort()
 
 
-def _no_item_environment(item_id: str) -> tuple[tuple[str, str], ...]:
+def _no_item_environment(run_id: str, name: str) -> tuple[tuple[str, str], ...]:
     return ()
 
 
@@ -105,7 +105,8 @@ class WorkflowPorts:
     # items never share temporary directories. The production composition maps
     # each item to its own directories under the scratch root; the default adds
     # nothing.
-    item_environment: Callable[[str], tuple[tuple[str, str], ...]] = _no_item_environment
+    # Takes the run id and the item id or batch name.
+    item_environment: Callable[[str, str], tuple[tuple[str, str], ...]] = _no_item_environment
     # The monotonic clock, in seconds, that times each item and the campaign's
     # makespan, and the wait the tracker lease heartbeat sleeps on between
     # renewals: it returns True once the event is set (the campaign is

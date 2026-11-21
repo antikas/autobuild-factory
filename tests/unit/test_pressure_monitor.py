@@ -726,6 +726,8 @@ def test_three_failed_renewals_withhold_admissions_and_a_renewal_lifts_the_hold(
     holder["ports"] = ports
     holder["runner"] = runner = CampaignRunner(ports)
     ports.tracker.ready.append(work("item-a"))
+    # item-b exists at launch and becomes ready during the run.
+    ports.tracker.existing.add("item-b")
 
     def target() -> None:
         try:

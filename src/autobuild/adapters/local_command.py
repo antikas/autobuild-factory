@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
+from typing import Any
 from uuid import uuid4
 
 from autobuild.domain import AdapterIdentity, CommandRequest, CommandResult, ProbeResult
@@ -408,7 +409,9 @@ class PosixCommandAdapter(LocalCommandAdapter):
 class WindowsCommandAdapter(LocalCommandAdapter):
     host_family = "windows"
 
-    def _child_cpu_seconds(self, process: subprocess.Popen[bytes]) -> float | None:
+    def _child_cpu_seconds(
+        self, process: subprocess.Popen[bytes], *, kernel32: Any = None
+    ) -> float | None:
         """Read the direct child's CPU time through ``GetProcessTimes``.
 
         Uses only ``ctypes`` from the standard library. Any failure reports the
@@ -417,9 +420,12 @@ class WindowsCommandAdapter(LocalCommandAdapter):
         try:
             import ctypes
             from ctypes import wintypes
+
+            from autobuild.adapters.windows_kernel32 import load_kernel32
         except Exception:
             return None
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if kernel32 is None:
+            kernel32 = load_kernel32()
         process_query_limited_information = 0x1000
         handle = kernel32.OpenProcess(
             process_query_limited_information, False, process.pid

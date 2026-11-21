@@ -6,9 +6,13 @@ exclude-list, can never be claimed. A tracker that offers such an item from
 ``next_item`` is a policy violation: the wrapper raises ``ScopeFenceViolation``
 so the campaign stops without a claim. ``ready_items`` is the closed-universe
 listing and passes through unchanged; the runner filters it against the fence.
+An item this wrapper proposed is never claimable through it: a campaign never
+builds its own follow-ups.
 """
 
 from __future__ import annotations
+
+from threading import Lock
 
 from autobuild.domain import (
     CampaignRef,
@@ -41,12 +45,20 @@ class ScopedTrackerPort:
     def __init__(self, port: TrackerPort, selection: CampaignSelection) -> None:
         self._port = port
         self._selection = selection
+        self._proposed: set[str] = set()
+        self._proposed_guard = Lock()
 
     def probe(self):
         return self._port.probe()
 
     def ready_items(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
         return self._port.ready_items(campaign)
+
+    def blocked_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
+        return self._port.blocked_item_ids(campaign)
+
+    def known_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
+        return self._port.known_item_ids(campaign)
 
     def resumable_claims(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
         return self._port.resumable_claims(campaign)
@@ -63,6 +75,12 @@ class ScopedTrackerPort:
         if not self._selection.permits(item.item_id):
             raise ScopeFenceViolation(
                 f"claim refused for out-of-fence item {item.item_id!r}"
+            )
+        with self._proposed_guard:
+            proposed = item.item_id in self._proposed
+        if proposed:
+            raise ScopeFenceViolation(
+                f"claim refused for item {item.item_id!r} proposed by this campaign"
             )
         return self._port.claim(item, actor)
 
@@ -81,7 +99,10 @@ class ScopedTrackerPort:
         return self._port.park(item_id, reason, actor, workspace)
 
     def propose(self, proposal: Proposal, actor: str) -> ProposalRef:
-        return self._port.propose(proposal, actor)
+        result = self._port.propose(proposal, actor)
+        with self._proposed_guard:
+            self._proposed.add(result.proposal_id)
+        return result
 
     def recover(self):
         return self._port.recover()

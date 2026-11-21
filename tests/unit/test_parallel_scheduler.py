@@ -533,6 +533,8 @@ def test_a_warning_reading_holds_admissions_until_nothing_runs_then_admits_one()
     meter = FakeUsageMeter(identity("meter"), readings={METER: [warning_reading()]}, on_read=on_read)
     ports = keyed_ports((*first, *later), on_invoke=hook, meter=meter)
     ports.tracker.ready.extend(work(item_id) for item_id in first)
+    # The later items exist at launch and become ready during the run.
+    ports.tracker.existing.update(later)
 
     thread, box = run_in_background(ports, campaign(concurrency=6, max_items=7))
     # No reading exists yet, so nothing is held: all three are admitted.

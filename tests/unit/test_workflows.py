@@ -25,6 +25,7 @@ from autobuild.domain import (
     EffortLevel,
     EvidenceError,
     FogRecord,
+    FollowUpRecord,
     ItemDisposition,
     ItemExecutionSpec,
     ItemOutcome,
@@ -53,7 +54,7 @@ from autobuild.domain import (
     WorktreeStatus,
 )
 from autobuild.domain import ClaimTaken, ScopeFenceViolation, TrackerPublication, TrackerStop
-from autobuild.domain.models import BuilderContinuation
+from autobuild.domain.models import BuilderContinuation, raised_effort
 from autobuild.enforcement import ScopedTrackerPort
 from autobuild.domain import (
     CampaignContext,
@@ -73,6 +74,7 @@ from autobuild.testing import (
     FakeTrackerAdapter,
     FakeWorkspaceAdapter,
 )
+from test_brief_git_fixtures import EXCERPT_C
 
 
 def identity(name: str) -> AdapterIdentity:
@@ -190,7 +192,8 @@ def test_item_accepts_only_after_build_validation_and_review() -> None:
         ItemState.RELEASED,
     )
     assert [request.seat.value for request in ports.harness.requests] == ["builder", "reviewer"]
-    assert ports.harness.requests[1].context_refs == ("patch:0", "stdout:1")
+    reviewer_refs = ports.harness.requests[1].context_refs
+    assert reviewer_refs[:2] == ("patch:0", "stdout:1") and len(reviewer_refs) == 3
     assert ports.harness.requests[1].tool_policy.allowed_tools == frozenset({"read"})
     assert ports.harness.requests[0].brief_path == Path("/worktree/brief.md")
     assert ports.harness.requests[0].tool_policy.allowed_roots == (Path("/worktree"),)
@@ -248,12 +251,73 @@ def test_material_finding_gets_one_fresh_correction_then_clean_review() -> None:
     assert len(ports.command.requests) == 2
 
 
-def test_correction_ceiling_parks_instead_of_thrashing() -> None:
+def _final_correct(suffix: str) -> SeatResult:
+    verdict = ReviewVerdict(
+        "item-1",
+        ReviewDecision.CORRECT,
+        (
+            ReviewFinding("BUG", "wrong output", f"finding:bug:{suffix}", blocking=True),
+            ReviewFinding("STYLE", "rename for clarity", f"finding:style:{suffix}", blocking=False),
+        ),
+        f"verdict:{suffix}",
+    )
+    return _review_result(verdict, f"review-{suffix}")
+
+
+def _assert_round_limit_follow_ups(ports, outcome, final: str) -> None:
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert len(ports.tracker.closed) == 1
+    close = ports.tracker.closed[0]
+    assert close.accepted_at_round_limit is True
+    assert close.verdict.evidence_ref == f"verdict:{final}"
+    assert outcome.finalise is not None
+    assert outcome.finalise.item_commit == "item-commit"
+    titles = [proposal.title for proposal in ports.tracker.proposals]
+    assert titles == ["Follow-up: item-1 BUG", "Follow-up: item-1 STYLE"]
+    assert tuple(record.proposal for record in outcome.follow_ups) == tuple(ports.tracker.proposals)
+    blocking, non_blocking = ports.tracker.proposals
+    assert "open at the round limit" in blocking.rationale
+    assert "open at the round limit" not in non_blocking.rationale
+    assert f"verdict:{final}" in blocking.rationale
+    assert ports.tracker.parked == []
+    trajectory = ports.records.evidence["item-1-trajectory"]
+    assert "accepted at the round limit with 1 open blocking finding(s)" in trajectory
+
+
+def test_a_green_item_at_the_round_limit_merges_and_registers_its_findings() -> None:
     ports = make_ports(
         [
             builder("initial"), review(ReviewDecision.CORRECT, "1"),
             builder("fold-1"), review(ReviewDecision.CORRECT, "2"),
-            builder("fold-2"), review(ReviewDecision.CORRECT, "3"),
+            builder("fold-2"), _final_correct("3"),
+        ],
+        [command(suffix="1"), command(suffix="2"), command(suffix="3")],
+        diff_count=3,
+    )
+    ports.tracker.queue.append(item())
+
+    campaign_outcome = CampaignRunner(ports).run(campaign(), lambda selected: spec(selected))
+
+    (outcome,) = campaign_outcome.items
+    _assert_round_limit_follow_ups(ports, outcome, "3")
+    assert len(ports.harness.requests) == 6
+    assert ports.workspace.released == ["lease"]
+    content = ports.workspace.reports[0].content
+    shipped = content[content.index("## Shipped") : content.index("## Parked")]
+    follow_ups = content[content.index("## Follow-ups") :]
+    assert "- item-1 test item" in shipped
+    assert "### proposal-1 Follow-up: item-1 BUG" in follow_ups
+    assert "### proposal-2 Follow-up: item-1 STYLE" in follow_ups
+
+
+def test_a_specialist_correct_at_the_ceiling_merges_with_its_follow_ups() -> None:
+    specialist = _final_correct("specialist")
+    ports = make_ports(
+        [
+            builder("initial"), review(ReviewDecision.CORRECT, "1"),
+            builder("fold-1"), review(ReviewDecision.CORRECT, "2"),
+            builder("fold-2"), review(ReviewDecision.ESCALATE, "3"),
+            specialist,
         ],
         [command(suffix="1"), command(suffix="2"), command(suffix="3")],
         diff_count=3,
@@ -261,13 +325,60 @@ def test_correction_ceiling_parks_instead_of_thrashing() -> None:
 
     outcome = ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
 
+    _assert_round_limit_follow_ups(ports, outcome, "specialist")
+    assert ports.harness.requests[-1].seat is Seat.SPECIALIST
+
+
+def test_a_review_still_correct_after_the_specialist_round_merges_with_its_follow_ups() -> None:
+    ports = make_ports(
+        [
+            builder("initial"), review(ReviewDecision.ESCALATE, "1"),
+            review(ReviewDecision.CORRECT, "specialist"),
+            builder("fold-1"), _final_correct("2"),
+        ],
+        [command(suffix="1"), command(suffix="2")],
+        diff_count=2,
+    )
+
+    outcome = ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+
+    _assert_round_limit_follow_ups(ports, outcome, "2")
+    assert [request.seat for request in ports.harness.requests] == [
+        Seat.BUILDER, Seat.REVIEWER, Seat.SPECIALIST, Seat.BUILDER, Seat.REVIEWER
+    ]
+
+
+def test_a_red_validator_on_the_final_round_still_parks() -> None:
+    ports = make_ports(
+        [
+            builder("initial"), review(ReviewDecision.CORRECT, "1"),
+            builder("fold-1"), review(ReviewDecision.CORRECT, "2"),
+            builder("fold-2"),
+        ],
+        [command(suffix="1"), command(suffix="2"), command(exit_code=1, suffix="3")],
+        diff_count=3,
+    )
+
+    outcome = ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+
     assert outcome.disposition is ItemDisposition.PARKED
-    assert "correction ceiling" in (outcome.reason or "")
-    assert outcome.finalise is not None
-    assert outcome.finalise.item_commit is None
-    assert outcome.finalise.tracker_commit == "tracker-commit"
-    assert len(ports.harness.requests) == 6
-    assert ports.workspace.released == ["lease"]
+    assert "did not pass" in (outcome.reason or "")
+    assert ports.tracker.closed == []
+    assert ports.tracker.proposals == []
+    assert outcome.finalise is None or outcome.finalise.item_commit is None
+
+
+def test_a_first_round_pass_does_not_name_the_round_limit() -> None:
+    ports = make_ports([builder(), review(ReviewDecision.PASS)], [command()], diff_count=1)
+
+    outcome = ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert len(ports.tracker.closed) == 1
+    assert ports.tracker.proposals == []
+    trajectory = ports.records.evidence["item-1-trajectory"]
+    assert "accepted after 0 correction round(s)" in trajectory
+    assert "round limit" not in trajectory
 
 
 def test_specialist_is_added_only_after_an_escalation() -> None:
@@ -281,6 +392,35 @@ def test_specialist_is_added_only_after_an_escalation() -> None:
 
     assert outcome.disposition is ItemDisposition.ACCEPTED
     assert [request.seat.value for request in ports.harness.requests] == ["builder", "reviewer", "specialist"]
+
+
+@pytest.mark.parametrize("seat_outcome", [SeatOutcome.FAILED, SeatOutcome.CANCELLED])
+def test_a_failed_escalation_specialist_parks_as_a_seat_failure(
+    seat_outcome: SeatOutcome,
+) -> None:
+    failed = SeatResult("specialist", seat_outcome, None, "raw:s", SeatUsage(), "start", "end")
+    ports = make_ports(
+        [builder(), review(ReviewDecision.ESCALATE), failed], [command()], diff_count=1
+    )
+
+    outcome = ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert outcome.reason == f"specialist ended {seat_outcome.value}"
+    parked = next(event for event in ports.records.events if event.event_type == "item.parked")
+    assert parked.payload["kill_kind"] == seat_outcome.value
+
+
+def test_a_succeeded_escalation_specialist_without_a_verdict_names_the_missing_verdict() -> None:
+    empty = SeatResult("specialist", SeatOutcome.SUCCEEDED, None, "raw:s", SeatUsage(), "start", "end")
+    ports = make_ports(
+        [builder(), review(ReviewDecision.ESCALATE), empty], [command()], diff_count=1
+    )
+
+    outcome = ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert "typed ReviewVerdict" in outcome.reason
 
 
 def _review_result(verdict: ReviewVerdict, run: str = "review-1") -> SeatResult:
@@ -313,7 +453,10 @@ def test_pass_with_non_blocking_findings_accepts_and_proposes_follow_ups() -> No
     assert len(ports.tracker.closed) == 1
     titles = [proposal.title for proposal in ports.tracker.proposals]
     assert titles == ["Follow-up: item-1 STYLE", "Follow-up: item-1 DOCS"]
-    assert outcome.follow_ups == ("Follow-up: item-1 STYLE", "Follow-up: item-1 DOCS")
+    assert [(record.proposal_id, record.proposal.title) for record in outcome.follow_ups] == [
+        ("proposal-1", "Follow-up: item-1 STYLE"),
+        ("proposal-2", "Follow-up: item-1 DOCS"),
+    ]
     for proposal in ports.tracker.proposals:
         assert proposal.brief_ref == "docs/campaigns/campaign.md"
         assert "verdict:pass" in proposal.rationale
@@ -448,15 +591,11 @@ def test_builder_failure_with_product_files_snapshots_before_park() -> None:
     assert any(entry["outcome"] == "failed" for entry in parked_event.payload["seat_evidence"])
 
 
-def test_correction_ceiling_snapshots_tracked_patch_and_untracked_files() -> None:
+def test_review_park_snapshots_tracked_patch_and_untracked_files() -> None:
     ports = make_ports(
-        [
-            builder("initial"), review(ReviewDecision.CORRECT, "1"),
-            builder("fold-1"), review(ReviewDecision.CORRECT, "2"),
-            builder("fold-2"), review(ReviewDecision.CORRECT, "3"),
-        ],
-        [command(suffix="1"), command(suffix="2"), command(suffix="3")],
-        diff_count=3,
+        [builder("initial"), review(ReviewDecision.PARK, "1")],
+        [command(suffix="1")],
+        diff_count=1,
     )
     ports.workspace.snapshots = [
         WorktreeSnapshot(
@@ -621,6 +760,49 @@ def test_machine_item_parks_at_triage_without_a_workspace_and_next_item_builds()
     assert triaged.payload["nature"] == "machine"
 
 
+def test_an_item_whose_brief_orders_git_staging_parks_at_triage_and_next_item_builds() -> None:
+    ports = make_ports(
+        [builder("b2"), verdict_result("item-2", ReviewDecision.PASS, "2")],
+        [command(suffix="2")],
+        diff_count=1,
+    )
+    buildable = WorkItem("item-2", "second", "plan", ("passes",))
+    ports.tracker.queue.extend([item(), buildable])
+
+    def spec_for(selected: WorkItem) -> ItemExecutionSpec:
+        text = EXCERPT_C if selected.item_id == "item-1" else ""
+        return spec(selected, brief_text=text)
+
+    outcome = CampaignRunner(ports).run(campaign(max_items=2), spec_for)
+
+    first, second = outcome.items
+    assert first.item_id == "item-1"
+    assert first.disposition is ItemDisposition.PARKED
+    reason = first.reason or ""
+    assert reason.startswith("brief:git-staging")
+    assert "line 2" in reason and "`git rm`" in reason
+    assert len(reason) < 500
+    assert ("item-1", reason) in ports.tracker.parked
+    assert second.item_id == "item-2"
+    assert second.disposition is ItemDisposition.ACCEPTED
+    assert ports.workspace.created == ["item-2"]
+    assert [item_id for item_id, _ in ports.tracker.claims] == ["item-2"]
+    assert len(ports.workspace.delivered) == 1
+    assert [request.seat.value for request in ports.harness.requests] == [
+        "builder",
+        "reviewer",
+    ]
+    triaged = next(
+        event for event in ports.records.events if event.event_type == "item.triaged"
+    )
+    assert triaged.item_id == "item-1"
+    assert triaged.payload["triage"] == "brief:git-staging"
+    assert triaged.payload["reason"] == reason
+    assert triaged.payload["lines"] == [
+        {"line_number": 2, "invocations": ["git rm"], "text": EXCERPT_C.splitlines()[1][:160]}
+    ]
+
+
 def test_owner_gated_item_offered_by_the_tracker_parks_with_its_class() -> None:
     ports = make_ports([], [], diff_count=0)
     ports.tracker.queue.append(item())
@@ -779,7 +961,12 @@ def test_report_names_shipped_parked_and_failed_items(tmp_path: Path) -> None:
                 ItemDisposition.ACCEPTED,
                 (ItemState.RELEASED,),
                 title="Ship it",
-                follow_ups=("Follow-up: item-1 STYLE",),
+                follow_ups=(
+                    FollowUpRecord(
+                        "proposal-1",
+                        Proposal("Follow-up: item-1 STYLE", "rename", "non-blocking", "plan"),
+                    ),
+                ),
             ),
             ItemOutcome("item-2", ItemDisposition.PARKED, (ItemState.PARKED,), reason="held", title="Park it"),
             ItemOutcome(
@@ -809,7 +996,7 @@ def test_report_names_shipped_parked_and_failed_items(tmp_path: Path) -> None:
     assert "- item-1 Ship it" in content
     assert "- item-2: held" in content
     assert "- item-3: boom" in content
-    assert "- Follow-up: item-1 STYLE" in content
+    assert "### proposal-1 Follow-up: item-1 STYLE" in content
     # The new run-record section is the final section, after the five existing
     # ones and the seat-usage table, and names the progress log.
     assert content.index("## Seat usage") < content.index("## Run record")
@@ -976,11 +1163,12 @@ def test_out_of_allow_list_next_item_is_never_claimed_and_the_fenced_queue_is_dr
     assert len(violations) == 1 and "'c'" in violations[0].payload["error"]
 
 
-def test_report_lists_a_blocked_allowed_item_with_reason_blocked() -> None:
+def test_report_lists_an_allowed_item_after_a_park_as_not_ready_without_a_tracker_block() -> None:
     ready_item = WorkItem("a", "Item A", "plan", ("passes",))
     failed = SeatResult("builder", SeatOutcome.FAILED, None, "raw", SeatUsage(), "start", "end")
     ports = make_ports([failed], [], diff_count=0)
     ports.tracker.ready = [ready_item]
+    ports.tracker.existing.add("b")
 
     outcome = CampaignRunner(ports).run(
         campaign(max_items=5, selection=CampaignSelection(allow=("a", "b"))),
@@ -991,7 +1179,121 @@ def test_report_lists_a_blocked_allowed_item_with_reason_blocked() -> None:
     assert outcome.items[0].disposition is ItemDisposition.PARKED
     content = ports.workspace.reports[0].content
     assert "## Allowed items left unbuilt" in content
+    assert "- b: not ready" in content
+    assert "- b: blocked" not in content
+
+
+def test_report_lists_an_allowed_item_the_tracker_holds_back_as_blocked() -> None:
+    a = WorkItem("a", "Item A", "plan", ("passes",))
+    b = WorkItem("b", "Item B", "plan", ("passes",))
+    ports = make_ports(
+        [builder("a"), verdict_result("a", ReviewDecision.PASS, "a")],
+        [command(suffix="a")],
+        diff_count=1,
+    )
+    ports.tracker.ready = [a, b]
+    ports.tracker.blocked_by = {"b": frozenset({"z"})}
+
+    outcome = CampaignRunner(ports).run(
+        campaign(max_items=5, selection=CampaignSelection(allow=("a", "b"))),
+        lambda selected: spec(selected),
+    )
+
+    assert [(o.item_id, o.disposition) for o in outcome.items] == [
+        ("a", ItemDisposition.ACCEPTED)
+    ]
+    content = ports.workspace.reports[0].content
     assert "- b: blocked" in content
+
+
+def test_report_lists_an_allowed_item_another_writer_claimed_as_claim_taken() -> None:
+    a = WorkItem("a", "Item A", "plan", ("passes",))
+    ports = make_ports([], [], diff_count=0)
+    ports.tracker.ready = [a]
+    ports.tracker.claim_errors["a"] = ClaimTaken("a", "claimed elsewhere")
+
+    outcome = CampaignRunner(ports).run(
+        campaign(max_items=5, selection=CampaignSelection(allow=("a",))),
+        lambda selected: spec(selected),
+    )
+
+    assert outcome.stop_reason is CampaignStopReason.QUEUE_DRY
+    assert ports.tracker.claims == []
+    assert outcome.items == ()
+    content = ports.workspace.reports[0].content
+    assert "- a: claim taken" in content
+    assert "- a: item bound" not in content
+
+
+def test_a_taken_allowed_item_absent_from_the_ready_listing_reads_claim_taken() -> None:
+    reason = CampaignRunner._unbuilt_reason(
+        "a",
+        CampaignSelection(allow=("a",)),
+        frozenset(),
+        frozenset(),
+        frozenset({"a"}),
+        CampaignStopReason.QUEUE_DRY,
+        frozenset({"a"}),
+    )
+
+    assert reason == "claim taken"
+
+
+def test_a_ready_unbuilt_allowed_item_is_labelled_by_the_stop() -> None:
+    named = {
+        CampaignStopReason.ITEM_BOUND: "item bound",
+        CampaignStopReason.HOLD_LIMIT: "hold limit",
+        CampaignStopReason.PAUSED: "paused",
+        CampaignStopReason.LAUNCH_SET_UNREADABLE: "launch set unreadable",
+    }
+    selection = CampaignSelection(allow=("a",))
+
+    labels = {
+        stop: CampaignRunner._unbuilt_reason(
+            "a", selection, frozenset({"a"}), frozenset(), frozenset(), stop, frozenset({"a"})
+        )
+        for stop in CampaignStopReason
+    }
+
+    assert labels == {
+        stop: named.get(stop, "ready after the last selection") for stop in CampaignStopReason
+    }
+
+
+def test_an_allowed_item_not_ready_at_the_item_bound_reads_not_ready() -> None:
+    reason = CampaignRunner._unbuilt_reason(
+        "a",
+        CampaignSelection(allow=("a",)),
+        frozenset(),
+        frozenset(),
+        frozenset(),
+        CampaignStopReason.ITEM_BOUND,
+        frozenset({"a"}),
+    )
+
+    assert reason == "not ready"
+
+
+def test_an_in_fence_item_the_allow_list_peek_offers_is_claimed_and_built() -> None:
+    a = WorkItem("a", "Item A", "plan", ("passes",))
+    ports = make_ports(
+        [builder("a"), verdict_result("a", ReviewDecision.PASS, "a")],
+        [command(suffix="a")],
+        diff_count=1,
+    )
+    base = ports.tracker
+    base.queue = [a]
+    selection = CampaignSelection(allow=("a",))
+    ports = replace(ports, tracker=ScopedTrackerPort(base, selection))
+
+    outcome = CampaignRunner(ports).run(
+        campaign(max_items=5, selection=selection), lambda selected: spec(selected)
+    )
+
+    assert [item_id for item_id, _ in base.claims] == ["a"]
+    assert [(o.item_id, o.disposition) for o in outcome.items] == [
+        ("a", ItemDisposition.ACCEPTED)
+    ]
 
 
 # --- Single-writer lease per surface ------------------------------------------
@@ -1175,9 +1477,16 @@ def test_builder_rate_limit_reruns_on_lane_two_and_the_item_is_accepted() -> Non
     outcome = ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
 
     assert outcome.disposition is ItemDisposition.ACCEPTED
-    assert ("item-1", "builder@lane-one") in ports.tracker.claims
-    assert ("item-1", "builder@lane-two") in ports.tracker.claims
+    assert ports.tracker.claims == [("item-1", "builder@lane-one")]
     assert [lane for lane, _signal, _campaign in state.cools] == ["lane-one"]
+    changed = [
+        event.payload for event in ports.records.events if event.event_type == "item.lane_changed"
+    ]
+    assert changed == [{"lane": "lane-two", "from_lane": "lane-one"}]
+    assert not any(
+        event.event_type == "item.lane_reclaim_failed" for event in ports.records.events
+    )
+    assert [evidence.builder_lane for evidence in ports.tracker.closed] == ["lane-two"]
     accepted_lanes = {observation.lane for observation in outcome.seats if observation.outcome is SeatOutcome.SUCCEEDED}
     assert accepted_lanes == {"lane-two"}
     finalised = next(
@@ -1266,8 +1575,9 @@ def test_a_succeeded_seat_never_cools_the_lane_even_when_a_signal_is_available()
 
     assert outcome.disposition is ItemDisposition.ACCEPTED
     assert state.cools == []
-    assert ("item-1", "builder@lane-one") in ports.tracker.claims
-    assert ("item-1", "builder@lane-two") not in ports.tracker.claims
+    assert ports.tracker.claims == [("item-1", "builder@lane-one")]
+    assert not any(event.event_type == "item.lane_changed" for event in ports.records.events)
+    assert [evidence.builder_lane for evidence in ports.tracker.closed] == ["lane-one"]
 
 
 # --- Seat effort ---------------------------------------------------------------
@@ -1400,6 +1710,316 @@ def test_a_spec_that_sets_one_seat_twice_on_a_lane_is_refused() -> None:
         replace(spec(), lane_efforts=efforts)
 
 
+# --- A red validator retries the builder one effort level higher ---------------
+
+
+def _builder_efforts(ports: WorkflowPorts) -> list[EffortLevel | None]:
+    return [request.effort for request in ports.harness.requests if request.seat is Seat.BUILDER]
+
+
+def _builder_spec(level: EffortLevel | None) -> ItemExecutionSpec:
+    if level is None:
+        return replace(spec(), lane_efforts=(("", Seat.REVIEWER, EffortLevel.LOW),))
+    return replace(spec(), lane_efforts=(("", Seat.BUILDER, level),))
+
+
+def test_a_red_validator_retries_the_builder_one_level_higher_with_its_output() -> None:
+    ports = make_ports(
+        [builder("first"), builder("retry"), review(ReviewDecision.PASS)],
+        [command(exit_code=1, suffix="red"), command(suffix="green")],
+        diff_count=2,
+    )
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), _builder_spec(EffortLevel.MEDIUM), ports.records.create(campaign())
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert _builder_efforts(ports) == [EffortLevel.MEDIUM, EffortLevel.HIGH]
+    retry = ports.harness.requests[1]
+    assert retry.seat is Seat.BUILDER
+    assert "stdout:red" in retry.context_refs
+    assert [
+        payload["effort"]
+        for payload in _seat_payloads(ports)
+        if payload["seat"] == "builder"
+    ] == ["medium", "high"]
+    raised = [event for event in ports.records.events if event.event_type == "item.effort_raised"]
+    assert [event.payload["effort"] for event in raised] == ["high"]
+    assert render_progress_line(raised[0]).endswith(
+        " item item-1 validator did not pass; a fresh builder retries at effort high "
+        "(was medium)"
+    )
+
+
+def test_every_red_validator_runs_medium_then_high_and_parks() -> None:
+    ports = make_ports(
+        [builder("first"), builder("retry")],
+        [command(exit_code=1, suffix="1"), command(exit_code=1, suffix="2")],
+        diff_count=2,
+    )
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), _builder_spec(EffortLevel.MEDIUM), ports.records.create(campaign())
+    )
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert "validator validator did not pass" in (outcome.reason or "")
+    assert _builder_efforts(ports) == [EffortLevel.MEDIUM, EffortLevel.HIGH]
+
+
+@pytest.mark.parametrize("level", [EffortLevel.HIGH, EffortLevel.XHIGH, EffortLevel.MAX, None])
+def test_a_red_validator_at_high_or_without_a_builder_effort_parks_after_one_seat(
+    level: EffortLevel | None,
+) -> None:
+    ports = make_ports([builder()], [command(exit_code=1)], diff_count=1)
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), _builder_spec(level), ports.records.create(campaign())
+    )
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert "did not pass" in (outcome.reason or "")
+    assert _builder_efforts(ports) == [level]
+
+
+def test_a_raised_level_holds_for_a_later_correction_round() -> None:
+    ports = make_ports(
+        [
+            builder("first"), builder("retry"), review(ReviewDecision.CORRECT, "1"),
+            builder("fold-1"), review(ReviewDecision.PASS, "2"),
+        ],
+        [command(exit_code=1, suffix="1"), command(suffix="2"), command(suffix="3")],
+        diff_count=3,
+    )
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), _builder_spec(EffortLevel.MEDIUM), ports.records.create(campaign())
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert _builder_efforts(ports) == [EffortLevel.MEDIUM, EffortLevel.HIGH, EffortLevel.HIGH]
+
+
+def test_a_retry_does_not_count_toward_the_correction_ceiling() -> None:
+    ports = make_ports(
+        [
+            builder("first"), builder("retry"), review(ReviewDecision.CORRECT, "1"),
+            builder("fold-1"), review(ReviewDecision.PASS, "2"),
+        ],
+        [command(exit_code=1, suffix="1"), command(suffix="2"), command(suffix="3")],
+        diff_count=3,
+    )
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(),
+        replace(_builder_spec(EffortLevel.LOW), max_corrections=1),
+        ports.records.create(campaign()),
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    rounds = [e.payload["round"] for e in ports.records.events if e.event_type == "item.correcting"]
+    assert rounds == [1]
+    assert _builder_efforts(ports) == [EffortLevel.LOW, EffortLevel.MEDIUM, EffortLevel.MEDIUM]
+
+
+def test_a_red_correction_round_raises_the_level_again_up_to_high() -> None:
+    ports = make_ports(
+        [
+            builder("first"), builder("retry-1"), review(ReviewDecision.CORRECT, "1"),
+            builder("fold-1"), builder("retry-2"),
+        ],
+        [
+            command(exit_code=1, suffix="1"), command(suffix="2"),
+            command(exit_code=1, suffix="3"), command(exit_code=1, suffix="4"),
+        ],
+        diff_count=4,
+    )
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), _builder_spec(EffortLevel.LOW), ports.records.create(campaign())
+    )
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert "did not pass" in (outcome.reason or "")
+    assert _builder_efforts(ports) == [
+        EffortLevel.LOW, EffortLevel.MEDIUM, EffortLevel.MEDIUM, EffortLevel.HIGH
+    ]
+
+
+def _started_builder_efforts(ports: WorkflowPorts) -> list[str | None]:
+    return [
+        event.payload["effort"]
+        for event in ports.records.events
+        if event.event_type == "seat.started" and event.payload["seat"] == "builder"
+    ]
+
+
+def _effort_raises(ports: WorkflowPorts) -> list[dict]:
+    return [
+        event.payload for event in ports.records.events if event.event_type == "item.effort_raised"
+    ]
+
+
+def test_a_red_validator_on_resumed_built_work_retries_the_builder_one_level_higher() -> None:
+    ports = make_ports(
+        [builder("retry"), review(ReviewDecision.PASS)],
+        [command(exit_code=1, suffix="red"), command(suffix="green")],
+        diff_count=2,
+    )
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(),
+        _builder_spec(EffortLevel.MEDIUM),
+        ports.records.create(campaign()),
+        resume=ResumePlan("built", Path("/worktree"), 0, "run-old"),
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert _builder_efforts(ports) == [EffortLevel.HIGH]
+    retry = next(r for r in ports.harness.requests if r.seat is Seat.BUILDER)
+    assert "stdout:red" in retry.context_refs
+    raised = _effort_raises(ports)
+    assert [(p["from_effort"], p["effort"], p["raises"]) for p in raised] == [
+        ("medium", "high", 1)
+    ]
+
+
+def test_a_red_validator_on_resumed_work_at_high_parks_without_a_builder_seat() -> None:
+    ports = make_ports([], [command(exit_code=1, suffix="red")], diff_count=1)
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(),
+        _builder_spec(EffortLevel.HIGH),
+        ports.records.create(campaign()),
+        resume=ResumePlan("validated", Path("/worktree"), 0, "run-old"),
+    )
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert "validator validator did not pass" in (outcome.reason or "")
+    assert _builder_efforts(ports) == []
+    assert _effort_raises(ports) == []
+
+
+_CONTINUATION = "Continuation: A previous builder seat timed out in this workspace"
+
+
+def test_a_timed_out_raised_builder_continues_at_the_raised_level_with_its_trigger() -> None:
+    timed_out = SeatResult(
+        "builder", SeatOutcome.TIMED_OUT, None, "raw", SeatUsage(), "start", "end"
+    )
+    ports = make_ports(
+        [builder("first"), timed_out, builder("continued"), review(ReviewDecision.PASS)],
+        [command(exit_code=1, suffix="red"), command(suffix="green")],
+        diff_count=2,
+    )
+    item_spec = _builder_spec(EffortLevel.MEDIUM)
+
+    with pytest.raises(BuilderContinuation) as handed:
+        ItemWorkflow(ports).run(campaign(), item_spec, ports.records.create(campaign()))
+    plan = handed.value.plan
+    assert (plan.builder_raises, plan.builder_context_refs) == (1, ("stdout:red",))
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), item_spec, ports.records.create(campaign()), resume=plan
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    continued = [r for r in ports.harness.requests if r.seat is Seat.BUILDER][-1]
+    assert continued.effort is EffortLevel.HIGH
+    assert "stdout:red" in continued.context_refs
+    assert _CONTINUATION in continued.instructions
+    assert _started_builder_efforts(ports) == ["medium", "high", "high"]
+
+
+def test_a_red_validator_retry_after_a_continued_builder_is_not_told_to_continue() -> None:
+    timed_out = SeatResult(
+        "builder", SeatOutcome.TIMED_OUT, None, "raw", SeatUsage(), "start", "end"
+    )
+    ports = make_ports(
+        [timed_out, builder("continued"), builder("retry"), review(ReviewDecision.PASS)],
+        [command(exit_code=1, suffix="red"), command(suffix="green")],
+        diff_count=2,
+    )
+    item_spec = _builder_spec(EffortLevel.LOW)
+
+    with pytest.raises(BuilderContinuation) as handed:
+        ItemWorkflow(ports).run(campaign(), item_spec, ports.records.create(campaign()))
+    resumed_from = len(ports.harness.requests)
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), item_spec, ports.records.create(campaign()), resume=handed.value.plan
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    continued, retry = [
+        r for r in ports.harness.requests[resumed_from:] if r.seat is Seat.BUILDER
+    ]
+    assert (continued.effort, retry.effort) == (EffortLevel.LOW, EffortLevel.MEDIUM)
+    assert _CONTINUATION in continued.instructions
+    assert "stdout:red" in retry.context_refs
+    assert "Continuation:" not in retry.instructions
+
+
+def test_a_resume_from_a_launch_time_isolated_marker_starts_at_the_lane_level() -> None:
+    ports = make_ports(
+        [builder("rebuilt"), review(ReviewDecision.PASS)], [command()], diff_count=1
+    )
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(),
+        _builder_spec(EffortLevel.MEDIUM),
+        ports.records.create(campaign()),
+        resume=ResumePlan("isolated", Path("/worktree"), 0, "run-old"),
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert _builder_efforts(ports) == [EffortLevel.MEDIUM]
+    rebuilt = next(r for r in ports.harness.requests if r.seat is Seat.BUILDER)
+    assert rebuilt.context_refs == ()
+    assert "Continuation:" not in rebuilt.instructions
+
+
+def test_the_raised_effort_event_names_the_effort_of_the_next_builder_seat() -> None:
+    ports, state = lane_ports(
+        [builder("one")],
+        [builder("two"), review(ReviewDecision.PASS)],
+        [command(exit_code=1, suffix="red"), command(suffix="green")],
+        diff_count=2,
+    )
+    validator_runs: list[str] = []
+
+    def cool_lane_one_on_first_validator(request) -> None:
+        validator_runs.append(request.command_id)
+        if len(validator_runs) == 1:
+            state.cool("lane-one", LaneSignal(LaneSignalKind.RATE_LIMIT), "other-campaign")
+
+    ports.command.on_run = cool_lane_one_on_first_validator
+    item_spec = replace(
+        spec(),
+        lane_efforts=(
+            ("lane-one", Seat.BUILDER, EffortLevel.LOW),
+            ("lane-two", Seat.BUILDER, EffortLevel.MEDIUM),
+        ),
+    )
+
+    outcome = ItemWorkflow(ports).run(campaign(), item_spec, ports.records.create(campaign()))
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    raised = _effort_raises(ports)
+    assert [(p["from_effort"], p["effort"]) for p in raised] == [("low", "high")]
+    assert _started_builder_efforts(ports) == ["low", raised[0]["effort"]]
+
+
+def test_raised_effort_caps_at_high_and_never_lowers_a_lane_level() -> None:
+    assert raised_effort(EffortLevel.LOW, 1) is EffortLevel.MEDIUM
+    assert raised_effort(EffortLevel.LOW, 5) is EffortLevel.HIGH
+    assert raised_effort(EffortLevel.MEDIUM, 0) is EffortLevel.MEDIUM
+    assert raised_effort(EffortLevel.XHIGH, 1) is EffortLevel.XHIGH
+    assert raised_effort(EffortLevel.MAX, 2) is EffortLevel.MAX
+    assert raised_effort(None, 1) is None
+
+
 # --- Automatic resume from a good state ---------------------------------------
 
 
@@ -1432,6 +2052,24 @@ def test_a_built_marker_with_a_matching_worktree_resumes_and_is_accepted() -> No
     resumed = next(event for event in ports.records.events if event.event_type == "item.resumed")
     assert resumed.payload["prior_run_id"] == "run-old"
     assert resumed.payload["marker_state"] == "built"
+
+
+def test_a_resume_past_the_build_hands_the_reviewer_no_builder_report() -> None:
+    from autobuild.application.prompts import NO_BUILDER_REPORT_SENTENCE
+
+    ports = make_ports([review(ReviewDecision.PASS)], [command()], diff_count=1)
+    ports.tracker.resumable = [item()]
+    ports.records.markers = {"item-1": _built_marker()}
+    ports.workspace.worktrees = [
+        WorktreeStatus(Path("/worktree"), "run", "base", "digest-built")
+    ]
+
+    CampaignRunner(ports).run(campaign(max_items=5), lambda selected: spec(selected))
+
+    (reviewer,) = ports.harness.requests
+    assert reviewer.context_refs == ("patch:0", "stdout:1")
+    assert NO_BUILDER_REPORT_SENTENCE in reviewer.instructions
+    assert not [name for name in ports.records.evidence if "builder-report" in name]
 
 
 def test_a_head_moved_marker_parks_with_resume_head_moved_and_campaign_continues() -> None:
@@ -1535,7 +2173,10 @@ def test_a_closed_marker_on_a_still_claimed_item_is_not_resumed() -> None:
 
     assert outcome.items[0].disposition is ItemDisposition.PARKED
     assert outcome.items[0].reason == "resume:tracker-mismatch"
-    assert ports.workspace.adopted == []
+    # adopted only to snapshot it in place: no seat runs and it is not released
+    assert ports.workspace.adopted == [Path("/worktree")]
+    assert ports.harness.requests == []
+    assert ports.workspace.released == []
 
 
 def test_a_correcting_marker_resumes_by_re_running_the_builder() -> None:
@@ -1556,6 +2197,187 @@ def test_a_correcting_marker_resumes_by_re_running_the_builder() -> None:
     assert outcome.items[0].disposition is ItemDisposition.ACCEPTED
     # a correcting marker re-runs the builder before validation and review
     assert [request.seat.value for request in ports.harness.requests] == ["builder", "reviewer"]
+
+
+# --- Resume parks report each worktree once -----------------------------------
+
+
+def _owned(ports, item_id: str, *roots: str) -> list[Path]:
+    paths = [Path(root) for root in roots]
+    for path in paths:
+        ports.workspace.worktrees.append(WorktreeStatus(path, "run", "base", "digest"))
+        ports.workspace.worktree_owners[path] = item_id
+    return paths
+
+
+def _resume_parked(ports) -> list[dict]:
+    return [
+        event.payload for event in ports.records.events if event.event_type == "item.resume_parked"
+    ]
+
+
+def _orphan_roots(ports) -> list[str]:
+    return [
+        event.payload["worktree_root"]
+        for event in ports.records.events
+        if event.event_type == "resume.orphan_worktree"
+    ]
+
+
+def _parked_section(ports) -> list[str]:
+    content = ports.workspace.reports[0].content
+    section = content.split("## Parked", 1)[1].split("\n## ", 1)[0]
+    return [line for line in section.splitlines() if line.startswith("- ")]
+
+
+def test_a_missing_marker_item_names_and_snapshots_its_one_worktree_and_no_orphan() -> None:
+    ports = make_ports([], [], diff_count=0)
+    ports.tracker.resumable = [item()]
+    (root,) = _owned(ports, "item-1", "/scratch/worktrees/item-1-0a1b2c3d")
+
+    outcome = CampaignRunner(ports).run(campaign(), lambda selected: spec(selected))
+
+    assert outcome.items[0].reason == "resume:missing-marker"
+    (parked,) = _resume_parked(ports)
+    assert parked["worktree_roots"] == [str(root)]
+    assert parked["snapshot_path"] == "evidence/item-1-park"
+    assert ports.workspace.adopted == [root]
+    assert "item-1-park/snapshot.json" in ports.records.evidence_files
+    assert _orphan_roots(ports) == []
+    assert _parked_section(ports) == ["- item-1: resume:missing-marker"]
+    assert ports.workspace.released == []
+
+
+def test_a_missing_marker_item_with_two_worktrees_names_both_and_snapshots_none() -> None:
+    ports = make_ports([], [], diff_count=0)
+    ports.tracker.resumable = [item()]
+    roots = _owned(
+        ports, "item-1", "/scratch/worktrees/item-1-0a1b2c3d", "/scratch/worktrees/item-1-4e5f6a7b"
+    )
+
+    outcome = CampaignRunner(ports).run(campaign(), lambda selected: spec(selected))
+
+    assert outcome.items[0].reason == "resume:missing-marker"
+    (parked,) = _resume_parked(ports)
+    assert parked["worktree_roots"] == [str(root) for root in roots]
+    assert parked["snapshot_path"] == ""
+    assert ports.workspace.adopted == []
+    assert _orphan_roots(ports) == []
+    assert _parked_section(ports) == ["- item-1: resume:missing-marker"]
+
+
+def test_an_isolated_marker_with_no_worktree_root_attaches_the_owned_worktree() -> None:
+    ports = make_ports([], [], diff_count=0)
+    ports.tracker.resumable = [item()]
+    ports.records.markers = {
+        "item-1": PhaseMarker("item-1", "isolated", Path(""), "", "", "", 0, "run-old")
+    }
+    (root,) = _owned(ports, "item-1", "/scratch/worktrees/item-1-0a1b2c3d")
+
+    outcome = CampaignRunner(ports).run(campaign(), lambda selected: spec(selected))
+
+    assert outcome.items[0].reason == "resume:missing-worktree"
+    (parked,) = _resume_parked(ports)
+    assert parked["worktree_roots"] == [str(root)]
+    assert parked["snapshot_path"] == "evidence/item-1-park"
+    assert _orphan_roots(ports) == []
+    assert _parked_section(ports) == ["- item-1: resume:missing-worktree"]
+
+
+def test_a_worktree_no_claimed_item_owns_is_still_one_orphan() -> None:
+    ports = make_ports([], [], diff_count=0)
+    ports.tracker.resumable = [item()]
+    _owned(ports, "item-1", "/scratch/worktrees/item-1-0a1b2c3d")
+    (stray,) = _owned(ports, "item-9", "/scratch/worktrees/item-9-0a1b2c3d")
+
+    CampaignRunner(ports).run(campaign(), lambda selected: spec(selected))
+
+    assert _orphan_roots(ports) == [str(stray)]
+    assert _parked_section(ports) == [
+        "- item-1: resume:missing-marker",
+        "- item-9-0a1b2c3d: resume:orphan-worktree",
+    ]
+
+
+def test_a_claimed_item_outside_the_selection_keeps_its_worktree_off_the_orphan_list() -> None:
+    ports = make_ports([], [], diff_count=0)
+    ports.tracker.resumable = [
+        WorkItem("item-in", "inside the fence", "plan", ("passes",)),
+        WorkItem("item-out", "outside the fence", "plan", ("passes",)),
+    ]
+    _owned(ports, "item-in", "/scratch/worktrees/item-in-0a1b2c3d")
+    (fenced_out,) = _owned(ports, "item-out", "/scratch/worktrees/item-out-0a1b2c3d")
+    stray = Path("/scratch/worktrees/stray-0a1b2c3d")
+    ports.workspace.worktrees.append(WorktreeStatus(stray, "run", "base", "digest"))
+
+    CampaignRunner(ports).run(
+        campaign(selection=CampaignSelection(allow=("item-in",))),
+        lambda selected: spec(selected),
+    )
+
+    assert _orphan_roots(ports) == [str(stray)]
+    assert fenced_out not in ports.workspace.adopted
+    parked = _parked_section(ports)
+    assert not any("item-out" in line for line in parked)
+    assert parked.count("- stray-0a1b2c3d: resume:orphan-worktree") == 1
+
+
+def test_a_tracker_mismatch_snapshots_the_marker_worktree() -> None:
+    ports = make_ports([], [], diff_count=0)
+    ports.tracker.resumable = [item()]
+    ports.records.markers = {"item-1": _built_marker(state="parked")}
+    ports.workspace.worktrees = [
+        WorktreeStatus(Path("/worktree"), "run", "base", "digest-built")
+    ]
+
+    outcome = CampaignRunner(ports).run(campaign(), lambda selected: spec(selected))
+
+    assert outcome.items[0].reason == "resume:tracker-mismatch"
+    (parked,) = _resume_parked(ports)
+    assert parked["worktree_roots"] == [str(Path("/worktree"))]
+    assert parked["snapshot_path"] == "evidence/item-1-park"
+    assert "item-1-park/snapshot.json" in ports.records.evidence_files
+    assert ports.workspace.released == []
+    assert _orphan_roots(ports) == []
+
+
+def test_a_tracker_mismatch_under_a_live_foreign_lease_writes_no_snapshot() -> None:
+    ports = make_ports([], [], diff_count=0)
+    ports.tracker.resumable = [item()]
+    ports.records.markers = {"item-1": _built_marker(state="parked")}
+    ports.workspace.worktrees = [
+        WorktreeStatus(Path("/worktree"), "run", "base", "digest-built")
+    ]
+    ports.lease.live_holders[str(Path("/worktree"))] = LeaseRecord(
+        "other-campaign", 777, "other-host", "s", "b", Path("/worktree"), SurfaceKind.WORKTREE
+    )
+
+    outcome = CampaignRunner(ports).run(campaign(), lambda selected: spec(selected))
+
+    assert outcome.items[0].reason == "resume:tracker-mismatch"
+    (parked,) = _resume_parked(ports)
+    assert parked["snapshot_path"] == ""
+    assert ports.workspace.adopted == []
+    assert not any(path.startswith("item-1-park/") for path in ports.records.evidence_files)
+
+
+def test_a_held_lease_park_is_never_snapshotted() -> None:
+    ports = make_ports([], [], diff_count=0)
+    ports.tracker.resumable = [item()]
+    ports.records.markers = {"item-1": _built_marker()}
+    ports.workspace.worktrees = [
+        WorktreeStatus(Path("/worktree"), "run", "base", "digest-built")
+    ]
+    ports.lease.live_holders[str(Path("/worktree"))] = LeaseRecord(
+        "other-campaign", 777, "other-host", "s", "b", Path("/worktree"), SurfaceKind.WORKTREE
+    )
+
+    CampaignRunner(ports).run(campaign(), lambda selected: spec(selected))
+
+    (parked,) = _resume_parked(ports)
+    assert parked["snapshot_path"] == ""
+    assert parked["worktree_roots"] == [str(Path("/worktree"))]
+    assert ports.workspace.snapshotted == []
 
 
 # --- Owner progress lines ------------------------------------------------------
@@ -1948,7 +2770,7 @@ def test_published_tracker_writes_add_no_unpublished_record() -> None:
     assert "Unpublished tracker writes" not in ports.workspace.reports[0].content
 
 
-def test_an_unpublished_lane_re_claim_is_recorded_like_the_first_claim() -> None:
+def test_a_lane_flip_after_an_unpublished_claim_publishes_no_second_claim() -> None:
     ports, _state = lane_ports(
         [failed_builder("one")],
         [builder("two"), review(ReviewDecision.PASS)],
@@ -1966,6 +2788,75 @@ def test_an_unpublished_lane_re_claim_is_recorded_like_the_first_claim() -> None
         for index, event in enumerate(ports.records.events)
         if event.event_type == "tracker.unpublished" and event.payload["operation"] == "claim"
     ]
-    assert len(positions) == 2
+    assert len(positions) == 1
     changed = [event.event_type for event in ports.records.events].index("item.lane_changed")
-    assert positions[0] < changed < positions[1]
+    assert positions[0] < changed
+    assert ports.tracker.claims == [("item-1", "builder@lane-one")]
+
+
+# --- The builder report handed to the reviewer --------------------------------
+
+
+def _builder_report(ports: WorkflowPorts, reference: str) -> str:
+    assert reference.startswith("evidence:")
+    return ports.records.evidence[reference.removeprefix("evidence:")]
+
+
+def _accepted_run() -> WorkflowPorts:
+    ports = make_ports([builder(), review(ReviewDecision.PASS)], [command()], diff_count=1)
+    ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+    return ports
+
+
+def _corrected_run() -> WorkflowPorts:
+    ports = make_ports(
+        [
+            builder("first"),
+            review(ReviewDecision.CORRECT, "1"),
+            builder("fold"),
+            review(ReviewDecision.PASS, "2"),
+        ],
+        [command(suffix="1"), command(suffix="2")],
+        diff_count=2,
+    )
+    ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+    return ports
+
+
+def test_the_reviewer_is_handed_the_builder_report_as_evidence() -> None:
+    ports = _accepted_run()
+
+    reviewer = ports.harness.requests[1]
+    assert reviewer.seat is Seat.REVIEWER
+    assert len(reviewer.context_refs) == 3
+    assert reviewer.context_refs[:2] == ("patch:0", "stdout:1")
+    content = _builder_report(ports, reviewer.context_refs[2])
+    assert "built" in content and "report:builder" in content
+    assert json.loads(content) == {"summary": "built", "report_ref": "report:builder"}
+
+
+def test_each_reviewer_gets_the_latest_builder_report_of_its_round() -> None:
+    ports = _corrected_run()
+
+    reviewers = [r for r in ports.harness.requests if r.seat is Seat.REVIEWER]
+    assert len(reviewers) == 2
+    first = _builder_report(ports, reviewers[0].context_refs[2])
+    second = _builder_report(ports, reviewers[1].context_refs[2])
+    assert "report:first" in first
+    assert "report:fold" in second and "report:first" not in second
+    assert reviewers[0].context_refs[2] != reviewers[1].context_refs[2]
+    assert "item-1-builder-report-1" in ports.records.evidence
+    assert "item-1-builder-report-2" in ports.records.evidence
+
+
+def test_no_reviewer_is_handed_a_builder_transcript() -> None:
+    transcripts = ("raw:builder", "raw:first", "raw:fold")
+    for ports in (_accepted_run(), _corrected_run()):
+        for request in ports.harness.requests:
+            if request.seat is Seat.BUILDER:
+                continue
+            assert not set(transcripts) & set(request.context_refs)
+            for reference in request.context_refs:
+                if "builder-report" in reference:
+                    content = _builder_report(ports, reference)
+                    assert not [raw for raw in transcripts if raw in content]

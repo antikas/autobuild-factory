@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, replace
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -33,6 +34,35 @@ def _safe_relative(value: str) -> str:
     return "/".join(_safe_name(part) for part in parts)
 
 
+PAUSE_MARKER = "pause-requested.json"
+
+
+def pause_marker_path(run_dir: Path) -> Path:
+    return run_dir / PAUSE_MARKER
+
+
+def request_pause(run_dir: Path) -> Path:
+    """Write the pause marker into a run directory and return its path. A
+    second request replaces the first, so a run never holds two markers."""
+
+    path = pause_marker_path(run_dir)
+    payload = {
+        "schema": "autobuild.pause.v1",
+        "run_id": run_dir.name,
+        "requested_at": datetime.now(UTC).isoformat(),
+    }
+    _atomic_write(path, json.dumps(payload, indent=2, sort_keys=True))
+    return path
+
+
+def _manifest(run_dir: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _atomic_write(path: Path, content: str) -> None:
     _atomic_write_bytes(path, content.encode("utf-8"))
 
@@ -43,10 +73,20 @@ def _atomic_write_bytes(path: Path, content: bytes) -> None:
     temporary.replace(path)
 
 
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 class LocalRunRecordAdapter:
-    def __init__(self, root: Path, metadata: Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        metadata: Mapping[str, Any] | None = None,
+        now: Callable[[], datetime] = utc_now,
+    ) -> None:
         self._root = root.resolve(strict=False)
         self._metadata = dict(metadata or {})
+        self._now = now
         self._lock = Lock()
         # The last line number written to each events log, kept in memory so an
         # append never recounts the file.
@@ -63,7 +103,8 @@ class LocalRunRecordAdapter:
         )
 
     def create(self, campaign: CampaignRef) -> RunRecordRef:
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        created = self._now().astimezone(UTC)
+        stamp = created.strftime("%Y%m%dT%H%M%SZ")
         run_id = f"{_safe_name(campaign.campaign_id)}-{stamp}-{uuid4().hex[:8]}"
         record_root = self._root / run_id
         record_root.mkdir(parents=True, exist_ok=False)
@@ -72,7 +113,7 @@ class LocalRunRecordAdapter:
             "run_id": run_id,
             "campaign_id": campaign.campaign_id,
             "repository": str(campaign.repository.resolve(strict=False)),
-            "created_at": datetime.now(UTC).isoformat(),
+            "created_at": created.isoformat(),
             "runtime": self._metadata,
         }
         _atomic_write(record_root / "manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
@@ -82,11 +123,14 @@ class LocalRunRecordAdapter:
             self._sequences[record_root / "events.jsonl"] = 0
         return RunRecordRef(run_id, record_root)
 
+    def timestamp(self) -> str:
+        return self._now().astimezone(UTC).isoformat()
+
     def append(self, record: RunRecordRef, event: RunEvent) -> str:
         path = record.root / "events.jsonl"
         stamped = event
         if not event.occurred_at.strip():
-            stamped = replace(event, occurred_at=datetime.now(UTC).isoformat())
+            stamped = replace(event, occurred_at=self.timestamp())
         payload = asdict(stamped)
         payload["evidence_refs"] = list(stamped.evidence_refs)
         payload["payload"] = dict(stamped.payload)
@@ -163,6 +207,37 @@ class LocalRunRecordAdapter:
             )
         except (KeyError, TypeError, ValueError):
             return None
+
+    def pause_requested(self, record: RunRecordRef) -> bool:
+        return pause_marker_path(record.root).is_file()
+
+    def clear_prior_pause(self, record: RunRecordRef) -> str | None:
+        current = _manifest(record.root)
+        if current is None or not current.get("repository"):
+            return None
+        repository = current["repository"]
+        newest: tuple[str, str, Path] | None = None
+        try:
+            run_dirs = [entry for entry in self._root.iterdir() if entry.is_dir()]
+        except OSError:
+            return None
+        current_root = record.root.resolve(strict=False)
+        for run_dir in run_dirs:
+            if run_dir.resolve(strict=False) == current_root:
+                continue
+            manifest = _manifest(run_dir)
+            if manifest is None or manifest.get("repository") != repository:
+                continue
+            key = (str(manifest.get("created_at", "")), run_dir.name, run_dir)
+            if newest is None or key[:2] > newest[:2]:
+                newest = key
+        if newest is None:
+            return None
+        marker = pause_marker_path(newest[2])
+        if not marker.is_file():
+            return None
+        marker.unlink(missing_ok=True)
+        return newest[2].name
 
     def complete(self, record: RunRecordRef, summary: str) -> str:
         path = record.root / "report.txt"

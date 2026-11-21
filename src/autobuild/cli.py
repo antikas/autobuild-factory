@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from autobuild.adapters.local_records import request_pause
 from autobuild.adapters.progress import ProgressLogReader, is_completion_line
 from autobuild.bootstrap.composition import (
     host_capacity,
@@ -27,6 +28,7 @@ from autobuild.domain import (
     UsageReading,
     bytes_to_gib,
 )
+from autobuild.domain.models import BatchVerdict
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -76,6 +78,21 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         help="Stop with exit 3 if no completion line arrives within this many seconds.",
     )
+
+    pause = subcommands.add_parser(
+        "pause",
+        help="Ask a running campaign to finish its in-flight items and stop",
+    )
+    pause_selector = pause.add_mutually_exclusive_group(required=True)
+    pause_selector.add_argument("--run", help="Run id to pause under the runs root")
+    pause_selector.add_argument(
+        "--latest",
+        action="store_true",
+        help="Pause the most recently modified run under the runs root",
+    )
+    pause.add_argument("--repository", default=".")
+    pause.add_argument("--profile")
+    pause.add_argument("--scratch-root")
 
     usage = subcommands.add_parser(
         "usage",
@@ -176,6 +193,47 @@ def _latest_run_dir(runs_root: Path) -> Path | None:
     return max(candidates, key=lambda entry: entry.stat().st_mtime)
 
 
+def _find_run_dir(args: argparse.Namespace) -> Path | None:
+    """The run directory ``--run`` or ``--latest`` names, or None with the
+    reason printed to stderr."""
+
+    try:
+        runs_root = resolve_runs_root(args.repository, args.profile, args.scratch_root)
+    except (ConfigurationError, OSError, UnicodeError) as exc:
+        print(f"autobuild {args.command}: {exc}", file=sys.stderr)
+        return None
+    if args.latest:
+        run_dir = _latest_run_dir(runs_root)
+        if run_dir is None:
+            print(f"no run exists under {runs_root}", file=sys.stderr)
+        return run_dir
+    run_dir = runs_root / args.run
+    if run_dir.parent != runs_root or not run_dir.is_dir():
+        print(f"run does not exist: {args.run}", file=sys.stderr)
+        return None
+    return run_dir
+
+
+def _pause(args: argparse.Namespace) -> int:
+    """Write the pause marker into the run's directory; exit 0 once written,
+    2 when the profile cannot be read, the run cannot be found or the run has
+    already completed."""
+
+    run_dir = _find_run_dir(args)
+    if run_dir is None:
+        return 2
+    if any(is_completion_line(line) for line in ProgressLogReader(run_dir / "progress.log").poll()):
+        print(f"run {run_dir.name} has already completed; there is nothing to pause.", file=sys.stderr)
+        return 2
+    try:
+        marker = request_pause(run_dir)
+    except OSError as exc:
+        print(f"autobuild pause: cannot write the pause marker: {exc}", file=sys.stderr)
+        return 2
+    print(f"pause requested for run {run_dir.name}: {marker}")
+    return 0
+
+
 def _watch(
     args: argparse.Namespace,
     *,
@@ -187,20 +245,12 @@ def _watch(
 
     The runs root is resolved without a complete profile. Stdout carries the
     progress lines only; every diagnostic goes to stderr. The command exits 0 once
-    the campaign-completion line has been printed, 2 when the run cannot be found,
-    and 3 when ``--timeout-seconds`` elapses first."""
+    the campaign-completion line has been printed, 2 when the profile cannot be
+    read or the run cannot be found, and 3 when ``--timeout-seconds`` elapses first."""
 
-    runs_root = resolve_runs_root(args.repository, args.profile, args.scratch_root)
-    if args.latest:
-        run_dir = _latest_run_dir(runs_root)
-        if run_dir is None:
-            print(f"no run exists under {runs_root}", file=sys.stderr)
-            return 2
-    else:
-        run_dir = runs_root / args.run
-        if run_dir.parent != runs_root or not run_dir.is_dir():
-            print(f"run does not exist: {args.run}", file=sys.stderr)
-            return 2
+    run_dir = _find_run_dir(args)
+    if run_dir is None:
+        return 2
     reader = ProgressLogReader(run_dir / "progress.log")
     deadline = None if args.timeout_seconds is None else clock() + args.timeout_seconds
     while True:
@@ -381,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "watch":
         return _watch(args)
+    if args.command == "pause":
+        return _pause(args)
     if args.command == "usage":
         return _usage(args)
     if args.command == "preflight":
@@ -407,4 +459,6 @@ def main(argv: list[str] | None = None) -> int:
         destination.write_text(rendered + "\n", encoding="utf-8")
     print(rendered)
     dispositions = {item["disposition"] for item in result["items"]}
+    if result.get("batch_validation", {}).get("verdict") == BatchVerdict.FAILED.value:
+        return 1
     return 0 if not dispositions or dispositions == {ItemDisposition.ACCEPTED.value} else 1

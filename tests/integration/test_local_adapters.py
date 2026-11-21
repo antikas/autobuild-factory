@@ -24,6 +24,7 @@ from autobuild.adapters import (
     WindowsCommandAdapter,
 )
 from autobuild.adapters.local_command import ProgressSample, progress_stalled
+from autobuild.adapters.local_records import PAUSE_MARKER, request_pause
 from autobuild.application import CampaignRunner, WorkflowPorts
 from autobuild.cli import main
 from autobuild.domain import (
@@ -327,6 +328,63 @@ def test_run_record_stamps_a_utc_timestamp_and_persists_the_payload(tmp_path: Pa
     stamped = datetime.fromisoformat(event["occurred_at"])
     assert stamped.tzinfo is not None and stamped.utcoffset() == timedelta(0)
     assert event["payload"] == {"seat": "builder", "input_tokens": 11}
+
+
+def test_run_record_stamps_events_from_its_injected_clock(tmp_path: Path) -> None:
+    frozen = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    adapter = LocalRunRecordAdapter(tmp_path / "runs", now=lambda: frozen)
+    record = adapter.create(CampaignRef("campaign", tmp_path / "repo"))
+
+    assert adapter.timestamp() == "2026-01-02T03:04:05+00:00"
+    adapter.append(record, RunEvent("campaign.started", payload={}))
+    adapter.append(record, RunEvent("campaign.kept", occurred_at="2025-12-31T00:00:00+00:00"))
+
+    lines = (record.root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    stamps = [json.loads(line)["occurred_at"] for line in lines]
+    assert stamps == ["2026-01-02T03:04:05+00:00", "2025-12-31T00:00:00+00:00"]
+
+
+def test_run_record_manifest_and_run_id_come_from_its_injected_clock(tmp_path: Path) -> None:
+    adapter = LocalRunRecordAdapter(
+        tmp_path / "runs", now=lambda: datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    )
+    record = adapter.create(CampaignRef("campaign", tmp_path / "repo"))
+
+    manifest = json.loads((record.root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["created_at"] == "2026-01-02T03:04:05+00:00"
+    assert "-20260102T030405Z-" in record.run_id
+    assert manifest["run_id"] == record.run_id
+
+
+def test_run_record_reads_its_clock_once_for_run_id_and_manifest(tmp_path: Path) -> None:
+    readings = iter([datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)])
+
+    def clock() -> datetime:
+        return next(readings, datetime(2027, 1, 1, tzinfo=UTC))
+
+    adapter = LocalRunRecordAdapter(tmp_path / "runs", now=clock)
+    record = adapter.create(CampaignRef("campaign", tmp_path / "repo"))
+
+    manifest = json.loads((record.root / "manifest.json").read_text(encoding="utf-8"))
+    stamp = record.run_id.split("-")[-2]
+    assert stamp == "20260102T030405Z"
+    assert manifest["created_at"] == "2026-01-02T03:04:05+00:00"
+
+
+def test_clear_prior_pause_orders_prior_runs_by_the_injected_clock(tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    repository = CampaignRef("campaign", tmp_path / "repo")
+
+    def adapter_at(day: int) -> LocalRunRecordAdapter:
+        return LocalRunRecordAdapter(runs, now=lambda: datetime(2026, 1, day, tzinfo=UTC))
+
+    adapter_at(3).create(repository)
+    older = adapter_at(2).create(repository)
+    request_pause(older.root)
+    current = adapter_at(4).create(repository)
+
+    assert adapter_at(4).clear_prior_pause(current) is None
+    assert (older.root / PAUSE_MARKER).is_file()
 
 
 def test_host_command_runs_argv_and_captures_both_streams(tmp_path: Path) -> None:

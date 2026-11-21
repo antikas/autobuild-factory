@@ -62,11 +62,15 @@ Reviewer result:
 {
   "decision": "pass",
   "findings": [],
-  "evidence_ref": "Reference supplied by the command, or an empty string"
+  "evidence_ref": "Reference supplied by the command, or an empty string",
+  "inspected": [{"path": "src/app.py", "lines": "1-120,300-340"}],
+  "acceptance": [{"clause": "A1", "outcome": "met", "evidence_ref": "src/app.py:42"}]
 }
 ```
 
 Blocking decisions use `correct`, `escalate` or `park` and require at least one finding. Each finding carries a code, concrete consequence and evidence reference. A specialist boundary is optional.
+
+`inspected` and `acceptance` are required arrays; an adjudicating specialist usually returns both empty. Each `inspected` entry names a path the seat read and the line ranges it read, or `"all"`. Each `acceptance` entry names a clause number the seat was given (`A1`), its outcome (`met`, `unmet` or `not_checked`) and an evidence reference. Every key of both entries is required and no other key is allowed. A `pass` that reports a clause `unmet` is refused.
 
 ### Command mappings
 
@@ -110,13 +114,13 @@ Each adapter declares the levels it can pass in `effort_levels`. The three built
 
 ### Lane failure signals
 
-Each adapter owns the classification of its own failures through `classify_failure`. It reads a lane signal from structural evidence only: the process exit state and the CLI's structured error fields. It never scans the event stream for words. A successful seat, or a seat the harness killed for stalling, timing out or cancellation, never cools a lane, so a report that mentions "rate limit" in prose with a clean exit and a valid result is not a false kill. A failed process that produced no structured output at all is a spawn failure and cools the lane.
+Each adapter owns the classification of its own failures through `classify_failure`. It reads a lane signal from structural evidence only: the process exit state and the CLI's structured error fields, read from whole JSON documents on both standard output and standard error, with a code on standard output read first. A whole JSON document is a JSON object or array that forms the whole stream or one whole line; JSON after text on a line, and a bare value such as a number, are not documents. A document behind a byte order mark, or a pretty-printed document after a prose line, is not a whole document either, so such a failure is a spawn failure. Inside a document, a string field counts as structured only when its whole text is one JSON object or array, so JSON quoted inside prose in a result field never cools a lane. It never scans the event stream for words. A successful seat, or a seat the harness killed for stalling, timing out or cancellation, never cools a lane, so a report that mentions "rate limit" in prose with a clean exit and a valid result is not a false kill. A failed process that produced no structured document on either stream is a spawn failure and cools the lane.
 
 The structured fields each adapter reads:
 
 | Adapter | Structured limit fields |
 |---|---|
-| Claude Code | the result object `is_error` with a nested `error.type` (or `subtype`) following the Anthropic error taxonomy, such as `rate_limit_error`, `overloaded_error` and `authentication_error` |
+| Claude Code | the result object `is_error` with a nested `error.type` (or `subtype`) following the Anthropic error taxonomy, such as `rate_limit_error`, `overloaded_error` and `authentication_error`, and the `api_error_status` on a result with `is_error`, where 429 is a rate limit and 401 is an auth failure |
 | Codex | an `error` event or a `turn.failed` event with a nested `error` carrying the OpenAI error `type` or `code`, such as `rate_limit_exceeded`, `insufficient_quota` and `invalid_api_key` |
 | GitHub Copilot | an `error` object with a `code` or `type` (or a nested `error`) carrying the GitHub Models limit codes, such as `rate_limited`, `quota_exceeded` and `unauthorized` |
 | Claude Agent SDK | top-level message fields only: the assistant message `error` (`billing_error`, `rate_limit`, `authentication_failed`) and a result message with `is_error` and an `api_error_status`, whose relayed API message names an exhausted credit balance or a reached spend limit; message content is never read |

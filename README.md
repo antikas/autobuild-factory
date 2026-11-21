@@ -29,13 +29,13 @@ The [setup and run guide](docs/running-autobuild.md) explains installation, harn
 
 AutoBuild has two stages. Use `autobuild-plan` for research, planning, independent review and tracker registration. After the owner approves that result, use `autobuild` to run the queue. [The operating guide starts with the planning stage](docs/running-autobuild.md#stage-1-plan-and-register-the-work).
 
-Release 0.10.0 is available from PyPI as [`autobuild-factory`](https://pypi.org/project/autobuild-factory/) and as a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.10.0). The guide also has a [macOS setup path](docs/running-autobuild.md#set-up-autobuild-on-macos) and [GitHub Copilot setup](docs/running-autobuild.md#github-copilot-cli).
+Release 0.11.0 is available from PyPI as [`autobuild-factory`](https://pypi.org/project/autobuild-factory/) and as a Python wheel and source archive on the [GitHub release page](https://github.com/antikas/autobuild-factory/releases/tag/autobuild-factory-0.11.0). The guide also has a [macOS setup path](docs/running-autobuild.md#set-up-autobuild-on-macos) and [GitHub Copilot setup](docs/running-autobuild.md#github-copilot-cli).
 
 Platform and coding assistant are separate choices. You can use Codex on macOS, GitHub Copilot on Windows, or any other supported combination.
 
 The [architecture guide](docs/architecture.md) explains the layers, state machines, ports, adapters, evidence chain, Git delivery model and extension points.
 
-Run the test lane with `uv run --native-tls python -m pytest tests -q`. Add `-n 8 --dist loadfile` to run it on eight pytest-xdist workers.
+Run the test lane with `uv run --system-certs python -m pytest tests -q`. Add `-n 8 --dist loadfile` to run it on eight pytest-xdist workers.
 
 The [harness adapter guide](docs/harness-adapters.md) explains how one builder and reviewer contract runs through Claude Code, Codex and GitHub Copilot.
 

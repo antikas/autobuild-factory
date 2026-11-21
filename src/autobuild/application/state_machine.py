@@ -11,8 +11,13 @@ ALLOWED_TRANSITIONS: dict[ItemState, frozenset[ItemState]] = {
     ItemState.VERIFIED: frozenset({ItemState.CLAIMED}),
     ItemState.CLAIMED: frozenset({ItemState.ISOLATED, ItemState.PARKED}),
     ItemState.ISOLATED: frozenset({ItemState.BUILT, ItemState.PARKED}),
-    ItemState.BUILT: frozenset({ItemState.VALIDATED, ItemState.PARKED}),
-    ItemState.VALIDATED: frozenset({ItemState.REVIEWED, ItemState.PARKED}),
+    # Back to isolated when a red validator retries the builder in the same worktree.
+    ItemState.BUILT: frozenset({ItemState.VALIDATED, ItemState.ISOLATED, ItemState.PARKED}),
+    # Straight to finalised when a review lane's last correction is judged by
+    # the validator alone.
+    ItemState.VALIDATED: frozenset(
+        {ItemState.REVIEWED, ItemState.FINALISED, ItemState.PARKED}
+    ),
     ItemState.REVIEWED: frozenset(
         {ItemState.CORRECTING, ItemState.ESCALATED, ItemState.FINALISED, ItemState.PARKED}
     ),

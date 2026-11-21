@@ -28,12 +28,20 @@ from autobuild.domain import (
     ProbeResult,
     Proposal,
     ProposalRef,
+    ReviewFinding,
     TrackerPublication,
     TrackerStop,
     WorkItem,
     WorkspaceRef,
+    fenced_block,
 )
-from autobuild.domain.models import HoldCondition, SkippedItem, TrackerRecovery
+from autobuild.domain.models import (
+    HoldCondition,
+    SkippedItem,
+    TrackerRecovery,
+    heading_text,
+    labelled_value,
+)
 from autobuild.adapters.tracker_commits import (
     head_on_remote,
     only_tracker_changes,
@@ -63,6 +71,32 @@ _PUSH_REJECTED = "push_rejected"
 # publishing push. The first attempt runs at once.
 RECOVERY_WAITS = (2.0, 5.0, 10.0)
 _RECOVERY_SUBJECT = "pinax: commit the appended tracker event"
+# The longest caption ``pinax note add`` accepts.
+CAPTION_LIMIT = 200
+# Pinax mints a suffix of at least four characters and lengthens it on a
+# collision; the pre-write caption check reserves this many.
+_ID_SUFFIX_ROOM = 8
+
+
+def _findings(findings: tuple[ReviewFinding, ...]) -> str:
+    """Every finding of the accepted verdict in full, in order."""
+
+    if not findings:
+        return "none"
+    blocks = []
+    for finding in findings:
+        multi_line_code = "\n" in finding.code or "\r" in finding.code
+        lines = [
+            heading_text(f"### {finding.code}"),
+            "",
+            *(labelled_value("Finding code", finding.code) if multi_line_code else ()),
+            f"- Blocking: {'yes' if finding.blocking else 'no'}",
+            *labelled_value("Evidence reference", finding.evidence_ref or "none"),
+            "",
+            fenced_block(finding.consequence),
+        ]
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 class _PartialWrite(TrackerStop):
@@ -193,7 +227,61 @@ class PinaxTrackerAdapter:
             item = self._fenced_item(campaign, root, item_id, title)
             if item is not None:
                 items.append(item)
+        head_id = self._head_id(root)
+        for index, item in enumerate(items):
+            if item.item_id == head_id:
+                return (item, *items[:index], *items[index + 1 :])
         return tuple(items)
+
+    def _head_id(self, root: Path) -> str | None:
+        """The id ``pinax next`` offers. ``pinax ready`` lists by item id and
+        only ``pinax next`` knows the dispatch order, so the listing puts this
+        head first. ``next_item`` is not used here because it falls back to
+        this listing."""
+
+        completed = self._run(root, "next", "--actor", "coordinator@autobuild", "--json")
+        if completed.returncode != 0:
+            combined = f"{completed.stdout}\n{completed.stderr}".casefold()
+            if "no ready" in combined or "queue" in combined and "empty" in combined:
+                return None
+            raise AdapterError(
+                completed.stderr.strip() or completed.stdout.strip() or "pinax next failed"
+            )
+        if not completed.stdout.strip():
+            return None
+        payload = json.loads(completed.stdout)
+        if not isinstance(payload, dict) or payload.get("item_id") is None:
+            return None
+        return str(payload["item_id"])
+
+    def blocked_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
+        root = campaign.repository.resolve(strict=False)
+        if root != self._repository:
+            raise AdapterError("campaign repository does not match the bound Pinax repository")
+        items_dir = root / ".ergon" / "items"
+        if not items_dir.is_dir():
+            return frozenset()
+        fronts = {}
+        for path in sorted(items_dir.glob("*.md")):
+            front = self._frontmatter(path)
+            item_id = front.get("id", "").strip()
+            if item_id:
+                fronts[item_id] = front
+
+        def status(item_id: str) -> str:
+            return fronts.get(item_id, {}).get("status", "").strip().casefold()
+
+        blocked: set[str] = set()
+        for item_id, front in fronts.items():
+            deps = [
+                dep.strip().strip("'\"")
+                for dep in front.get("deps", "").strip().strip("[]").split(",")
+            ]
+            if status(item_id) == "blocked" or any(
+                dep and status(dep) != "done" for dep in deps
+            ):
+                blocked.add(item_id)
+        return frozenset(blocked)
 
     def _fenced_item(
         self, campaign: CampaignRef, root: Path, item_id: str, title: str
@@ -218,6 +306,28 @@ class PinaxTrackerAdapter:
             brief_ref,
             (caption or f"Measurable acceptance is defined by {brief_ref}",),
         )
+
+    def known_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
+        root = campaign.repository.resolve(strict=False)
+        if root != self._repository:
+            raise AdapterError("campaign repository does not match the bound Pinax repository")
+        log_dir = root / ".ergon" / "log"
+        if not log_dir.is_dir():
+            raise AdapterError(f"Pinax event log is missing at {log_dir}")
+        known: set[str] = set()
+        for log in log_dir.glob("*.jsonl"):
+            for line in log.read_text(encoding="utf-8").splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "item.created":
+                    continue
+                payload = event.get("payload", {})
+                item_id = str(payload.get("item_id", "")) if isinstance(payload, dict) else ""
+                if item_id:
+                    known.add(item_id)
+        return frozenset(known)
 
     @staticmethod
     def _titles(root: Path) -> dict[str, str]:
@@ -362,6 +472,10 @@ class PinaxTrackerAdapter:
 
     def propose(self, proposal: Proposal, actor: str) -> ProposalRef:
         self.validate_proposal(proposal)
+        # The id is known only after ``add``; checking with the longest
+        # suffix expected keeps a pointer that cannot fit from leaving an
+        # item behind without its note.
+        self.caption(proposal, f"{self._proposal_prefix}-{'x' * _ID_SUFFIX_ROOM}")
         created, added = self._on_primary(
             self._no_foreign_changes,
             "add",
@@ -387,7 +501,7 @@ class PinaxTrackerAdapter:
             actor,
             "--json",
         )
-        caption = f"{proposal.question} {proposal.rationale}"[:200]
+        caption = self.caption(proposal, proposal_id)
         _, noted = self._on_primary(
             None,
             "note",
@@ -407,6 +521,26 @@ class PinaxTrackerAdapter:
             runnable=False,
             published=all(write.published for write in writes),
             publication_note=next((write.note for write in writes if not write.published), ""),
+        )
+
+    @staticmethod
+    def caption(proposal: Proposal, proposal_id: str) -> str:
+        """The proposal's note caption: a pointer to where its full text is
+        kept, never the text itself, because Pinax takes at most
+        ``CAPTION_LIMIT`` characters. The parent clause is dropped first; a
+        pointer that still does not fit raises ``EvidenceError``."""
+
+        source = proposal.report_ref or proposal.brief_ref
+        pointer = f"Full text: {source}, section {proposal_id}"
+        if proposal.parent_item:
+            with_parent = f"{pointer}; parent {proposal.parent_item} close briefing"
+            if len(with_parent) <= CAPTION_LIMIT:
+                return with_parent
+        if len(pointer) <= CAPTION_LIMIT:
+            return pointer
+        raise EvidenceError(
+            f"proposal report_ref or brief_ref is too long for a {CAPTION_LIMIT}-character "
+            "Pinax note caption"
         )
 
     @staticmethod
@@ -474,6 +608,7 @@ class PinaxTrackerAdapter:
     @staticmethod
     def _briefing(evidence: CloseEvidence, item_commit: str) -> str:
         changed = "\n".join(f"- {entry.kind.value}: `{entry.path.as_posix()}`" for entry in evidence.diff.changed_paths)
+        lane = f"- Builder lane: `{evidence.builder_lane}`\n" if evidence.builder_lane else ""
         return (
             f"## Outcome\n\nAccepted and delivered by AutoBuild.\n\n"
             f"## Evidence\n\n"
@@ -482,7 +617,9 @@ class PinaxTrackerAdapter:
             f"- Validator: `{evidence.validation.validator_id}`\n"
             f"- Validator output: `{evidence.validation.command.stdout_ref}`\n"
             f"- Review verdict: `{evidence.verdict.evidence_ref}`\n"
-            f"- Trajectory: `{evidence.trajectory_ref}`\n\n"
+            f"- Trajectory: `{evidence.trajectory_ref}`\n"
+            f"{lane}\n"
+            f"## Review findings\n\n{_findings(evidence.verdict.findings)}\n\n"
             f"## Changed paths\n\n{changed or '- None'}\n"
         )
 

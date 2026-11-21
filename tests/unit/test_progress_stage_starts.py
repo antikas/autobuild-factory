@@ -320,8 +320,27 @@ def test_the_report_is_byte_identical_with_and_without_start_events() -> None:
     assert START_EVENTS <= set(events_with)
     assert not START_EVENTS & set(events_without)
     assert with_starts.encode("utf-8") == without_starts.encode("utf-8")
-    assert with_starts.count("| item-1 | builder |") == 1
-    assert with_starts.count("| item-1 | reviewer |") == 1
+    seat_usage = _report_section(with_starts, "Seat usage")
+    review_depth = _report_section(with_starts, "Review depth")
+    assert _rows(seat_usage, "| item-1 | builder |") == 1
+    assert _rows(seat_usage, "| item-1 | reviewer |") == 1
+    assert _rows(review_depth, "| item-1 | reviewer |") == 1
+    assert _rows(review_depth, "| item-1 | builder |") == 0
+
+
+def _report_section(report: str, name: str) -> list[str]:
+    lines = report.splitlines()
+    start = lines.index(f"## {name}") + 1
+    section = []
+    for line in lines[start:]:
+        if line.startswith("## "):
+            break
+        section.append(line)
+    return section
+
+
+def _rows(section: list[str], prefix: str) -> int:
+    return sum(1 for line in section if line.startswith(prefix))
 
 
 class _BatchHeld(_Deliveries):
