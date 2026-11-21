@@ -1,6 +1,6 @@
 ---
 name: autobuild-builder
-description: Fresh builder seat for one approved item in a coordinated AutoBuild campaign. Changes the artefact in its assigned lane from the brief it is given, runs the scoped validator, and returns a bounded report. Never commits, never writes the tracker.
+description: Fresh builder seat for one approved item in a coordinated AutoBuild campaign. Changes the artefact in its assigned lane from the brief it is given, runs only the focused tests that cover its change, and returns a bounded report. Never runs the validator, the full suite or a whole test directory; the coordinator runs the validator once on the reviewed candidate. Never commits, never writes the tracker.
 tools: ["read", "search", "edit", "execute"]
 disable-model-invocation: true
 user-invocable: false

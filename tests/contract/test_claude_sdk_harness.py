@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -118,7 +119,7 @@ def test_a_builder_seat_returns_the_typed_result_usage_and_model(tmp_path: Path)
 
 
 def test_a_reviewer_seat_returns_the_typed_verdict(tmp_path: Path) -> None:
-    verdict = {"decision": "pass", "findings": [], "evidence_ref": "review"}
+    verdict = {"decision": "pass", "findings": [], "evidence_ref": "review", "inspected": [], "acceptance": []}
     client = FakeAgentSdkClient(scripts=[[result_record(structured_output=verdict)]])
 
     result = adapter_for(tmp_path, client).invoke(seat(tmp_path, Seat.REVIEWER, frozenset({"read"})))
@@ -131,7 +132,7 @@ def test_a_reviewer_seat_returns_the_typed_verdict(tmp_path: Path) -> None:
     [(Seat.BUILDER, frozenset({"read", "write", "shell", "python", "git"})), (Seat.REVIEWER, frozenset({"read"}))],
 )
 def test_the_seat_carries_the_claude_code_seat_contract(tmp_path: Path, kind, tools) -> None:
-    client = FakeAgentSdkClient(scripts=[[result_record(structured_output={"summary": "s", "report_ref": "r", "decision": "pass", "findings": [], "evidence_ref": "e"})]])
+    client = FakeAgentSdkClient(scripts=[[result_record(structured_output={"summary": "s", "report_ref": "r", "decision": "pass", "findings": [], "evidence_ref": "e", "inspected": [], "acceptance": []})]])
     request = seat(tmp_path, kind, tools, effort=EffortLevel.HIGH)
     cli = ClaudeCodeHarnessAdapter(
         FakeCommandAdapter(identity()), tmp_path / "cli", command=(sys.executable,),
@@ -223,6 +224,26 @@ def test_the_child_gets_a_fresh_empty_config_dir_and_no_billing_or_redirect_vari
         assert first[name] == ""
     assert first["DISABLE_TELEMETRY"] == "1"
     assert all(KEY_SENTINEL not in value for value in first.values())
+
+
+def _basetemp(environment: dict[str, str]) -> str:
+    options = shlex.split(environment["PYTEST_ADDOPTS"])
+    return next(option.removeprefix("--basetemp=") for option in options if option.startswith("--basetemp="))
+
+
+def test_seats_of_one_item_in_two_runs_get_different_temporary_trees(tmp_path: Path) -> None:
+    client = FakeAgentSdkClient(scripts=[[result_record(structured_output={"summary": "s", "report_ref": "r"})]] * 2)
+    adapter = adapter_for(tmp_path, client)
+
+    adapter.invoke(seat(tmp_path, run_id="run-a", item_id="item-1"))
+    adapter.invoke(seat(tmp_path, run_id="run-b", item_id="item-1"))
+
+    first, second = (dict(spec.environment) for spec in client.specs)
+    assert first["TMPDIR"] != second["TMPDIR"]
+    assert _basetemp(first) != _basetemp(second)
+    root = (tmp_path / "harness").resolve()
+    assert Path(first["TMPDIR"]).resolve().is_relative_to(root)
+    assert Path(second["TMPDIR"]).resolve().is_relative_to(root)
 
 
 def test_a_missing_key_file_fails_the_probe_without_reading_any_oauth_credential(tmp_path: Path) -> None:

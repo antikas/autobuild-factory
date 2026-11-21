@@ -576,10 +576,11 @@ def _ports(
 
 
 def _item_environment(scratch: Path):
-    """Map each item to its own temporary directories under ``<scratch>/items``."""
+    """Map each item or batch of each run to its own temporary directories
+    under ``<scratch>/items``."""
 
     root = scratch / "items"
-    return lambda item_id: item_scratch_environment(root, item_id)
+    return lambda run_id, name: item_scratch_environment(root, run_id, name)
 
 
 def _lane_models(lane: LaneProfile) -> dict[str, str]:
@@ -728,6 +729,8 @@ def _preflight(
             briefs=tuple(briefs),
             tracker_surface=tracker_surface,
             removed_environment=tuple(getattr(harness, "removed_environment", ())),
+            repository_root=settings.repository,
+            allowed_roots=(settings.repository, *settings.allowed_roots),
         ),
         network=SocketNetworkProbe(),
         environment=ProcessEnvironmentProbe(dict(os.environ)),
@@ -880,10 +883,23 @@ def _lane_efforts(settings: RunSettings) -> tuple[tuple[str, Seat, EffortLevel],
     )
 
 
+def _starting_lane(
+    settings: RunSettings, lane_manifest: list[dict[str, object]], lane_state
+) -> LaneProfile:
+    """The lane the first seat runs on: the first configured lane that is
+    capable and not cooling. Read after the usage preflight, which may cool a
+    lane. When every lane is cooling the first configured lane is returned."""
+
+    capable = {str(entry["name"]) for entry in lane_manifest if entry.get("available")}
+    for lane in settings.lanes:
+        if lane.name in capable and lane_state.active(lane.name) is None:
+            return lane
+    return settings.lanes[0]
+
+
 def _starting_lane_efforts(
-    settings: RunSettings, lane_efforts: tuple[tuple[str, Seat, EffortLevel], ...]
+    starting_lane: str, lane_efforts: tuple[tuple[str, Seat, EffortLevel], ...]
 ) -> dict[str, EffortLevel | None]:
-    starting_lane = settings.lanes[0].name
     return {
         seat.value: next(
             (
@@ -1080,18 +1096,15 @@ def run_campaign(
     refill = settings.refill_plan or RefillPlan()
     target_branch = repository.current_branch or repository.default_branch
     lane_efforts = _lane_efforts(settings)
+    starting_lane = _starting_lane(settings, lane_manifest, lane_state)
     context = CampaignContext(
-        harness=settings.harness,
-        models={
-            "builder": settings.builder_model,
-            "reviewer": settings.reviewer_model,
-            "specialist": settings.specialist_model,
-        },
+        harness=starting_lane.name,
+        models=_lane_models(starting_lane),
         delivery_mode=delivery_mode,
         validator_id=settings.validator_id,
         target_branch=target_branch,
         target_revision=repository.revision,
-        efforts=_starting_lane_efforts(settings, lane_efforts),
+        efforts=_starting_lane_efforts(starting_lane.name, lane_efforts),
         push_current_branch=push_current_branch,
         allow_current_branch_default=allow_current_branch_default,
         tracker_surface=tracker_surface,
@@ -1147,6 +1160,21 @@ def run_campaign(
             "peak_concurrency": outcome.peak_concurrency,
             "makespan_seconds": round(outcome.makespan_seconds, 3),
             "item_seconds": round(outcome.item_seconds, 3),
+        },
+        "batch_validation": {
+            "verdict": outcome.batch_validation.verdict.value,
+            "runs": [
+                {
+                    "batch": run.number,
+                    "final": run.final,
+                    "revision": run.revision,
+                    "passed": run.passed,
+                    "exit_code": run.exit_code,
+                    "stdout_ref": run.stdout_ref,
+                    "error": run.error or None,
+                }
+                for run in outcome.batch_validation.runs
+            ],
         },
         "items": [
             {

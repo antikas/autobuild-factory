@@ -8,6 +8,6 @@ Outcome: <what now exists, stated from the artefact: relations, gates, tests, do
 
 Finding disposition: apply the [findings and disposition rules](../rules.md#findings-and-disposition). Corrected blockers: <the blocker and its fix, per round>. Advisories: <recorded, scheduled or dismissed with reason>.
 
-Evidence: builder's validator run <exit code, suites, build lines>; blind review <rounds and verdicts>; declared acceptance validation on the exact delivery candidate <commit> <evidence line>.
+Evidence: builder's focused test run <command, exit code, pass line>; blind review <rounds and verdicts>; declared acceptance validation on the exact delivery candidate <commit> <evidence line>.
 
-Seats: <builder tier> <minutes>, <tool calls>, <validator runs>, <tokens where the runtime reports them>; <reviewer tier> <passes>, <minutes>, <tokens where reported>. Departures from the brief's command rules: <list or "none">.
+Seats: <builder tier> <minutes>, <tool calls>, <focused test runs>, <tokens where the runtime reports them>; <reviewer tier> <passes>, <minutes>, <tokens where reported>. Departures from the brief's command rules: <list or "none">.

@@ -6,10 +6,6 @@
     "builder@lane-one"
    ],
    [
-    "item-1",
-    "builder@lane-two"
-   ],
-   [
     "item-2",
     "builder@lane-two"
    ]
@@ -27,6 +23,14 @@
      "manifest_path": "/fake/record/manifest.json",
      "models": {},
      "validator_id": ""
+    }
+   },
+   {
+    "event_type": "campaign.launch_set_fixed",
+    "evidence_refs": [],
+    "item_id": null,
+    "payload": {
+     "items": 2
     }
    },
    {
@@ -74,6 +78,26 @@
     }
    },
    {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "lane-one",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "builder",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:one"
@@ -118,6 +142,26 @@
      "model": "",
      "model_class": "builder-class",
      "seat": "builder"
+    }
+   },
+   {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "lane-two",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "builder",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
     }
    },
    {
@@ -183,6 +227,26 @@
     }
    },
    {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "lane-two",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "reviewer",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:review:1"
@@ -213,10 +277,23 @@
     ],
     "item_id": "item-1",
     "payload": {
+     "acceptance": [],
      "blocking_finding_codes": [],
      "decision": "pass",
+     "depth": {
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "shallow": true
+     },
+     "duration_seconds": 2.0,
      "evidence_ref": "verdict:1",
      "finding_codes": [],
+     "inspected": [],
      "non_blocking_finding_codes": []
     }
    },
@@ -225,18 +302,8 @@
     "evidence_refs": [],
     "item_id": "item-1",
     "payload": {
-     "actor": "builder@lane-two",
      "from_lane": "lane-one",
      "lane": "lane-two"
-    }
-   },
-   {
-    "event_type": "tracker.unpublished",
-    "evidence_refs": [],
-    "item_id": "item-1",
-    "payload": {
-     "note": "committed on the pull request branch",
-     "operation": "claim"
     }
    },
    {
@@ -258,6 +325,7 @@
      "item_commit": "item-commit",
      "merged_commit": "merge-commit",
      "pushed": true,
+     "review_lane": null,
      "seat_lanes": [
       {
        "lane": "lane-one",
@@ -317,6 +385,26 @@
      "model": "",
      "model_class": "builder-class",
      "seat": "builder"
+    }
+   },
+   {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "lane-two",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "builder",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
     }
    },
    {
@@ -382,6 +470,26 @@
     }
    },
    {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "lane-two",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "reviewer",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:review:2"
@@ -412,10 +520,23 @@
     ],
     "item_id": "item-2",
     "payload": {
+     "acceptance": [],
      "blocking_finding_codes": [],
      "decision": "pass",
+     "depth": {
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "shallow": true
+     },
+     "duration_seconds": 2.0,
      "evidence_ref": "verdict:2",
      "finding_codes": [],
+     "inspected": [],
      "non_blocking_finding_codes": []
     }
    },
@@ -438,6 +559,7 @@
      "item_commit": "item-commit",
      "merged_commit": "merge-commit",
      "pushed": true,
+     "review_lane": null,
      "seat_lanes": [
       {
        "lane": "lane-two",
@@ -457,6 +579,7 @@
     "item_id": null,
     "payload": {
      "accepted": 2,
+     "batch_validation": "none",
      "failed": 0,
      "parked": 0,
      "report": "docs/campaigns/campaign.md",
@@ -480,6 +603,21 @@
     "lane_signature": null,
     "lanes_exhausted": false,
     "reason": null,
+    "review_depths": [
+     {
+      "boundary": null,
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "duration_seconds": 2.0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "seat": "reviewer",
+      "shallow": true
+     }
+    ],
     "seats": [
      {
       "cost": null,
@@ -563,6 +701,21 @@
     "lane_signature": null,
     "lanes_exhausted": false,
     "reason": null,
+    "review_depths": [
+     {
+      "boundary": null,
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "duration_seconds": 2.0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "seat": "reviewer",
+      "shallow": true
+     }
+    ],
     "seats": [
      {
       "cost": null,
@@ -629,7 +782,6 @@
    "item item-1 seat reviewer started: model class reviewer-class, effort default, lane lane-two",
    "item item-1 seat reviewer succeeded in 0.0 min, estimated cost 0.01",
    "item item-1 review pass with 0 finding(s)",
-   "item item-1 claim committed and not yet published; it goes out with the next push of its branch",
    "item item-1 delivery started: target branch main",
    "item item-1 delivered: item item-commit, tracker tracker-commit, pushed True",
    "item item-2 claimed: second",
@@ -678,6 +830,14 @@
     }
    },
    {
+    "event_type": "campaign.launch_set_fixed",
+    "evidence_refs": [],
+    "item_id": null,
+    "payload": {
+     "items": 4
+    }
+   },
+   {
     "event_type": "item.claimed",
     "evidence_refs": [],
     "item_id": "item-1",
@@ -710,6 +870,26 @@
      "model": "",
      "model_class": "builder-class",
      "seat": "builder"
+    }
+   },
+   {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "builder",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
     }
    },
    {
@@ -775,6 +955,26 @@
     }
    },
    {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-1",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "reviewer",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:review:1"
@@ -805,10 +1005,23 @@
     ],
     "item_id": "item-1",
     "payload": {
+     "acceptance": [],
      "blocking_finding_codes": [],
      "decision": "pass",
+     "depth": {
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "shallow": true
+     },
+     "duration_seconds": 2.0,
      "evidence_ref": "verdict:1",
      "finding_codes": [],
+     "inspected": [],
      "non_blocking_finding_codes": []
     }
    },
@@ -831,6 +1044,7 @@
      "item_commit": "item-commit",
      "merged_commit": "merge-commit",
      "pushed": true,
+     "review_lane": null,
      "seat_lanes": [
       {
        "lane": "",
@@ -877,6 +1091,26 @@
      "model": "",
      "model_class": "builder-class",
      "seat": "builder"
+    }
+   },
+   {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "builder",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
     }
    },
    {
@@ -942,6 +1176,26 @@
     }
    },
    {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "reviewer",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:review:2a"
@@ -972,14 +1226,27 @@
     ],
     "item_id": "item-2",
     "payload": {
+     "acceptance": [],
      "blocking_finding_codes": [
       "finding"
      ],
      "decision": "correct",
+     "depth": {
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "shallow": true
+     },
+     "duration_seconds": 2.0,
      "evidence_ref": "verdict:2a",
      "finding_codes": [
       "finding"
      ],
+     "inspected": [],
      "non_blocking_finding_codes": []
     }
    },
@@ -1002,6 +1269,26 @@
      "model": "",
      "model_class": "builder-class",
      "seat": "builder"
+    }
+   },
+   {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "builder",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
     }
    },
    {
@@ -1067,6 +1354,26 @@
     }
    },
    {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-2",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "reviewer",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:review:2b"
@@ -1097,10 +1404,23 @@
     ],
     "item_id": "item-2",
     "payload": {
+     "acceptance": [],
      "blocking_finding_codes": [],
      "decision": "pass",
+     "depth": {
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "shallow": true
+     },
+     "duration_seconds": 2.0,
      "evidence_ref": "verdict:2b",
      "finding_codes": [],
+     "inspected": [],
      "non_blocking_finding_codes": []
     }
    },
@@ -1123,6 +1443,7 @@
      "item_commit": "item-commit",
      "merged_commit": "merge-commit",
      "pushed": true,
+     "review_lane": null,
      "seat_lanes": [
       {
        "lane": "",
@@ -1177,6 +1498,26 @@
      "model": "",
      "model_class": "builder-class",
      "seat": "builder"
+    }
+   },
+   {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-3",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "builder",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
     }
    },
    {
@@ -1242,6 +1583,26 @@
     }
    },
    {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-3",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "reviewer",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
+    }
+   },
+   {
     "event_type": "seat.completed",
     "evidence_refs": [
      "raw:review:3a"
@@ -1272,14 +1633,27 @@
     ],
     "item_id": "item-3",
     "payload": {
+     "acceptance": [],
      "blocking_finding_codes": [
       "finding"
      ],
      "decision": "escalate",
+     "depth": {
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "shallow": true
+     },
+     "duration_seconds": 2.0,
      "evidence_ref": "verdict:3a",
      "finding_codes": [
       "finding"
      ],
+     "inspected": [],
      "non_blocking_finding_codes": []
     }
    },
@@ -1293,6 +1667,26 @@
      "model": "",
      "model_class": "specialist-class",
      "seat": "specialist"
+    }
+   },
+   {
+    "event_type": "seat.launched",
+    "evidence_refs": [],
+    "item_id": "item-3",
+    "payload": {
+     "argv": [
+      "fake-harness",
+      "--seat"
+     ],
+     "in_process": false,
+     "lane": "",
+     "removed_environment": [
+      "FAKE_HARNESS_TOKEN"
+     ],
+     "seat": "specialist",
+     "set_environment": [
+      "DO_NOT_TRACK"
+     ]
     }
    },
    {
@@ -1326,14 +1720,17 @@
     ],
     "item_id": "item-3",
     "payload": {
+     "acceptance": [],
      "blocking_finding_codes": [
       "finding"
      ],
      "decision": "park",
+     "duration_seconds": 2.0,
      "evidence_ref": "verdict:3b",
      "finding_codes": [
       "finding"
      ],
+     "inspected": [],
      "non_blocking_finding_codes": []
     }
    },
@@ -1410,6 +1807,7 @@
     "item_id": null,
     "payload": {
      "accepted": 2,
+     "batch_validation": "none",
      "failed": 0,
      "parked": 2,
      "report": "docs/campaigns/campaign.md",
@@ -1433,6 +1831,21 @@
     "lane_signature": null,
     "lanes_exhausted": false,
     "reason": null,
+    "review_depths": [
+     {
+      "boundary": null,
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "duration_seconds": 2.0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "seat": "reviewer",
+      "shallow": true
+     }
+    ],
     "seats": [
      {
       "cost": null,
@@ -1499,6 +1912,34 @@
     "lane_signature": null,
     "lanes_exhausted": false,
     "reason": null,
+    "review_depths": [
+     {
+      "boundary": null,
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "duration_seconds": 2.0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "seat": "reviewer",
+      "shallow": true
+     },
+     {
+      "boundary": null,
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "duration_seconds": 2.0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "seat": "reviewer",
+      "shallow": true
+     }
+    ],
     "seats": [
      {
       "cost": null,
@@ -1603,6 +2044,21 @@
     "lane_signature": null,
     "lanes_exhausted": false,
     "reason": "review disposition was park",
+    "review_depths": [
+     {
+      "boundary": null,
+      "changed_paths": 0,
+      "clauses": 1,
+      "clauses_checked": 0,
+      "duration_seconds": 2.0,
+      "inspected_changed_paths": 0,
+      "reasons": [
+       "checked no acceptance clause"
+      ],
+      "seat": "reviewer",
+      "shallow": true
+     }
+    ],
     "seats": [
      {
       "cost": null,
@@ -1680,6 +2136,7 @@
     "lane_signature": null,
     "lanes_exhausted": false,
     "reason": "nature:machine",
+    "review_depths": [],
     "seats": [],
     "states": [
      "ready",

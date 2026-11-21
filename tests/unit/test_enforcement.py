@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -52,8 +54,11 @@ from autobuild.enforcement import (
     ValidatorCheck,
     classify_item_nature,
     declared_item_class,
+    git_staging_lines,
+    out_of_fence_paths,
     run_preflight,
 )
+from autobuild.enforcement.triage import declared_path_tokens, exact_declared_paths
 from autobuild.testing import (
     FakeCommandAdapter,
     FakeEnvironmentProbe,
@@ -64,6 +69,7 @@ from autobuild.testing import (
     FakeTrackerAdapter,
     FakeWorkspaceAdapter,
 )
+from test_brief_git_fixtures import EXCERPT_C
 
 
 def identity(name: str) -> AdapterIdentity:
@@ -319,6 +325,77 @@ def test_tracker_rejects_stale_validation_before_close(tmp_path: Path) -> None:
     assert fake.closed == []
 
 
+def _round_limit_evidence(
+    root: Path,
+    *,
+    mark: bool,
+    exit_code: int = 0,
+    validation_revision: str = "revision",
+) -> tuple[WorkspaceRef, CloseEvidence]:
+    workspace, evidence = close_evidence(root, validation_revision=validation_revision)
+    command = CommandResult("run:item:tests", exit_code, "stdout", "stderr", "start", "end")
+    verdict = ReviewVerdict(
+        "item",
+        ReviewDecision.CORRECT,
+        (ReviewFinding("BUG", "wrong output", "finding:bug", blocking=True),),
+        "review",
+    )
+    return workspace, replace(
+        evidence,
+        validation=replace(evidence.validation, command=command),
+        verdict=verdict,
+        accepted_at_round_limit=mark,
+    )
+
+
+@pytest.mark.parametrize(
+    "mark,exit_code,validation_revision,refusal",
+    [
+        (False, 0, "revision", "only a passing review"),
+        (True, 1, "revision", "did not pass"),
+        (True, 0, "old-revision", "stale"),
+    ],
+)
+def test_close_refuses_a_correct_verdict_without_a_green_round_limit(
+    tmp_path: Path, mark: bool, exit_code: int, validation_revision: str, refusal: str
+) -> None:
+    workspace, evidence = _round_limit_evidence(
+        tmp_path, mark=mark, exit_code=exit_code, validation_revision=validation_revision
+    )
+    fake = FakeTrackerAdapter(identity("tracker"))
+    port = PolicyGateway(policy(tmp_path)).tracker(fake)
+
+    with pytest.raises(EvidenceError, match=refusal):
+        port.close(evidence, "item-commit", workspace, "coordinator")
+
+    assert fake.closed == []
+
+
+def test_close_accepts_a_correct_verdict_at_the_round_limit_on_green_validation(
+    tmp_path: Path,
+) -> None:
+    workspace, evidence = _round_limit_evidence(tmp_path, mark=True)
+    fake = FakeTrackerAdapter(identity("tracker"))
+    port = PolicyGateway(policy(tmp_path)).tracker(fake)
+
+    port.close(evidence, "item-commit", workspace, "coordinator")
+
+    assert fake.closed == [evidence]
+
+
+@pytest.mark.parametrize("decision", [ReviewDecision.PARK, ReviewDecision.ESCALATE])
+def test_close_refuses_other_non_pass_verdicts_even_with_the_mark(
+    tmp_path: Path, decision: ReviewDecision
+) -> None:
+    workspace, evidence = _round_limit_evidence(tmp_path, mark=True)
+    evidence = replace(evidence, verdict=replace(evidence.verdict, decision=decision))
+    fake = FakeTrackerAdapter(identity("tracker"))
+    port = PolicyGateway(policy(tmp_path)).tracker(fake)
+
+    with pytest.raises(EvidenceError, match="only a passing review"):
+        port.close(evidence, "item-commit", workspace, "coordinator")
+
+
 def test_tracker_rejects_a_durable_claim_without_protected_branch_gate(tmp_path: Path) -> None:
     fake = FakeTrackerAdapter(identity("tracker"))
     port = PolicyGateway(policy(tmp_path)).tracker(fake)
@@ -515,6 +592,22 @@ def test_scoped_tracker_passes_ready_items_and_in_fence_calls_through() -> None:
     assert scoped.claim(allowed, "builder").item_id == "a"
 
 
+def test_blocked_item_ids_pass_through_both_tracker_wrappers(tmp_path: Path) -> None:
+    base = FakeTrackerAdapter(identity("tracker"), blocked={"b"})
+    enforced = PolicyGateway(policy(tmp_path)).tracker(base)
+    scoped = ScopedTrackerPort(enforced, CampaignSelection(allow=("a", "b")))
+
+    assert scoped.blocked_item_ids(CampaignRef("campaign", tmp_path)) == frozenset({"b"})
+
+
+def test_blocked_item_ids_refuses_a_campaign_outside_the_allowed_roots(tmp_path: Path) -> None:
+    base = FakeTrackerAdapter(identity("tracker"), blocked={"b"})
+    enforced = PolicyGateway(policy(tmp_path / "allowed")).tracker(base)
+
+    with pytest.raises(PolicyViolation, match="outside the allowed roots"):
+        enforced.blocked_item_ids(CampaignRef("campaign", tmp_path / "other"))
+
+
 # --- Item-nature triage --------------------------------------------------------
 
 
@@ -593,6 +686,50 @@ def test_an_explicit_machine_class_wins_over_a_path_check() -> None:
         "## Declared paths\n\n`../other-repo/outside.py`\n"
     )
     assert classify_item_nature(brief, repository_root=REPO) is ItemNature.MACHINE
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [("src/app.py", "/account/home"), ("/account/home",)],
+)
+def test_a_missing_extensionless_route_token_is_not_a_declared_path(
+    tokens: tuple[str, ...],
+) -> None:
+    listed = ", ".join(f"`{token}`" for token in tokens)
+    brief = f"Item nature: repository.\n\n## Declared paths\n\n{listed}\n"
+    assert classify_item_nature(brief, repository_root=REPO) is ItemNature.REPOSITORY
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="a temporary directory has no leading-slash form on this platform",
+)
+def test_an_existing_leading_slash_directory_outside_the_repository_is_cross_repository(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    brief = f"## Declared paths\n\n`{outside.as_posix()}`\n"
+    assert (
+        classify_item_nature(brief, repository_root=repository)
+        is ItemNature.CROSS_REPOSITORY
+    )
+
+
+def test_a_missing_leading_slash_token_with_an_extension_is_cross_repository() -> None:
+    brief = "## Declared paths\n\n`/elsewhere/notes.md`\n"
+    assert (
+        classify_item_nature(brief, repository_root=REPO)
+        is ItemNature.CROSS_REPOSITORY
+    )
+
+
+def test_route_tokens_are_left_out_of_the_declared_path_sets() -> None:
+    brief = "## Declared paths\n\n`src/app.py`, `/account/home`\n"
+    assert exact_declared_paths(brief) == frozenset({"src/app.py"})
+    assert declared_path_tokens(brief) == ("src/app.py",)
 
 
 # --- Item class and the seat-timeout ceiling -----------------------------------
@@ -966,3 +1103,320 @@ def test_preflight_stops_when_a_ready_brief_is_too_large(tmp_path: Path) -> None
 
     with pytest.raises(PreflightError, match="briefs.*APP-1"):
         run(preflight_request(tmp_path), network, environment, filesystem, command)
+
+
+# --- Brief faults refused at preflight -----------------------------------------
+
+OUTSIDE_BRIEF = (
+    "# Title\n\nItem nature: {nature}\n\n## Outcome\n\nBuild it.\n\n"
+    "## Declared paths\n\n- `src/app.py`\n- `../outside/notes.md`\n"
+)
+
+
+def _brief_probes(tmp_path: Path, text: str):
+    network, environment, filesystem, command = passing_probes(tmp_path)
+    filesystem.texts = {str(tmp_path / "brief.md"): text}
+    return network, environment, filesystem, command
+
+
+def _fenced_request(tmp_path: Path, **overrides) -> PreflightRequest:
+    repository = tmp_path / "repo"
+    base = dict(repository_root=repository, allowed_roots=(repository,))
+    base.update(overrides)
+    return preflight_request(tmp_path, **base)
+
+
+def test_preflight_refuses_a_repository_brief_whose_declared_path_leaves_the_fence(
+    tmp_path: Path,
+) -> None:
+    probes = _brief_probes(tmp_path, OUTSIDE_BRIEF.format(nature="repository"))
+
+    with pytest.raises(PreflightError) as caught:
+        run(_fenced_request(tmp_path), *probes)
+
+    message = str(caught.value)
+    assert message.startswith("briefs preflight failed")
+    assert "APP-1" in message
+    assert "../outside/notes.md" in message
+    assert "cross-repository" in message
+    assert "src/app.py" not in message
+
+
+def test_preflight_passes_the_same_paths_under_an_explicit_cross_repository_nature(
+    tmp_path: Path,
+) -> None:
+    probes = _brief_probes(tmp_path, OUTSIDE_BRIEF.format(nature="cross-repository"))
+
+    probes_run = run(_fenced_request(tmp_path), *probes)
+
+    assert probes_run[-1].name == "briefs" and probes_run[-1].passed
+
+
+def test_preflight_passes_a_route_token_in_the_declared_paths(tmp_path: Path) -> None:
+    text = "Item nature: repository\n\n## Declared paths\n\n- `//test:run`\n- `src/app.py`\n"
+    probes = _brief_probes(tmp_path, text)
+
+    assert run(_fenced_request(tmp_path), *probes)[-1].passed
+
+
+def test_preflight_passes_a_declared_path_inside_a_requested_allowed_root(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    probes = _brief_probes(tmp_path, OUTSIDE_BRIEF.format(nature="repository"))
+    request = _fenced_request(
+        tmp_path, allowed_roots=(repository, tmp_path / "outside")
+    )
+
+    assert run(request, *probes)[-1].passed
+
+
+def test_out_of_fence_paths_returns_the_outside_tokens_in_brief_order() -> None:
+    brief = (
+        "## Declared paths\n\n"
+        "- `../first/a.md`\n- `src/inside.py`\n- `/elsewhere/b.py`\n"
+        "- `/account/home`\n- `../second/c.md`\n"
+    )
+
+    assert out_of_fence_paths(brief, repository_root=REPO) == (
+        "../first/a.md",
+        "/elsewhere/b.py",
+        "../second/c.md",
+    )
+    assert out_of_fence_paths(
+        brief, repository_root=REPO, allowed_roots=(Path("/elsewhere"),)
+    ) == ("../first/a.md", "../second/c.md")
+
+
+STAGING_BRIEF_LINES = (
+    "It applies cleanly to main `1a2b3c4d` (`git apply --index`), and "
+    "`src/components/dashboard/__tests__/` then passes (4 files, 27 tests).",
+    "7. Remove with `git rm` the forked tracker, its local re-export and "
+    "the `components/legacy/*` duplicates once nothing imports them, or name in "
+    "the work record the importer that keeps each one [R-3].",
+)
+
+
+def test_preflight_warns_of_a_brief_that_tells_the_builder_to_stage_through_git(
+    tmp_path: Path,
+) -> None:
+    lines = ["# Title", "", "Item nature: repository", "", "## Scope", "", "", "", ""]
+    lines += [STAGING_BRIEF_LINES[0], "", STAGING_BRIEF_LINES[1], ""]
+    probes = _brief_probes(tmp_path, "\n".join(lines))
+
+    briefs = run(_fenced_request(tmp_path), *probes)[-1]
+
+    assert briefs.name == "briefs" and briefs.passed
+    assert "warning: brief for APP-1" in briefs.detail
+    assert "line 12 `git rm`" in briefs.detail
+    assert "line 10" not in briefs.detail
+    assert "parked `brief:git-staging` at claim" in briefs.detail
+    assert "no git staging instructions" not in briefs.detail
+
+
+def test_preflight_passes_the_launch_and_names_only_the_refused_brief(
+    tmp_path: Path,
+) -> None:
+    network, environment, filesystem, command = passing_probes(tmp_path)
+    first, second = tmp_path / "first.md", tmp_path / "second.md"
+    filesystem.files = {str(first): 10, str(second): 10}
+    filesystem.texts = {str(first): EXCERPT_C, str(second): "# Clean\n\nBuild it.\n"}
+    request = preflight_request(
+        tmp_path, briefs=(BriefCheck("APP-1", first), BriefCheck("APP-2", second))
+    )
+
+    briefs = run(request, network, environment, filesystem, command)[-1]
+
+    assert briefs.passed
+    warning = briefs.detail.split("; ", 1)[1]
+    assert "brief for APP-1" in warning
+    assert "line 2 `git rm`" in warning
+    assert "APP-2" not in warning
+
+
+def test_preflight_quotes_at_most_160_characters_of_a_refused_line(tmp_path: Path) -> None:
+    line = "Run `git add -A` " + "x" * 300
+    probes = _brief_probes(tmp_path, line)
+
+    detail = run(_fenced_request(tmp_path), *probes)[-1].detail
+
+    assert line[:160] in detail
+    assert line[:161] not in detail
+
+
+def test_preflight_reads_a_brief_without_text_as_empty_and_passes(tmp_path: Path) -> None:
+    probes = passing_probes(tmp_path)
+
+    briefs = run(_fenced_request(tmp_path), *probes)[-1]
+
+    assert briefs.passed
+    assert "declared paths inside the fence" in briefs.detail
+    assert "no git staging instructions" in briefs.detail
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "- Scope: remove the superseded modules with `git rm src/old.py`.",
+        "Commit the change with git commit and a short message",
+        "```\ngit add -A\n```",
+        "Run `git stash push` to set the work aside.",
+        "Then run `git reset --hard`.",
+        "Then run `git reset HEAD~1`.",
+        "Apply the carry with `git apply --cached carry.patch`.",
+        "`git apply -3 carry.patch`",
+        "git -C <worktree> add -A",
+        "Do not edit the lock file; run `git add -A`.",
+        "Run `git add -A`, not the validator.",
+        "When done, stage with `git add -A`.",
+        "Then, `git add -A`.",
+        "Build it, then `git add -A` and finish.",
+        "The builder must run `git add -A`.",
+        "Run git -C ../repo add -A",
+        "`git apply --3way x.patch`",
+        "`git --git-dir=.git add -A`",
+        "`git --work-tree=. add -A`",
+        "`git -c user.name=x commit -m y`",
+        "`git mv a b`",
+        "`git apply --index x.patch`",
+        "```\ngit apply -3 x.patch\n```",
+        "The old files are removed with `git rm`.",
+        "The patch is applied using `git apply --index x.patch`.",
+        "Make sure you run `git add -A`.",
+        "Remember to run `git add -A`.",
+        "Be sure to commit with `git commit -m x`.",
+        "Afterwards `git add -A`.",
+        "- Run `git add -A`.",
+        "You have to run `git add -A`.",
+    ],
+)
+def test_the_git_reader_refuses_a_staging_instruction(line: str) -> None:
+    assert git_staging_lines(line)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Never run `git commit`, `git checkout`, `git stash` or `git clean` in the worktree.",
+        "Delete files only with plain `rm`, never `git rm`, and stage nothing.",
+        "Remove with plain `rm` (never `git rm`; nothing staged) the forked tracker.",
+        "Apply the carry with `git apply -3 carry.patch`, then `git reset -q`.",
+        "Check the carry with `git apply --check carry.patch`.",
+        "Apply the carry with `git apply carry.patch`.",
+        "Compare with `git -C <worktree> diff --cached`.",
+        "> Remove with `git rm` the forked tracker and run `git add -A`.",
+        "Do not run `git add -A`.",
+        "Never stage, e.g. `git add -A`.",
+        "The earlier `git apply -3` run failed on `AGENTS.md`.",
+        "It applies cleanly (`git apply --index`), and the tests pass.",
+        "A fake seat that runs `git commit --allow-empty` makes the close raise.",
+        "The deletions were staged by `git rm` in the first build.",
+        "Apply with `git apply -3`; the earlier build cleared the index with `git reset -q`.",
+    ],
+)
+def test_the_git_reader_passes_a_line_that_does_not_stage(line: str) -> None:
+    assert git_staging_lines(line) == ()
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "The builder runs `git add -A` at the end.",
+        "When done, `git add -A` and finish.",
+    ],
+)
+def test_the_git_reader_does_not_see_an_order_without_a_verb_modal_or_bare_command(
+    line: str,
+) -> None:
+    # Known gaps: these order the builder to stage, but carry no cue the reader reads.
+    assert git_staging_lines(line) == ()
+
+
+@pytest.mark.parametrize(
+    ("line", "invocation"),
+    [
+        ("Run git -C ../repo add -A", "git -C ../repo add -A"),
+        ("`git --git-dir=.git add -A`", "git --git-dir=.git add -A"),
+        ("`git --work-tree=. add -A`", "git --work-tree=. add -A"),
+        ("`git -c user.name=x commit -m y`", "git -c user.name=x commit -m y"),
+        ("`git apply --3way x.patch`", "git apply --3way x.patch"),
+    ],
+)
+def test_the_git_reader_names_the_whole_invocation_past_global_options(
+    line: str, invocation: str
+) -> None:
+    (refused,) = git_staging_lines(line)
+    assert refused.invocations == (invocation,)
+
+
+def test_the_git_reader_names_the_line_number_and_the_invocation() -> None:
+    text = "# Title\n\nKeep it.\nApply with `git apply --index carry.patch` and `git rm a.py`.\n"
+
+    (refused,) = git_staging_lines(text)
+
+    assert refused.line_number == 4
+    assert refused.invocations == ("git apply --index carry.patch", "git rm a.py")
+
+
+def test_the_git_reader_ignores_negation_words_inside_a_fenced_block() -> None:
+    text = "Never stage anything.\n\n```sh\n# never do this\ngit commit -m never\n```\n"
+
+    (refused,) = git_staging_lines(text)
+
+    assert refused.line_number == 5
+
+
+def test_this_item_brief_and_the_constraints_pass_both_brief_checks() -> None:
+    root = Path(__file__).resolve().parents[2]
+    if not (root / "docs" / "items").is_dir():
+        pytest.skip("item briefs are private and absent from the public tree")
+    for name in ("brief-faults-refused-early.md", "CONSTRAINTS.md"):
+        text = (root / "docs" / "items" / name).read_text(encoding="utf-8")
+        assert git_staging_lines(text) == (), name
+        assert out_of_fence_paths(text, repository_root=root, allowed_roots=(root,)) == ()
+
+
+def test_the_launch_preflight_passes_the_claim_time_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autobuild.bootstrap import composition
+    from autobuild.bootstrap.profile import ProfileOverrides, load_settings
+    from autobuild.domain.models import SeatTransport
+
+    repository = tmp_path / "project"
+    repository.mkdir()
+    shared = tmp_path / "shared"
+    (repository / ".autobuild.toml").write_text(
+        '[run]\nlanes = ["claude-code"]\n\n[lanes.claude-code]\nbuilder = "b"\n'
+        'reviewer = "r"\n\n[validator]\nid = "tests"\nargv = ["python", "-m", "pytest"]\n\n'
+        f"[policy]\nallowed_roots = [{str(shared)!r}]\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(repository, None, ProfileOverrides())
+    captured: list[PreflightRequest] = []
+    monkeypatch.setattr(
+        composition, "run_preflight", lambda request, **_: captured.append(request) or ()
+    )
+    monkeypatch.setattr(
+        composition,
+        "_seat_transport",
+        lambda *_: SeatTransport(10, True, ()),
+    )
+    monkeypatch.setattr(composition, "_origin_https_target", lambda _: None)
+
+    composition._preflight(
+        settings,
+        tmp_path / "scratch",
+        FakeHarnessAdapter(identity("h")),
+        FakeCommandAdapter(identity("c")),
+        FakeTrackerAdapter(identity("t")),
+        None,
+        LeaseSurface(tmp_path / "tracker", SurfaceKind.TRACKER),
+        CampaignRef("c", settings.repository),
+        type("Repository", (), {"root": settings.repository})(),
+    )
+
+    (request,) = captured
+    assert request.repository_root == settings.repository
+    assert request.allowed_roots == (settings.repository, *settings.allowed_roots)
+    assert settings.allowed_roots and request.allowed_roots[0] == settings.repository

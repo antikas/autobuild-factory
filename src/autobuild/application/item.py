@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from threading import Condition, Lock
 from typing import NoReturn
 
 from autobuild.application.dependencies import Lane, WorkflowPorts
 from autobuild.application.progress import render_progress_line
-from autobuild.application.prompts import render_seat_instructions
+from autobuild.application.prompts import render_seat_instructions, review_checklist_numbers
 from autobuild.application.state_machine import ItemStateMachine
 from autobuild.domain import (
     AdapterError,
@@ -24,8 +24,10 @@ from autobuild.domain import (
     CommandRequest,
     DiffEvidence,
     DeliveryRequest,
+    EffortLevel,
     EvidenceError,
     FinaliseRequest,
+    FollowUpRecord,
     ItemDisposition,
     ItemExecutionSpec,
     ItemNature,
@@ -63,18 +65,29 @@ from autobuild.domain import (
 )
 from autobuild.domain.models import (
     BuilderContinuation,
+    SeatLaunch,
     DeliveryParked,
     RevalidationDecision,
     ReviewBoundary,
+    ReviewDepth,
+    ReviewLane,
+    raised_effort,
 )
-from autobuild.enforcement import classify_item_nature
+from autobuild.enforcement import (
+    MAX_QUOTED_LINE,
+    GitStagingLine,
+    classify_item_nature,
+    git_staging_lines,
+)
 from autobuild.enforcement.pressure import PATIENT_LOOKBACK_SECONDS, stretched_seat_cap
 from autobuild.enforcement.review_scope import (
     BLIND_REVIEWER,
     boundary_findings,
     combined_verdict,
+    review_lane,
     review_seats,
 )
+from autobuild.enforcement.review_depth import review_depth
 from autobuild.enforcement.test_scope import seat_test_guard
 from autobuild.enforcement.triage import declared_path_tokens
 from autobuild.ports import RunRecordPort
@@ -108,6 +121,8 @@ _RESUME_SEED = {
 # worktree, for a fresh builder to continue; the next timeout parks it.
 BUILDER_CONTINUATIONS = 2
 # Marker states whose build is not yet trusted, so a resume re-runs the builder.
+_UNREVIEWED_NOTE = "; the final correction was judged by the validator and not reviewed again"
+
 _RESUME_REBUILD = frozenset(
     {ItemState.CLAIMED.value, ItemState.ISOLATED.value, ItemState.CORRECTING.value}
 )
@@ -120,6 +135,29 @@ def _duration_seconds(started_at: str, ended_at: str) -> float | None:
     except (TypeError, ValueError):
         return None
     return (end - start).total_seconds()
+
+
+class _SeatLog(list):
+    """The seat observations of one item run, and the depth record of each
+    review seat among them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.depths: list[ReviewDepth] = []
+
+
+def _depth_arrays(verdict: ReviewVerdict) -> dict[str, object]:
+    return {
+        "inspected": [{"path": entry.path, "lines": entry.lines} for entry in verdict.inspected],
+        "acceptance": [
+            {
+                "clause": check.clause,
+                "outcome": check.outcome.value,
+                "evidence_ref": check.evidence_ref,
+            }
+            for check in verdict.acceptance
+        ],
+    }
 
 
 def _stderr_ref(diagnostics: tuple[str, ...]) -> str:
@@ -248,7 +286,18 @@ class _LaneRouter:
     ``builder_lane`` is the lane the item's builder last settled on."""
 
     __slots__ = (
-        "_lanes", "_state", "_campaign_id", "_emit", "_index", "_last_signature", "builder_lane"
+        "_lanes",
+        "_state",
+        "_campaign_id",
+        "_emit",
+        "_index",
+        "_last_signature",
+        "builder_lane",
+        "builder_effort",
+        "builder_raises",
+        "builder_context_refs",
+        "builder_report_ref",
+        "builder_reports",
     )
 
     def __init__(self, lanes, lane_state, campaign_id, emit) -> None:
@@ -259,6 +308,18 @@ class _LaneRouter:
         self._index = 0
         self._last_signature = "lanes_exhausted"
         self.builder_lane: str | None = None
+        # The effort the item's last builder seat asked for, and how many levels
+        # a red validator has raised the builder above its lane's effort.
+        self.builder_effort: EffortLevel | None = None
+        self.builder_raises = 0
+        # The context references of the builder seat in flight, handed to its
+        # continuation when it times out.
+        self.builder_context_refs: tuple[str, ...] = ()
+        # The run-record evidence of the item's latest builder report, which the
+        # reviewer and boundary specialists judge as the builder's claim, and how
+        # many builder reports this item run has recorded.
+        self.builder_report_ref: str | None = None
+        self.builder_reports = 0
 
     def _cooled(self, name: str) -> bool:
         return self._state is not None and self._state.active(name) is not None
@@ -306,6 +367,14 @@ class _LaneRouter:
 
     def _last_lane_name(self) -> str:
         return self._lanes[-1].name if self._lanes else ""
+
+
+class _ValidatorFailed(AdapterError):
+    """The validator did not pass on a builder's candidate."""
+
+    def __init__(self, validator_id: str, output_ref: str) -> None:
+        super().__init__(f"validator {validator_id} did not pass")
+        self.output_ref = output_ref
 
 
 class _ParkGuard:
@@ -367,7 +436,7 @@ class _PhaseMarker:
             "head_commit": head,
             "workspace_revision": self.workspace_revision,
             "correction_count": self.corrections,
-            "timestamp": datetime.now(UTC).isoformat(),
+            "timestamp": self.records.timestamp(),
         }
         self.records.write_evidence_file(
             self.record,
@@ -622,6 +691,9 @@ class HeavySlots:
 # choose a serial run or longer timeouts.
 HOST_PRESSURE_VARIABLE = "AUTOBUILD_HOST_PRESSURE"
 
+# A tracker park reason stays shorter than this many characters.
+PARK_REASON_LIMIT = 500
+
 
 def patient_request(request: CommandRequest, patient_argv: tuple[str, ...]) -> CommandRequest:
     """The patient form of a validator request: ``patient_argv`` when the
@@ -789,6 +861,20 @@ class ItemWorkflow:
         *,
         resume: ResumePlan | None = None,
     ) -> ItemOutcome:
+        seats = _SeatLog()
+        outcome = self._run_item(campaign, spec, record, seats, resume)
+        if not seats.depths:
+            return outcome
+        return replace(outcome, review_depths=tuple(seats.depths))
+
+    def _run_item(
+        self,
+        campaign: CampaignRef,
+        spec: ItemExecutionSpec,
+        record: RunRecordRef,
+        seats: _SeatLog,
+        resume: ResumePlan | None,
+    ) -> ItemOutcome:
         machine = ItemStateMachine()
         workspace: WorkspaceRef | None = None
         worktree_grant: LeaseGrant | None = None
@@ -797,7 +883,6 @@ class ItemWorkflow:
         # is recorded from the primary checkout and never delivered from the
         # worktree, which would publish that commit.
         committed = False
-        seats: list[SeatObservation] = []
         guard = _ParkGuard()
         marker = _PhaseMarker(self._ports.records, record, spec.item.item_id)
         result: ItemOutcome | None = None
@@ -810,6 +895,8 @@ class ItemWorkflow:
                 record, event_type, spec.item.item_id, payload=payload
             ),
         )
+        if resume is not None:
+            router.builder_raises = resume.builder_raises
         try:
             if resume is not None:
                 claimed = True
@@ -850,6 +937,12 @@ class ItemWorkflow:
                 if nature is not ItemNature.REPOSITORY:
                     result = self._park_by_nature(
                         spec, machine, marker, record, seats, guard, nature
+                    )
+                    return result
+                staging = git_staging_lines(spec.brief_text)
+                if staging:
+                    result = self._park_by_git_staging(
+                        spec, machine, marker, record, seats, guard, staging
                     )
                     return result
                 self._advance(machine, marker, ItemState.VERIFIED)
@@ -896,22 +989,22 @@ class ItemWorkflow:
                 verdict, diff, validation = self._build_validate_review(
                     spec, workspace, machine, marker, record, seats, router, context_refs=()
                 )
-                self._reclaim_if_builder_flipped(spec, record, start_lane, router)
+                self._note_builder_lane_change(spec, record, start_lane, router)
                 corrections = 0
-            while verdict.decision is ReviewDecision.CORRECT:
-                if corrections >= spec.max_corrections:
-                    result = self._park(
-                        spec,
-                        machine,
-                        marker,
-                        record,
-                        workspace,
-                        seats,
-                        guard,
-                        "material finding remained after the correction ceiling",
-                        corrections=corrections,
+            lane = self._review_lane(spec, diff, None)
+            round_limit = False
+            unreviewed = False
+            if lane is not None:
+                verdict, diff, validation, corrections, lane, round_limit, unreviewed = (
+                    self._lane_rounds(
+                        spec, workspace, machine, marker, record, seats, router,
+                        verdict, diff, validation, corrections, lane,
                     )
-                    return result
+                )
+            while lane is None and verdict.decision is ReviewDecision.CORRECT:
+                if corrections >= spec.max_corrections:
+                    round_limit = True
+                    break
                 corrections += 1
                 marker.observe(corrections=corrections)
                 self._advance(machine, marker, ItemState.CORRECTING)
@@ -935,49 +1028,44 @@ class ItemWorkflow:
                     context_refs=(verdict.evidence_ref,),
                 )
 
-            if verdict.decision is ReviewDecision.ESCALATE:
+            if lane is None and verdict.decision is ReviewDecision.ESCALATE:
                 self._advance(machine, marker, ItemState.ESCALATED)
                 verdict = self._specialist_review(
                     spec, workspace, verdict, record, seats, router
                 )
                 if verdict.decision is ReviewDecision.CORRECT:
                     if corrections >= spec.max_corrections:
-                        result = self._park(
+                        round_limit = True
+                    else:
+                        corrections += 1
+                        marker.observe(corrections=corrections)
+                        self._advance(machine, marker, ItemState.CORRECTING)
+                        self._event(
+                            record,
+                            "item.correcting",
+                            spec.item.item_id,
+                            payload={
+                                "round": corrections,
+                                "triggering_evidence_ref": verdict.evidence_ref,
+                            },
+                        )
+                        verdict, diff, validation = self._build_validate_review(
                             spec,
+                            workspace,
                             machine,
                             marker,
                             record,
-                            workspace,
                             seats,
-                            guard,
-                            "specialist finding reached the correction ceiling",
-                            corrections=corrections,
+                            router,
+                            context_refs=(verdict.evidence_ref,),
                         )
-                        return result
-                    corrections += 1
-                    marker.observe(corrections=corrections)
-                    self._advance(machine, marker, ItemState.CORRECTING)
-                    self._event(
-                        record,
-                        "item.correcting",
-                        spec.item.item_id,
-                        payload={
-                            "round": corrections,
-                            "triggering_evidence_ref": verdict.evidence_ref,
-                        },
-                    )
-                    verdict, diff, validation = self._build_validate_review(
-                        spec,
-                        workspace,
-                        machine,
-                        marker,
-                        record,
-                        seats,
-                        router,
-                        context_refs=(verdict.evidence_ref,),
-                    )
+                        # The specialist path allows a single correction round,
+                        # so the review that follows it is the final round.
+                        round_limit = verdict.decision is ReviewDecision.CORRECT
 
-            if verdict.decision is not ReviewDecision.PASS:
+            if verdict.decision is not ReviewDecision.PASS and not (
+                round_limit and verdict.decision is ReviewDecision.CORRECT
+            ):
                 result = self._park(
                     spec,
                     machine,
@@ -990,6 +1078,7 @@ class ItemWorkflow:
                     corrections=corrections,
                 )
                 return result
+            accepted_at_round_limit = verdict.decision is ReviewDecision.CORRECT
 
             trajectory_ref = self._ports.records.write_evidence(
                 record,
@@ -998,7 +1087,10 @@ class ItemWorkflow:
                     ItemDisposition.ACCEPTED,
                     tuple(machine.history) + (ItemState.FINALISED, ItemState.RELEASED),
                     seats,
-                    f"accepted after {corrections} correction round(s); review={verdict.evidence_ref}",
+                    self._acceptance_reason(
+                        corrections, verdict, accepted_at_round_limit, unreviewed
+                    ),
+                    notes=(f"review lane: {lane.value if lane else 'none'}",),
                 ),
             )
             close = CloseEvidence(
@@ -1008,6 +1100,8 @@ class ItemWorkflow:
                 validation=validation,
                 verdict=verdict,
                 trajectory_ref=trajectory_ref,
+                accepted_at_round_limit=accepted_at_round_limit,
+                builder_lane=router.builder_lane or "",
             )
             item_commit = self._ports.workspace.commit_item(
                 workspace,
@@ -1061,6 +1155,7 @@ class ItemWorkflow:
                     "tracker_commit": tracker_commit,
                     "merged_commit": finalise.merged_commit,
                     "pushed": finalise.pushed,
+                    "review_lane": lane.value if lane else None,
                     "seat_lanes": [
                         {"seat": observation.seat.value, "lane": observation.lane}
                         for observation in seats
@@ -1072,7 +1167,7 @@ class ItemWorkflow:
             worktree_grant = self._release_worktree_lease(worktree_grant, record)
             marker.write("closed")
             follow_ups, follow_up_error = self._follow_ups_after_delivery(
-                spec, campaign, verdict, record
+                spec, campaign, verdict, record, unreviewed
             )
             result = ItemOutcome(
                 item_id=spec.item.item_id,
@@ -1094,7 +1189,7 @@ class ItemWorkflow:
         except Exception as exc:
             result = self._end_on_error(
                 spec, machine, marker, record, workspace, seats, guard, exc, claimed, committed,
-                continuations,
+                continuations, router,
             )
             return result
         finally:
@@ -1136,7 +1231,8 @@ class ItemWorkflow:
         exc: Exception,
         claimed: bool,
         committed: bool,
-        continuations: int = 0,
+        continuations: int,
+        router: _LaneRouter,
     ) -> ItemOutcome:
         """End the item on an error scoped to it; the campaign goes on.
 
@@ -1167,7 +1263,8 @@ class ItemWorkflow:
             and continuations < BUILDER_CONTINUATIONS
         ):
             self._continue_builder(
-                spec, machine, marker, record, workspace, seats, guard, reason, continuations + 1
+                spec, machine, marker, record, workspace, seats, guard, reason, continuations + 1,
+                router,
             )
         if claimed:
             try:
@@ -1213,12 +1310,14 @@ class ItemWorkflow:
         guard: _ParkGuard,
         reason: str,
         continuation: int,
+        router: _LaneRouter,
     ) -> NoReturn:
         """Hand a timed-out builder's item back to the campaign with its claim,
         its worktree and its phase marker intact, by raising
         ``BuilderContinuation``. Nothing is parked or snapshotted; the campaign
         re-admits the item with the plan and a fresh builder seat continues in
-        the same worktree."""
+        the same worktree at the same raised effort and with the same context
+        references as the seat that timed out."""
 
         guard.leave_worktree = True
         plan = ResumePlan(
@@ -1227,6 +1326,8 @@ class ItemWorkflow:
             marker.corrections,
             record.run_id,
             continuations=continuation,
+            builder_raises=router.builder_raises,
+            builder_context_refs=router.builder_context_refs,
         )
         self._event(
             record,
@@ -1283,18 +1384,22 @@ class ItemWorkflow:
         campaign: CampaignRef,
         verdict: ReviewVerdict,
         record: RunRecordRef,
-    ) -> tuple[tuple[str, ...], Exception | None]:
+        unreviewed: bool = False,
+    ) -> tuple[tuple[FollowUpRecord, ...], Exception | None]:
         """Record the follow-ups of a delivered item. A failure here never
-        undoes the delivery: it is recorded as an event and returned, and the
-        item stays accepted."""
+        undoes the delivery: it is recorded as an event and returned with the
+        follow-ups registered before it, whose notes already point to their
+        report sections, and the item stays accepted."""
 
+        registered: list[FollowUpRecord] = []
         try:
-            return self._record_follow_ups(spec, campaign, verdict, record), None
+            self._record_follow_ups(spec, campaign, verdict, record, registered, unreviewed)
         except Exception as exc:
             self._event(
                 record, "item.follow_up_failed", spec.item.item_id, payload={"error": str(exc)}
             )
-            return (), exc
+            return tuple(registered), exc
+        return tuple(registered), None
 
     def _acquire_worktree_lease(
         self, campaign: CampaignRef, workspace: WorkspaceRef, record: RunRecordRef
@@ -1353,18 +1458,26 @@ class ItemWorkflow:
         """Produce the first review verdict for a resumed item.
 
         A marker before the build re-runs the builder; a marker past the build
-        re-runs validation and review only against the work already on disk. In
-        both cases the shared correction, escalation and delivery tail follows."""
+        re-runs validation against the work already on disk, taken as built at
+        the builder effort its current lane sets, so a red validator there is
+        retried one level higher as on fresh work. In both cases the shared
+        correction, escalation and delivery tail follows."""
 
-        if resume.marker_state in _RESUME_REBUILD:
-            verdict, diff, validation = self._build_validate_review(
-                spec, workspace, machine, marker, record, seats, router, context_refs=(),
-                continuation=resume.continuations > 0,
-            )
-        else:
-            verdict, diff, validation = self._validate_and_review(
-                spec, workspace, machine, marker, record, seats, router
-            )
+        rebuild = resume.marker_state in _RESUME_REBUILD
+        if not rebuild:
+            try:
+                router.builder_effort = self._next_builder_effort(spec, router, 0)
+            except LanesExhausted:
+                router.builder_effort = None
+        diff, validation, output_ref = self._build_validate(
+            spec, workspace, machine, marker, record, seats, router,
+            context_refs=resume.builder_context_refs if rebuild else (),
+            continuation=rebuild and resume.continuations > 0,
+            build=rebuild,
+        )
+        verdict = self._review(
+            spec, workspace, machine, marker, record, seats, router, diff, output_ref
+        )
         return verdict, diff, validation, resume.correction_count
 
     def _resume_finalised(
@@ -1407,6 +1520,10 @@ class ItemWorkflow:
         self._ports.workspace.release(workspace)
         self._advance(machine, marker, ItemState.RELEASED)
         marker.write("closed")
+        # The finalised head is the item's own commit, so the worktree shows no
+        # diff; the scope gate already held the delivered change to the brief's
+        # declared paths, which alone set the lane.
+        lane = review_lane(spec.process, declared_path_tokens(spec.brief_text))
         self._event(
             record,
             "item.finalised",
@@ -1419,6 +1536,7 @@ class ItemWorkflow:
                 "merged_commit": finalise.merged_commit,
                 "pushed": finalise.pushed,
                 "resumed": True,
+                "review_lane": lane.value if lane else None,
             },
         )
         return ItemOutcome(
@@ -1442,10 +1560,83 @@ class ItemWorkflow:
         context_refs: tuple[str, ...],
         continuation: bool = False,
     ) -> tuple[ReviewVerdict, DiffEvidence, ValidationEvidence]:
-        self._run_builder(
+        """Build, validate and review one candidate."""
+
+        diff, validation, output_ref = self._build_validate(
             spec, workspace, machine, marker, record, seats, router, context_refs, continuation
         )
-        return self._validate_and_review(spec, workspace, machine, marker, record, seats, router)
+        verdict = self._review(
+            spec, workspace, machine, marker, record, seats, router, diff, output_ref
+        )
+        return verdict, diff, validation
+
+    def _build_validate(
+        self,
+        spec: ItemExecutionSpec,
+        workspace: WorkspaceRef,
+        machine: ItemStateMachine,
+        marker: _PhaseMarker,
+        record: RunRecordRef,
+        seats: list[SeatObservation],
+        router: _LaneRouter,
+        context_refs: tuple[str, ...],
+        continuation: bool = False,
+        build: bool = True,
+    ) -> tuple[DiffEvidence, ValidationEvidence, str]:
+        """Build and validate one candidate; return its diff, its validation
+        and the validator output reference. With ``build`` false the candidate
+        already on disk is validated first, as if built at
+        ``router.builder_effort``.
+
+        A red validator retries the builder in the same worktree one effort
+        level higher, with the validator output as context, until the level
+        would pass ``EFFORT_RAISE_CEILING``; then the failure stands. A retry is
+        not a correction round."""
+
+        while True:
+            if build:
+                self._run_builder(
+                    spec, workspace, machine, marker, record, seats, router, context_refs,
+                    continuation,
+                )
+            build = True
+            try:
+                return self._validate(spec, workspace, machine, marker, record)
+            except _ValidatorFailed as failed:
+                tried = router.builder_effort
+                if tried is None or raised_effort(tried, 1) is tried:
+                    raise
+                router.builder_raises += 1
+                try:
+                    effort = self._next_builder_effort(spec, router, router.builder_raises)
+                except LanesExhausted:
+                    effort = None
+                context_refs = (failed.output_ref,)
+                continuation = False
+                self._advance(machine, marker, ItemState.ISOLATED)
+                self._event(
+                    record,
+                    "item.effort_raised",
+                    spec.item.item_id,
+                    failed.output_ref,
+                    payload={
+                        "seat": Seat.BUILDER.value,
+                        "from_effort": tried.value,
+                        "effort": effort.value if effort is not None else None,
+                        "raises": router.builder_raises,
+                        "triggering_evidence_ref": failed.output_ref,
+                    },
+                )
+
+    @staticmethod
+    def _next_builder_effort(
+        spec: ItemExecutionSpec, router: _LaneRouter, raises: int
+    ) -> EffortLevel | None:
+        """The effort a builder seat starting now asks for: the builder effort of
+        the lane the router would choose, raised ``raises`` levels."""
+
+        lane = router.current_lane()
+        return raised_effort(spec.seat_effort(Seat.BUILDER, lane.name), raises)
 
     def _run_builder(
         self,
@@ -1461,6 +1652,7 @@ class ItemWorkflow:
     ) -> None:
         brief_path = self._workspace_brief(spec, workspace)
         builder_policy = self._workspace_policy(spec.tool_policy, workspace)
+        router.builder_context_refs = context_refs
         builder = self._invoke_seat(
             router,
             record,
@@ -1489,19 +1681,25 @@ class ItemWorkflow:
             raise self._seat_failure(Seat.BUILDER, builder)
         if not isinstance(builder.payload, BuilderReport):
             raise EvidenceError("builder result did not contain a typed BuilderReport")
+        router.builder_reports += 1
+        router.builder_report_ref = self._ports.records.write_evidence(
+            record,
+            f"{spec.item.item_id}-builder-report-{router.builder_reports}",
+            json.dumps(
+                {"summary": builder.payload.summary, "report_ref": builder.payload.report_ref},
+                indent=2,
+            ),
+        )
         self._advance(machine, marker, ItemState.BUILT)
 
-    def _validate_and_review(
+    def _validate(
         self,
         spec: ItemExecutionSpec,
         workspace: WorkspaceRef,
         machine: ItemStateMachine,
         marker: _PhaseMarker,
         record: RunRecordRef,
-        seats: list[SeatObservation],
-        router: _LaneRouter,
-    ) -> tuple[ReviewVerdict, DiffEvidence, ValidationEvidence]:
-        brief_path = self._workspace_brief(spec, workspace)
+    ) -> tuple[DiffEvidence, ValidationEvidence, str]:
         diff = self._ports.workspace.diff(workspace)
         marker.observe(diff=diff)
         command = self._run_validator(
@@ -1514,12 +1712,28 @@ class ItemWorkflow:
             changed_paths=diff.changed_paths,
         )
         if not self._passed(command):
-            raise AdapterError(f"validator {spec.validator_id} did not pass")
+            raise _ValidatorFailed(spec.validator_id, command.stdout_ref)
         self._advance(machine, marker, ItemState.VALIDATED)
+        return diff, validation, command.stdout_ref
 
+    def _review(
+        self,
+        spec: ItemExecutionSpec,
+        workspace: WorkspaceRef,
+        machine: ItemStateMachine,
+        marker: _PhaseMarker,
+        record: RunRecordRef,
+        seats: list[SeatObservation],
+        router: _LaneRouter,
+        diff: DiffEvidence,
+        output_ref: str,
+    ) -> ReviewVerdict:
+        brief_path = self._workspace_brief(spec, workspace)
         reviewer_policy = self._workspace_policy(
             spec.reviewer_tool_policy or self._read_only_policy(spec), workspace
         )
+        report_ref = router.builder_report_ref
+        evidence = (diff.patch_ref, output_ref) + ((report_ref,) if report_ref else ())
         reviewer = self._invoke_seat(
             router,
             record,
@@ -1534,11 +1748,11 @@ class ItemWorkflow:
                 workspace=workspace,
                 tool_policy=reviewer_policy,
                 instructions=render_seat_instructions(
-                    spec, Seat.REVIEWER, (diff.patch_ref, command.stdout_ref), brief_path
+                    spec, Seat.REVIEWER, evidence, brief_path, builder_report_ref=report_ref
                 ),
                 result_contract="review-verdict-v1",
                 timeout_seconds=spec.seat_timeout_seconds,
-                context_refs=(diff.patch_ref, command.stdout_ref),
+                context_refs=evidence,
                 progress_deadline_seconds=spec.seat_stall_seconds,
                 progress_digest=self._progress_digest(workspace),
             ),
@@ -1558,23 +1772,28 @@ class ItemWorkflow:
             "review.completed",
             spec.item.item_id,
             reviewer.payload.evidence_ref,
-            payload=self._verdict_payload(reviewer.payload),
+            payload={
+                **self._verdict_payload(reviewer.payload),
+                **self._depth_payload(
+                    spec, workspace, seats, diff, reviewer.payload, Seat.REVIEWER, None
+                ),
+            },
         )
         choices = review_seats(spec.process, self._review_paths(spec, diff))
         if choices[0] != BLIND_REVIEWER:
             raise EvidenceError("a review round starts with the one blind reviewer")
         boundaries = tuple(choice.boundary for choice in choices[1:] if choice.boundary)
         if not boundaries:
-            return reviewer.payload, diff, validation
+            return reviewer.payload
         verdicts = (reviewer.payload,) + tuple(
             self._boundary_review(
-                spec, workspace, boundary, (diff.patch_ref, command.stdout_ref), record, seats, router
+                spec, workspace, boundary, diff, evidence, record, seats, router, report_ref,
             )
             for boundary in boundaries
         )
         evidence_ref = self._ports.records.write_evidence(
             record,
-            f"{spec.item.item_id}-review-round-{len(seats)}",
+            f"{spec.item.item_id}-review-round-{marker.corrections + 1}",
             json.dumps(
                 {
                     "seats": ["blind"] + [boundary.name for boundary in boundaries],
@@ -1597,7 +1816,83 @@ class ItemWorkflow:
                 "boundaries": [boundary.name for boundary in boundaries],
             },
         )
-        return verdict, diff, validation
+        return verdict
+
+    def _review_lane(
+        self, spec: ItemExecutionSpec, diff: DiffEvidence, current: ReviewLane | None
+    ) -> ReviewLane | None:
+        """The item's review lane after ``diff``. Once Material, an item stays
+        Material for the rest of its cycle."""
+
+        if current is ReviewLane.MATERIAL:
+            return current
+        return review_lane(spec.process, self._review_paths(spec, diff))
+
+    def _lane_rounds(
+        self,
+        spec: ItemExecutionSpec,
+        workspace: WorkspaceRef,
+        machine: ItemStateMachine,
+        marker: _PhaseMarker,
+        record: RunRecordRef,
+        seats: list[SeatObservation],
+        router: _LaneRouter,
+        verdict: ReviewVerdict,
+        diff: DiffEvidence,
+        validation: ValidationEvidence,
+        corrections: int,
+        lane: ReviewLane,
+    ) -> tuple[
+        ReviewVerdict, DiffEvidence, ValidationEvidence, int, ReviewLane, bool, bool
+    ]:
+        """The review and correction rounds of an item in a review lane.
+
+        A ``correct`` verdict, or a specialist ``correct`` after an
+        ``escalate``, gets a correction round while the lane's correction limit
+        allows one. The correction that reaches the limit is judged by the
+        validator alone: green, it is accepted at the round limit with the
+        verdict that asked for it. Any other correction is reviewed again.
+        Returns the final verdict, diff, validation, correction count, lane,
+        whether the round limit was reached, and whether the last correction
+        went unreviewed."""
+
+        escalated = False
+        while True:
+            if verdict.decision is ReviewDecision.ESCALATE and not escalated:
+                escalated = True
+                self._advance(machine, marker, ItemState.ESCALATED)
+                verdict = self._specialist_review(
+                    spec, workspace, verdict, record, seats, router
+                )
+            if verdict.decision is not ReviewDecision.CORRECT:
+                return verdict, diff, validation, corrections, lane, False, False
+            if corrections >= lane.correction_limit:
+                return verdict, diff, validation, corrections, lane, True, False
+            corrections += 1
+            marker.observe(corrections=corrections)
+            self._advance(machine, marker, ItemState.CORRECTING)
+            self._event(
+                record,
+                "item.correcting",
+                spec.item.item_id,
+                payload={"round": corrections, "triggering_evidence_ref": verdict.evidence_ref},
+            )
+            diff, validation, output_ref = self._build_validate(
+                spec,
+                workspace,
+                machine,
+                marker,
+                record,
+                seats,
+                router,
+                context_refs=(verdict.evidence_ref,),
+            )
+            lane = self._review_lane(spec, diff, lane)
+            if corrections >= lane.correction_limit:
+                return verdict, diff, validation, corrections, lane, True, True
+            verdict = self._review(
+                spec, workspace, machine, marker, record, seats, router, diff, output_ref
+            )
 
     @staticmethod
     def _review_paths(spec: ItemExecutionSpec, diff: DiffEvidence) -> tuple[str, ...]:
@@ -1613,10 +1908,12 @@ class ItemWorkflow:
         spec: ItemExecutionSpec,
         workspace: WorkspaceRef,
         boundary: ReviewBoundary,
+        diff: DiffEvidence,
         context_refs: tuple[str, ...],
         record: RunRecordRef,
         seats: list[SeatObservation],
         router: _LaneRouter,
+        builder_report_ref: str | None = None,
     ) -> ReviewVerdict:
         """One specialist seat that reviews the change for ``boundary``, given
         its name and invariants file in the seat's brief."""
@@ -1640,7 +1937,12 @@ class ItemWorkflow:
                 workspace=workspace,
                 tool_policy=reviewer_policy,
                 instructions=render_seat_instructions(
-                    spec, Seat.SPECIALIST, refs, brief_path, boundary=boundary
+                    spec,
+                    Seat.SPECIALIST,
+                    refs,
+                    brief_path,
+                    boundary=boundary,
+                    builder_report_ref=builder_report_ref,
                 ),
                 result_contract="review-verdict-v1",
                 timeout_seconds=spec.seat_timeout_seconds,
@@ -1664,7 +1966,13 @@ class ItemWorkflow:
             "specialist.completed",
             spec.item.item_id,
             verdict.evidence_ref,
-            payload={**self._verdict_payload(verdict), "boundary": boundary.name},
+            payload={
+                **self._verdict_payload(verdict),
+                "boundary": boundary.name,
+                **self._depth_payload(
+                    spec, workspace, seats, diff, verdict, Seat.SPECIALIST, boundary.name
+                ),
+            },
         )
         return verdict
 
@@ -1690,7 +1998,7 @@ class ItemWorkflow:
             ),
             argv=spec.validator_argv,
             cwd=workspace.root,
-            environment=self._ports.item_environment(spec.item.item_id),
+            environment=self._ports.item_environment(record.run_id, spec.item.item_id),
             timeout_seconds=spec.command_timeout_seconds,
         )
         candidate = detail.get("candidate", "reviewed")
@@ -1827,9 +2135,9 @@ class ItemWorkflow:
                 progress_digest=self._progress_digest(workspace),
             ),
         )
-        if result.outcome in {SeatOutcome.STALLED, SeatOutcome.TIMED_OUT}:
+        if result.outcome is not SeatOutcome.SUCCEEDED:
             raise self._seat_failure(Seat.SPECIALIST, result)
-        if result.outcome is not SeatOutcome.SUCCEEDED or not isinstance(result.payload, ReviewVerdict):
+        if not isinstance(result.payload, ReviewVerdict):
             raise EvidenceError("specialist result did not contain a typed ReviewVerdict")
         if result.payload.item_id != spec.item.item_id:
             raise EvidenceError("specialist verdict item does not match the selected item")
@@ -1841,7 +2149,11 @@ class ItemWorkflow:
             "specialist.completed",
             spec.item.item_id,
             result.payload.evidence_ref,
-            payload=self._verdict_payload(result.payload),
+            payload={
+                **self._verdict_payload(result.payload),
+                "duration_seconds": seats[-1].duration_seconds if seats else None,
+                **_depth_arrays(result.payload),
+            },
         )
         return result.payload
 
@@ -1889,8 +2201,10 @@ class ItemWorkflow:
         """Invoke one seat, moving lanes on a structural limit signal.
 
         Every attempt records ``seat.started`` just before the harness runs it,
+        ``seat.launched`` when the harness reports the launch it gives the seat,
         and its own ``seat.completed`` event, which is stamped with the lane it
-        ran on and carries the effort that lane sets for the seat. A limit signal
+        ran on and carries the effort that lane sets for the seat, raised for a
+        builder by the item's red-validator raises. A limit signal
         cools the lane and re-runs the same seat on the next capable lane; when
         none remains ``current_lane`` raises ``LanesExhausted``. Before each
         attempt on a metered lane the usage meter is read; see ``_usage_admits``."""
@@ -1901,10 +2215,14 @@ class ItemWorkflow:
             if not self._usage_admits(router, record, lane, request, skip):
                 continue
             extension = self._seat_stretch(request.timeout_seconds)
+            effort = spec.seat_effort(request.seat, lane.name)
+            if request.seat is Seat.BUILDER:
+                effort = raised_effort(effort, router.builder_raises)
             attempt = replace(
                 request,
-                effort=spec.seat_effort(request.seat, lane.name),
+                effort=effort,
                 timeout_extension=extension,
+                on_launch=self._launch_recorder(record, request, lane.name),
             )
             self._event(
                 record,
@@ -1958,6 +2276,27 @@ class ItemWorkflow:
                 self._note_builder_lane(router, attempt, result)
                 return result
             router.signal(lane, signal)
+
+    def _launch_recorder(self, record: RunRecordRef, request: SeatRequest, lane: str):
+        """The ``on_launch`` callback of one attempt: it records ``seat.launched``
+        from the launch's names alone."""
+
+        def recorded(launch: SeatLaunch) -> None:
+            self._event(
+                record,
+                "seat.launched",
+                request.item_id,
+                payload={
+                    "seat": request.seat.value,
+                    "lane": lane,
+                    "argv": list(launch.argv),
+                    "set_environment": list(launch.set_environment),
+                    "removed_environment": list(launch.removed_environment),
+                    "in_process": launch.in_process,
+                },
+            )
+
+        return recorded
 
     def _seat_stretch(self, class_cap: float):
         """The seat's cap extension so far, as a zero-argument callable the
@@ -2070,44 +2409,29 @@ class ItemWorkflow:
     def _note_builder_lane(router: _LaneRouter, request: SeatRequest, result: SeatResult) -> None:
         if request.seat is Seat.BUILDER:
             router.builder_lane = result.lane
+            router.builder_effort = request.effort
 
-    def _reclaim_if_builder_flipped(
+    def _note_builder_lane_change(
         self,
         spec: ItemExecutionSpec,
         record: RunRecordRef,
         start_lane: str,
         router: _LaneRouter,
     ) -> None:
-        """Re-record the claim when the builder settled on a different lane.
+        """Record that the builder settled on a lane other than the start lane.
 
-        The claim actor names the lane the builder ran on. When a limit on the
-        starting lane moved the builder to another lane, the tracker claim is
-        re-issued so the actor reflects the lane that produced the build. A
-        tracker that refuses the re-claim leaves a diagnostic and does not fail
-        the item."""
+        The tracker claim is never issued again: a tracker that keeps the
+        earliest claim would refuse it and still log the losing claim. The
+        builder lane reaches the tracker through the close evidence instead."""
 
         builder_lane = router.builder_lane
         if not builder_lane or builder_lane == start_lane:
-            return
-        actor = self._lane_actor(builder_lane)
-        try:
-            receipt = self._ports.tracker.claim(spec.item, actor=actor)
-        except Exception as exc:
-            self._event(
-                record,
-                "item.lane_reclaim_failed",
-                spec.item.item_id,
-                payload={"lane": builder_lane, "error": str(exc)},
-            )
             return
         self._event(
             record,
             "item.lane_changed",
             spec.item.item_id,
-            payload={"actor": actor, "lane": builder_lane, "from_lane": start_lane},
-        )
-        self.record_publication(
-            record, spec.item.item_id, "claim", receipt.published, receipt.publication_note
+            payload={"lane": builder_lane, "from_lane": start_lane},
         )
 
     def _park_lanes_exhausted(
@@ -2171,26 +2495,40 @@ class ItemWorkflow:
         campaign: CampaignRef,
         verdict: ReviewVerdict,
         record: RunRecordRef,
-    ) -> tuple[str, ...]:
-        """Turn each non-blocking finding on an accepted item into a propose-only
-        tracker follow-up. A passing verdict carries non-blocking findings only, so
-        every finding here is a reservation the reviewer would still merge past."""
+        records: list[FollowUpRecord],
+        unreviewed: bool = False,
+    ) -> None:
+        """Turn each finding on an accepted item into a propose-only tracker
+        follow-up, appended to ``records`` as soon as it is registered, before
+        its publication and event are recorded: its Pinax note already names
+        its report section, so a later failure must not cost it that section. A
+        passing verdict carries non-blocking findings only; a verdict accepted
+        at the round limit may also carry blocking findings, which stayed open
+        when the rounds ran out. ``unreviewed`` marks a
+        verdict whose final correction the validator judged without a review."""
 
         brief_ref = f"docs/campaigns/{campaign.campaign_id}.md"
-        titles: list[str] = []
         for finding in verdict.findings:
+            if finding.blocking:
+                kind = f"blocking reviewer finding {finding.code} open at the round limit"
+            else:
+                kind = f"non-blocking reviewer finding {finding.code}"
             proposal = Proposal(
                 title=f"Follow-up: {spec.item.item_id} {finding.code}",
                 question=finding.consequence,
-                rationale=(
-                    f"non-blocking reviewer finding {finding.code}; "
-                    f"reviewer evidence {verdict.evidence_ref}"
-                ),
+                rationale=f"{kind}; reviewer evidence {verdict.evidence_ref}"
+                + (_UNREVIEWED_NOTE if unreviewed else ""),
                 brief_ref=brief_ref,
+                parent_item=spec.item.item_id,
+                evidence_ref=finding.evidence_ref,
+                finding_code=finding.code,
+                blocking=finding.blocking,
+                report_ref=brief_ref,
             )
             ref = self._ports.tracker.propose(proposal, actor=COORDINATOR_ACTOR)
             if ref.runnable:
                 raise EvidenceError("follow-up proposal must remain non-runnable")
+            records.append(FollowUpRecord(ref.proposal_id, proposal))
             self.record_publication(
                 record, ref.proposal_id, "proposal", ref.published, ref.publication_note
             )
@@ -2203,10 +2541,63 @@ class ItemWorkflow:
                     "code": finding.code,
                     "title": proposal.title,
                     "brief_ref": brief_ref,
+                    "evidence_ref": finding.evidence_ref,
+                    "consequence": finding.consequence,
                 },
             )
-            titles.append(proposal.title)
-        return tuple(titles)
+
+    @staticmethod
+    def _acceptance_reason(
+        corrections: int, verdict: ReviewVerdict, at_round_limit: bool, unreviewed: bool = False
+    ) -> str:
+        reason = (
+            f"accepted after {corrections} correction round(s); review={verdict.evidence_ref}"
+        )
+        if not at_round_limit:
+            return reason
+        blocking = sum(1 for finding in verdict.findings if finding.blocking)
+        return (
+            f"{reason}; accepted at the round limit with {blocking} open blocking "
+            "finding(s) registered as follow-ups"
+            + (_UNREVIEWED_NOTE if unreviewed else "")
+        )
+
+    @staticmethod
+    def _depth_payload(
+        spec: ItemExecutionSpec,
+        workspace: WorkspaceRef,
+        seats: list[SeatObservation],
+        diff: DiffEvidence,
+        verdict: ReviewVerdict,
+        seat: Seat,
+        boundary: str | None,
+    ) -> dict[str, object]:
+        """The depth record of one review seat, kept on ``seats`` for the
+        item outcome and returned for its completion event."""
+
+        depth = review_depth(
+            seat,
+            boundary,
+            seats[-1].duration_seconds if seats else None,
+            diff.changed_paths,
+            verdict,
+            review_checklist_numbers(spec),
+            workspace.root,
+        )
+        if isinstance(seats, _SeatLog):
+            seats.depths.append(depth)
+        return {
+            "duration_seconds": depth.duration_seconds,
+            **_depth_arrays(verdict),
+            "depth": {
+                "changed_paths": depth.changed_paths,
+                "inspected_changed_paths": depth.inspected_changed_paths,
+                "clauses": depth.clauses,
+                "clauses_checked": depth.clauses_checked,
+                "shallow": depth.shallow,
+                "reasons": list(depth.reasons),
+            },
+        }
 
     @staticmethod
     def _verdict_payload(verdict: ReviewVerdict) -> dict[str, object]:
@@ -2228,10 +2619,12 @@ class ItemWorkflow:
         states: tuple[ItemState, ...],
         seats: list[SeatObservation],
         reason: str,
+        notes: tuple[str, ...] = (),
     ) -> str:
         lines = [
             f"disposition: {disposition.value}",
             "states: " + " -> ".join(state.value for state in states),
+            *notes,
         ]
         for observation in seats:
             lane = f", lane={observation.lane}" if observation.lane else ""
@@ -2338,6 +2731,50 @@ class ItemWorkflow:
         )
         return self._park(spec, machine, marker, record, None, seats, guard, reason)
 
+    def _park_by_git_staging(
+        self,
+        spec: ItemExecutionSpec,
+        machine: ItemStateMachine,
+        marker: _PhaseMarker,
+        record: RunRecordRef,
+        seats: list[SeatObservation],
+        guard: _ParkGuard,
+        staging: tuple[GitStagingLine, ...],
+    ) -> ItemOutcome:
+        """Park an item whose brief orders the builder to stage, commit or
+        remove through git, before any claim or worktree: delivery could not
+        add the index such a build leaves. The park reason names the first
+        refused line so the board says what to fix."""
+
+        first = staging[0]
+        reason = (
+            f"brief:git-staging line {first.line_number} "
+            f"`{'`, `'.join(first.invocations)}`"
+        )
+        if len(staging) > 1:
+            reason += f" and {len(staging) - 1} more line(s)"
+        reason += "; describe git only in a clause that forbids it, a report or a quotation"
+        if len(reason) >= PARK_REASON_LIMIT:
+            reason = reason[: PARK_REASON_LIMIT - 4] + "..."
+        self._event(
+            record,
+            "item.triaged",
+            spec.item.item_id,
+            payload={
+                "triage": "brief:git-staging",
+                "reason": reason,
+                "lines": [
+                    {
+                        "line_number": line.line_number,
+                        "invocations": list(line.invocations),
+                        "text": line.text[:MAX_QUOTED_LINE],
+                    }
+                    for line in staging
+                ],
+            },
+        )
+        return self._park(spec, machine, marker, record, None, seats, guard, reason)
+
     def _park(
         self,
         spec: ItemExecutionSpec,
@@ -2400,24 +2837,72 @@ class ItemWorkflow:
                     record, spec, workspace, self._delivery_request(spec, None, tracker_commit)
                 )
         except Exception as exc:
-            # The item is unfinished: its worktree and evidence are kept and
-            # the campaign goes on.
-            self._event(
-                record,
-                "item.park_failed",
-                spec.item.item_id,
-                trajectory_ref,
-                payload={
-                    "reason": reason,
-                    "error": str(exc),
-                    "snapshot_path": snapshot_dir,
-                    "worktree_root": str(evidence.root) if evidence is not None else "",
-                },
-            )
-            return _with_tracker_failure(
-                self._unfinished_item(spec, machine, record, evidence, seats, guard, str(exc)),
-                exc,
-            )
+            park_error: Exception | None = exc
+            failure = str(exc)
+            if workspace is not None:
+                # The worktree park did not land, so the park is recorded from
+                # the primary checkout instead; nothing from the worktree is
+                # delivered and the worktree is kept as it is.
+                self._event(
+                    record,
+                    "item.park_delivery_failed",
+                    spec.item.item_id,
+                    trajectory_ref,
+                    payload={
+                        "reason": reason,
+                        "error": failure,
+                        "snapshot_path": snapshot_dir,
+                        "worktree_root": str(workspace.root),
+                    },
+                )
+                guard.leave_worktree = True
+                finalise = None
+                fallback_reason = f"{reason}; park delivery failed: {failure}"
+                fallback_tracker_reason = (
+                    f"{fallback_reason} [snapshot={snapshot_dir}]"
+                    if snapshot_dir
+                    else fallback_reason
+                )
+                try:
+                    publication = self._ports.tracker.park(
+                        spec.item.item_id,
+                        fallback_tracker_reason,
+                        actor=COORDINATOR_ACTOR,
+                        workspace=None,
+                    )
+                    if publication is not None:
+                        self.record_publication(
+                            record,
+                            spec.item.item_id,
+                            "park",
+                            publication.published,
+                            publication.note,
+                        )
+                except Exception as primary_error:
+                    park_error = primary_error
+                    failure = f"{failure}; {primary_error}"
+                else:
+                    reason = fallback_reason
+                    park_error = None
+            if park_error is not None:
+                # The item is unfinished: its worktree and evidence are kept and
+                # the campaign goes on.
+                self._event(
+                    record,
+                    "item.park_failed",
+                    spec.item.item_id,
+                    trajectory_ref,
+                    payload={
+                        "reason": reason,
+                        "error": failure,
+                        "snapshot_path": snapshot_dir,
+                        "worktree_root": str(evidence.root) if evidence is not None else "",
+                    },
+                )
+                return _with_tracker_failure(
+                    self._unfinished_item(spec, machine, record, evidence, seats, guard, failure),
+                    park_error,
+                )
         self._emit_parked(
             record,
             spec,
@@ -2542,13 +3027,12 @@ class ItemWorkflow:
         *refs: str,
         payload: dict[str, object] | None = None,
     ) -> None:
-        # The event is stamped once, here, so its recorded payload and its owner
-        # progress line carry exactly the same timestamp. The run-record adapter
-        # keeps a non-empty ``occurred_at`` and stamps only events created without
-        # one.
+        # The event is stamped once, here, from the run-record port's clock, so
+        # its recorded payload and its owner progress line carry exactly the same
+        # timestamp.
         event = RunEvent(
             event_type=event_type,
-            occurred_at=datetime.now(UTC).isoformat(),
+            occurred_at=self._ports.records.timestamp(),
             item_id=item_id,
             evidence_refs=tuple(refs),
             payload=dict(payload or {}),

@@ -15,6 +15,7 @@ from test_workflows import builder, campaign, command, item, make_ports, review,
 
 from autobuild.application import CampaignRunner, ItemWorkflow
 from autobuild.application.item import HeavySlots
+from autobuild.application.progress import render_progress_line
 from autobuild.application.prompts import render_seat_instructions
 from autobuild.domain import (
     CampaignContext,
@@ -29,7 +30,7 @@ from autobuild.domain import (
     SeatRequest,
     WorkItem,
 )
-from autobuild.domain.models import BatchValidationPolicy, HoldCondition
+from autobuild.domain.models import BatchValidationPolicy, BatchVerdict, HoldCondition
 from autobuild.enforcement.integration import package_key, revalidation_decision
 from autobuild.enforcement.policy import ApprovedValidator, EnforcedCommandPort, PolicyConfig
 from autobuild.enforcement.pressure import stretched_seat_cap
@@ -557,7 +558,11 @@ def test_a_fix_pushed_to_origin_releases_the_hold_with_nothing_in_flight() -> No
     assert True in ports.workspace.refreshes[1:]
 
 
-def test_a_failing_batch_records_the_commits_holds_admissions_and_reverts_nothing() -> None:
+def _fail_then_fix():
+    """Four deliveries, batches every two: the first batch fails on head-2,
+    which holds admissions until an operator's fix moves the head and a later
+    batch passes."""
+
     clock = FakeClock(current=0.0)
 
     def hold_wait(stop: threading.Event, seconds: float) -> bool:
@@ -602,6 +607,11 @@ def test_a_failing_batch_records_the_commits_holds_admissions_and_reverts_nothin
         lambda selected: spec(selected),
         context=_batch_context(every=2, hold_limit_seconds=1e9),
     )
+    return ports, items, outcome, seen_at_run
+
+
+def test_a_failing_batch_records_the_commits_holds_admissions_and_reverts_nothing() -> None:
+    ports, items, outcome, seen_at_run = _fail_then_fix()
 
     failed = _batch_events(ports, "campaign.batch_validation_failed")
     assert len(failed) == 1
@@ -636,3 +646,129 @@ def test_a_failing_batch_records_the_commits_holds_admissions_and_reverts_nothin
     assert [entry.disposition for entry in outcome.items] == [ItemDisposition.ACCEPTED] * 4
     assert ports.workspace.delivered == []
 
+
+
+# --- the batch verdict at campaign end ---------------------------------------------------
+
+
+def _completed(ports) -> tuple[dict, str]:
+    [event] = [event for event in ports.records.events if event.event_type == "campaign.completed"]
+    # The line without its timestamp, so it can be matched from its opening.
+    return event.payload, render_progress_line(replace(event, occurred_at=""))
+
+
+def _report(ports) -> str:
+    return ports.workspace.reports[-1].content
+
+
+def _section(report: str) -> list[str]:
+    lines = report.splitlines()
+    start = lines.index("## Batch validation")
+    end = next(index for index in range(start + 1, len(lines)) if lines[index].startswith("## "))
+    return [line for line in lines[start + 1 : end] if line]
+
+
+def test_a_failed_final_batch_is_stated_in_the_completion_the_report_and_the_outcome() -> None:
+    ports = _batch_ports(1, [command(1, suffix="final")])
+    ports.workspace.validation_revisions = ["head-1"]
+
+    outcome = CampaignRunner(ports, items=_Deliveries()).run(
+        campaign(max_items=1), lambda selected: spec(selected), context=_batch_context(every=2)
+    )
+
+    payload, line = _completed(ports)
+    assert payload["batch_validation"] == "failed"
+    assert payload["batch_revision"] == "head-1"
+    assert payload["batch_stdout_ref"] == "stdout:final"
+    assert "batch_error" not in payload
+    assert payload["stop_reason"] == "item_bound"
+    assert line.startswith("campaign completed: shipped 1, parked 0, failed 0;")
+    assert "batch validation failed on head-1; output stdout:final;" in line
+    assert line.index("batch validation failed") < line.index("; report ")
+    section = _section(_report(ports))
+    assert section == [
+        "The delivery target head `head-1` failed validation at campaign end and is not proven.",
+        "- batch 1 (final), revision `head-1`, failed, exit 1, output `stdout:final`",
+    ]
+    report = _report(ports)
+    assert report.index("## Failed") < report.index("## Batch validation")
+    assert outcome.batch_validation.verdict is BatchVerdict.FAILED
+    assert [run.revision for run in outcome.batch_validation.runs] == ["head-1"]
+
+
+def test_a_failure_followed_by_a_passing_batch_is_passed_and_lists_both() -> None:
+    ports, _items, outcome, _seen = _fail_then_fix()
+
+    payload, line = _completed(ports)
+    assert payload["batch_validation"] == "passed"
+    assert "batch_revision" not in payload
+    assert "batch validation failed" not in line
+    section = _section(_report(ports))
+    assert not section[0].startswith("The delivery target head")
+    assert section[0] == "- batch 1, revision `head-2`, failed, exit 1, output `stdout:b1`"
+    assert len(section) >= 2
+    assert [line.split(",")[0] for line in section] == [
+        f"- batch {number}{' (final)' if run.final else ''}"
+        for number, run in enumerate(outcome.batch_validation.runs, start=1)
+    ]
+    assert all(", passed, exit 0, " in line for line in section[1:])
+    assert outcome.batch_validation.verdict is BatchVerdict.PASSED
+    assert outcome.batch_validation.runs[0].passed is False
+
+
+def test_a_final_batch_whose_command_raises_is_failed_with_the_error() -> None:
+    ports = _batch_ports(1, [command(0, suffix="unused")])
+    ports.workspace.validation_revisions = ["head-1"]
+
+    def raises(request) -> None:
+        raise RuntimeError("validator vanished")
+
+    ports.command.on_run = raises
+
+    outcome = CampaignRunner(ports, items=_Deliveries()).run(
+        campaign(max_items=1), lambda selected: spec(selected), context=_batch_context(every=2)
+    )
+
+    payload, line = _completed(ports)
+    assert payload["batch_validation"] == "failed"
+    assert payload["batch_error"] == "RuntimeError: validator vanished"
+    assert "batch validation failed on head-1; error RuntimeError: validator vanished;" in line
+    assert outcome.batch_validation.verdict is BatchVerdict.FAILED
+    assert _section(_report(ports))[-1] == (
+        "- batch 1 (final), revision `head-1`, failed, exit none, output `none`, "
+        "error RuntimeError: validator vanished"
+    )
+
+
+def test_a_final_batch_whose_checkout_cannot_open_names_an_unknown_head() -> None:
+    ports = _batch_ports(1, [])
+
+    def refuse(repository, branch, refresh=False):
+        raise OSError("no checkout")
+
+    ports.workspace.open_validation_checkout = refuse
+
+    CampaignRunner(ports, items=_Deliveries()).run(
+        campaign(max_items=1), lambda selected: spec(selected), context=_batch_context(every=2)
+    )
+
+    payload, line = _completed(ports)
+    assert payload["batch_revision"] == "unknown"
+    assert "batch validation failed on unknown; error OSError: no checkout;" in line
+    assert _section(_report(ports))[0] == (
+        "The delivery target head `unknown` failed validation at campaign end and is not proven."
+    )
+
+
+def test_a_campaign_without_a_delivery_has_no_batch_verdict() -> None:
+    ports = _batch_ports(0, [])
+
+    outcome = CampaignRunner(ports, items=_Deliveries()).run(
+        campaign(max_items=1), lambda selected: spec(selected), context=_batch_context()
+    )
+
+    payload, line = _completed(ports)
+    assert payload["batch_validation"] == "none"
+    assert "batch validation" not in line
+    assert _section(_report(ports)) == ["none"]
+    assert outcome.batch_validation.verdict is BatchVerdict.NONE

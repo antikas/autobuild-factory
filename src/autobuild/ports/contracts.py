@@ -58,7 +58,22 @@ class Probeable(Protocol):
 @runtime_checkable
 class TrackerPort(Probeable, Protocol):
     def next_item(self, campaign: CampaignRef) -> WorkItem | None: ...
-    def ready_items(self, campaign: CampaignRef) -> tuple[WorkItem, ...]: ...
+    def ready_items(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
+        """Every ready item in the tracker's dispatch order: the first entry
+        that passes the campaign's fence is the item ``next_item`` would offer,
+        so every selection mode starts with the same item."""
+        ...
+
+    def blocked_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
+        """The id of every item the tracker holds back behind a gate or an
+        unfinished dependency, so a report can name a real block."""
+        ...
+
+    def known_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
+        """The id of every item the tracker holds, in any status, so a campaign
+        can fix its launch set once and never select an item created later."""
+        ...
+
     def resumable_claims(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
         """Items claimed by the AutoBuild builder actor that are neither done nor
         parked, so a relaunch can resume an interrupted item without a person
@@ -103,6 +118,12 @@ class WorkspacePort(Probeable, Protocol):
         with its branch, head commit and current product status digest, so a
         relaunch can match a phase marker to a live worktree and spot an orphan
         worktree that no claimed item owns."""
+        ...
+
+    def worktree_belongs_to(self, status: WorktreeStatus, item_id: str) -> bool:
+        """True when the listed worktree is one this adapter made for
+        ``item_id``, so a relaunch can attribute a worktree to its claimed item
+        even when no phase marker names it."""
         ...
 
     def adopt_worktree(
@@ -202,6 +223,11 @@ class CommandPort(Probeable, Protocol):
 class RunRecordPort(Probeable, Protocol):
     def create(self, campaign: CampaignRef) -> RunRecordRef: ...
     def append(self, record: RunRecordRef, event: RunEvent) -> str: ...
+    def timestamp(self) -> str:
+        """The current instant on the run record's clock, in UTC ISO 8601 with
+        offset. Every event and phase marker the core writes carries it."""
+        ...
+
     def write_evidence(self, record: RunRecordRef, name: str, content: str) -> str: ...
     def write_evidence_file(
         self, record: RunRecordRef, relative_path: str, content: bytes
@@ -210,6 +236,16 @@ class RunRecordPort(Probeable, Protocol):
         """The item's phase marker from the most recent run under the scratch
         root, or ``None`` when no run recorded one, so a relaunch can resume from
         the last recorded phase."""
+        ...
+
+    def pause_requested(self, record: RunRecordRef) -> bool:
+        """True when the operator has asked this run to pause."""
+        ...
+
+    def clear_prior_pause(self, record: RunRecordRef) -> str | None:
+        """Lift the pause request of the newest other run of the same repository
+        as ``record``. Returns that run's id when a request was removed, else
+        ``None``. Never touches ``record`` itself or another repository's run."""
         ...
 
     def complete(self, record: RunRecordRef, summary: str) -> str: ...
@@ -304,6 +340,7 @@ class FilesystemProbePort(Protocol):
     def foreign_locks(self, path: Path) -> tuple[str, ...]: ...
     def is_file(self, path: Path) -> bool: ...
     def size(self, path: Path) -> int: ...
+    def read_text(self, path: Path) -> str: ...
 
 
 

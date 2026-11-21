@@ -243,7 +243,7 @@ def result_record(**fields) -> dict:
 
 
 BUILT = result_record(structured_output={"summary": "built", "report_ref": "r"})
-PASSED = result_record(structured_output={"decision": "pass", "findings": [], "evidence_ref": "v"})
+PASSED = result_record(structured_output={"decision": "pass", "findings": [], "evidence_ref": "v", "inspected": [], "acceptance": []})
 
 
 def credit_stop(text: str) -> list[dict]:

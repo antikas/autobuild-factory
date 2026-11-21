@@ -32,7 +32,7 @@ from autobuild.domain import (
 )
 from autobuild.testing import FakeAgentSdkClient, FakeCommandAdapter
 from autobuild.adapters.claude_sdk_harness import ClaudeSdkHarnessAdapter
-from autobuild.adapters.harness_cli import result_schema
+from autobuild.adapters.harness_cli import _contract_object, result_schema
 
 
 def identity() -> AdapterIdentity:
@@ -118,7 +118,7 @@ def test_claude_normalises_structured_builder_result_and_usage(tmp_path: Path) -
 
 
 def test_codex_uses_read_only_sandbox_for_review_and_normalises_jsonl(tmp_path: Path) -> None:
-    verdict = json.dumps({"decision": "pass", "findings": [], "evidence_ref": "review"})
+    verdict = json.dumps({"decision": "pass", "findings": [], "evidence_ref": "review", "inspected": [], "acceptance": []})
     stdout = json.dumps(
         {"type": "item.completed", "item": {"type": "agent_message", "text": verdict}}
     ) + "\n" + json.dumps(
@@ -149,7 +149,7 @@ def test_codex_streams_materialised_large_evidence_instead_of_argv(tmp_path: Pat
     evidence = tmp_path / "changes.patch"
     brief.write_text("APPROVED-BRIEF-CONTENT", encoding="utf-8")
     evidence.write_text("D" * 200_000, encoding="utf-8")
-    verdict = json.dumps({"decision": "pass", "findings": [], "evidence_ref": "review"})
+    verdict = json.dumps({"decision": "pass", "findings": [], "evidence_ref": "review", "inspected": [], "acceptance": []})
     commands = FakeCommandAdapter(
         identity(),
         scripted_results=[
@@ -201,6 +201,8 @@ def test_copilot_uses_programmatic_json_mode_and_confined_permissions(tmp_path: 
             }
         ],
         "evidence_ref": "review",
+        "inspected": [],
+        "acceptance": [],
     }
     stdout = json.dumps(
         {"type": "assistant.message", "data": {"content": json.dumps(verdict)}}
@@ -454,6 +456,344 @@ def test_a_plain_failure_without_a_limit_field_does_not_cool_the_lane(
     assert adapter.classify_failure(failed) is None
 
 
+_LIMIT_DOCUMENTS = [
+    (
+        ClaudeCodeHarnessAdapter,
+        {"type": "result", "is_error": True, "error": {"type": "rate_limit_error"}},
+        LaneSignalKind.RATE_LIMIT,
+    ),
+    (
+        CodexHarnessAdapter,
+        {"type": "error", "error": {"type": "rate_limit_exceeded"}},
+        LaneSignalKind.RATE_LIMIT,
+    ),
+    (
+        CopilotCliHarnessAdapter,
+        {"type": "error", "error": {"code": "quota_exceeded"}},
+        LaneSignalKind.QUOTA,
+    ),
+]
+
+_CLI_ADAPTERS = [ClaudeCodeHarnessAdapter, CodexHarnessAdapter, CopilotCliHarnessAdapter]
+
+
+def seat_result_with_stderr(
+    tmp_path: Path,
+    name: str,
+    stdout: str,
+    stderr: str,
+    outcome: SeatOutcome = SeatOutcome.FAILED,
+    exit_code: int | None = 1,
+) -> SeatResult:
+    result = seat_result(tmp_path, name, stdout, outcome, exit_code)
+    stderr_ref = output(tmp_path, f"{name}-stderr.txt", stderr)
+    return replace(result, diagnostics=(f"stderr={stderr_ref}",))
+
+
+@pytest.mark.parametrize("adapter_class, limit_document, kind", _LIMIT_DOCUMENTS)
+def test_a_limit_only_on_the_error_stream_cools_the_lane(
+    tmp_path: Path, adapter_class, limit_document, kind
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result_with_stderr(tmp_path, "stderr-limit", "", json.dumps(limit_document))
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is kind
+
+
+@pytest.mark.parametrize("adapter_class, limit_document, kind", _LIMIT_DOCUMENTS)
+def test_a_limit_on_the_error_stream_beside_unrelated_stdout_json_cools_the_lane(
+    tmp_path: Path, adapter_class, limit_document, kind
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result_with_stderr(
+        tmp_path,
+        "mixed",
+        json.dumps({"type": "result", "is_error": True, "subtype": "error_during_execution"}),
+        json.dumps(limit_document),
+    )
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is kind
+
+
+@pytest.mark.parametrize("adapter_class", _CLI_ADAPTERS)
+def test_a_limit_code_on_standard_output_wins_over_the_error_stream(
+    tmp_path: Path, adapter_class
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result_with_stderr(
+        tmp_path,
+        "both",
+        json.dumps({"type": "error", "error": {"type": "rate_limit_error"}}),
+        json.dumps({"type": "error", "error": {"type": "authentication_error"}}),
+    )
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is LaneSignalKind.RATE_LIMIT
+
+
+@pytest.mark.parametrize("adapter_class", _CLI_ADAPTERS)
+def test_prose_on_the_error_stream_is_a_spawn_signal_not_a_limit(
+    tmp_path: Path, adapter_class
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result_with_stderr(tmp_path, "prose-stderr", "", "API error: rate limit reached")
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is LaneSignalKind.SPAWN
+
+
+@pytest.mark.parametrize("adapter_class, limit_document, kind", _LIMIT_DOCUMENTS)
+def test_a_limit_after_a_text_prefix_on_the_error_stream_is_a_spawn_signal(
+    tmp_path: Path, adapter_class, limit_document, kind
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result_with_stderr(
+        tmp_path, "prefixed-stderr", "", "Error: request failed " + json.dumps(limit_document)
+    )
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is LaneSignalKind.SPAWN
+
+
+@pytest.mark.parametrize("adapter_class, limit_document, kind", _LIMIT_DOCUMENTS)
+def test_a_limit_after_a_text_prefix_on_standard_output_is_a_spawn_signal(
+    tmp_path: Path, adapter_class, limit_document, kind
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result(
+        tmp_path,
+        "prefixed-stdout",
+        "Error: request failed " + json.dumps(limit_document),
+        SeatOutcome.FAILED,
+        exit_code=1,
+    )
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is LaneSignalKind.SPAWN
+
+
+@pytest.mark.parametrize(
+    "name, stderr",
+    [
+        ("braces-in-prose", "fatal: cannot start, see {} for details"),
+        ("bare-number", "fatal: cannot start\n2\n"),
+    ],
+)
+@pytest.mark.parametrize("adapter_class", _CLI_ADAPTERS)
+def test_braces_or_a_bare_value_in_error_prose_is_a_spawn_signal(
+    tmp_path: Path, adapter_class, name, stderr
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result_with_stderr(tmp_path, name, "", stderr)
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is LaneSignalKind.SPAWN
+
+
+@pytest.mark.parametrize("adapter_class, limit_document, kind", _LIMIT_DOCUMENTS)
+def test_a_pretty_printed_limit_on_the_error_stream_cools_the_lane(
+    tmp_path: Path, adapter_class, limit_document, kind
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result_with_stderr(
+        tmp_path, "pretty", "", json.dumps(limit_document, indent=2)
+    )
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is kind
+
+
+@pytest.mark.parametrize("adapter_class, limit_document, kind", _LIMIT_DOCUMENTS)
+def test_a_limit_on_its_own_line_after_prose_on_the_error_stream_cools_the_lane(
+    tmp_path: Path, adapter_class, limit_document, kind
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result_with_stderr(
+        tmp_path, "prose-then-line", "", "Error: request failed\n" + json.dumps(limit_document) + "\n"
+    )
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is kind
+
+
+def test_the_contract_reader_still_finds_json_wrapped_in_text_or_a_code_fence() -> None:
+    text = 'Here is the report: {"summary": "built"}'
+    fenced = "```json\n" + text + "\n```"
+
+    assert _contract_object(text, "builder-report-v1") == {"summary": "built"}
+    assert _contract_object(fenced, "builder-report-v1") == {"summary": "built"}
+
+
+_PROSE_QUOTING_A_LIMIT = (
+    '{"type": "result", "is_error": true, "subtype": "error_during_execution", '
+    '"result": "The docs show a limit body like {\\"type\\": \\"rate_limit_error\\"}; I stopped."}'
+)
+
+
+@pytest.mark.parametrize("adapter_class", _CLI_ADAPTERS)
+def test_a_limit_object_quoted_in_result_prose_does_not_cool_the_lane(
+    tmp_path: Path, adapter_class
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result_with_stderr(tmp_path, "quoted-result", _PROSE_QUOTING_A_LIMIT, "")
+
+    assert adapter.classify_failure(failed) is None
+
+
+@pytest.mark.parametrize("adapter_class", _CLI_ADAPTERS)
+def test_a_limit_object_quoted_in_a_nested_string_on_the_error_stream_does_not_cool_the_lane(
+    tmp_path: Path, adapter_class
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    stderr = json.dumps({"type": "error", "message": 'see {"code": "quota_exceeded"} in the docs'})
+    failed = seat_result_with_stderr(tmp_path, "quoted-stderr", "", stderr)
+
+    assert adapter.classify_failure(failed) is None
+
+
+@pytest.mark.parametrize("adapter_class", _CLI_ADAPTERS)
+def test_a_result_string_that_is_a_whole_limit_document_cools_the_lane(
+    tmp_path: Path, adapter_class
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "is_error": True,
+            "result": json.dumps({"error": {"type": "rate_limit_error"}}),
+        }
+    )
+    failed = seat_result_with_stderr(tmp_path, "whole-string", stdout, "")
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is LaneSignalKind.RATE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "status, text, kind, detail",
+    [
+        (
+            429,
+            "API Error: 429 "
+            + json.dumps({"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}),
+            LaneSignalKind.RATE_LIMIT,
+            "api 429",
+        ),
+        (401, "API Error: 401 Unauthorized", LaneSignalKind.AUTH, "api 401"),
+        (400, "API Error: 400 Bad Request", None, None),
+    ],
+)
+def test_claude_reads_the_api_error_status_of_a_failed_result(
+    tmp_path: Path, status, text, kind, detail
+) -> None:
+    adapter = ClaudeCodeHarnessAdapter(
+        FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,)
+    )
+    stdout = json.dumps(
+        {"type": "result", "is_error": True, "api_error_status": status, "result": text}
+    )
+    failed = seat_result_with_stderr(tmp_path, f"api-{status}", stdout, "")
+
+    signal = adapter.classify_failure(failed)
+
+    if kind is None:
+        assert signal is None
+    else:
+        assert signal is not None
+        assert signal.kind is kind
+        assert signal.detail == detail
+
+
+_LIMIT_WITH_RESET = {
+    "type": "error",
+    "error": {"type": "rate_limit_error", "code": "rate_limit_exceeded"},
+    "reset_at": "2026-11-20T23:00:00Z",
+}
+
+
+@pytest.mark.parametrize(
+    "name, stderr",
+    [
+        ("byte-order-mark", "\ufeff" + json.dumps(_LIMIT_WITH_RESET)),
+        (
+            "prose-then-pretty",
+            "Error: request failed\n" + json.dumps(_LIMIT_WITH_RESET, indent=2) + "\n",
+        ),
+    ],
+)
+@pytest.mark.parametrize("adapter_class", _CLI_ADAPTERS)
+def test_a_limit_behind_a_byte_order_mark_or_pretty_printed_after_prose_is_a_spawn_signal(
+    tmp_path: Path, adapter_class, name, stderr
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    failed = seat_result_with_stderr(tmp_path, name, "", stderr)
+
+    signal = adapter.classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is LaneSignalKind.SPAWN
+    assert signal.reset_at is None
+
+
+@pytest.mark.parametrize("adapter_class, limit_document, kind", _LIMIT_DOCUMENTS)
+def test_a_succeeded_seat_with_a_limit_on_the_error_stream_is_not_classified(
+    tmp_path: Path, adapter_class, limit_document, kind
+) -> None:
+    adapter = adapter_class(FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,))
+    succeeded = seat_result_with_stderr(
+        tmp_path, "ok", "", json.dumps(limit_document), SeatOutcome.SUCCEEDED, exit_code=0
+    )
+
+    assert adapter.classify_failure(succeeded) is None
+
+
+@pytest.mark.parametrize("adapter_class, limit_document, kind", _LIMIT_DOCUMENTS)
+def test_the_adapter_reads_the_error_stream_it_recorded_from_the_run(
+    tmp_path: Path, adapter_class, limit_document, kind
+) -> None:
+    scripted = CommandResult(
+        "invoke",
+        1,
+        output(tmp_path, "run-stdout.txt", ""),
+        output(tmp_path, "run-stderr.txt", json.dumps(limit_document)),
+        "start",
+        "end",
+    )
+    commands = FakeCommandAdapter(identity(), scripted_results=[scripted])
+    adapter = adapter_class(commands, tmp_path / "harness", command=(sys.executable,))
+
+    result = adapter.invoke(
+        request(tmp_path, Seat.REVIEWER, "review-verdict-v1", frozenset({"read"}))
+    )
+    signal = adapter.classify_failure(result)
+
+    assert result.outcome is SeatOutcome.FAILED
+    assert signal is not None
+    assert signal.kind is kind
+
+
 def test_result_schemas_require_every_declared_property() -> None:
     for contract in ("builder-report-v1", "review-verdict-v1"):
         schema = result_schema(contract)
@@ -509,7 +849,7 @@ def test_brief_and_evidence_are_materialised_without_builder_transcript(tmp_path
     evidence = tmp_path / "changes.patch"
     brief.write_text("APPROVED-BRIEF-CONTENT", encoding="utf-8")
     evidence.write_text("DIFF-AND-VALIDATOR-EVIDENCE", encoding="utf-8")
-    verdict = {"decision": "pass", "findings": [], "evidence_ref": "review"}
+    verdict = {"decision": "pass", "findings": [], "evidence_ref": "review", "inspected": [], "acceptance": []}
     stdout = json.dumps(
         {"type": "assistant.message", "data": {"content": json.dumps(verdict)}}
     )
@@ -607,7 +947,7 @@ def test_claude_streams_materialised_large_evidence_instead_of_argv(tmp_path: Pa
     stdout = json.dumps(
         {
             "result": "complete",
-            "structured_output": {"decision": "pass", "findings": [], "evidence_ref": "review"},
+            "structured_output": {"decision": "pass", "findings": [], "evidence_ref": "review", "inspected": [], "acceptance": []},
         }
     )
     commands = FakeCommandAdapter(

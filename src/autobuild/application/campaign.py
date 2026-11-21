@@ -29,6 +29,7 @@ from autobuild.domain import (
     CampaignStopReason,
     ClaimTaken,
     DeliveryMode,
+    FollowUpRecord,
     ItemDisposition,
     ItemExecutionSpec,
     ItemOutcome,
@@ -47,10 +48,14 @@ from autobuild.domain import (
     SurfaceKind,
     WorkItem,
     WorktreeStatus,
+    fenced_block,
 )
 from autobuild.domain.models import (
     GIB,
     BatchValidationPolicy,
+    BatchValidationRun,
+    BatchValidationSummary,
+    BatchVerdict,
     BuilderContinuation,
     CommandRequest,
     HoldCondition,
@@ -59,6 +64,8 @@ from autobuild.domain.models import (
     PressurePolicy,
     TrackerRecovery,
     bytes_to_gib,
+    heading_text,
+    labelled_value,
     validator_command_id,
 )
 from autobuild.enforcement.pressure import assess_pressure, initial_pressure
@@ -137,6 +144,9 @@ class _ResumeCandidate:
     item: WorkItem
     marker: PhaseMarker | None
     plan: ResumePlan | None = None
+    # Every listed worktree attributed to the item: the marker's own and any
+    # the workspace says belongs to it.
+    worktree_roots: tuple[Path, ...] = ()
 
 
 @dataclass(slots=True)
@@ -526,6 +536,8 @@ class _BatchState:
     pending: bool = False
     # The head whose batch failed, until a later batch passes.
     failed_revision: str | None = None
+    # Every absorbed result, in the order it was absorbed.
+    history: list[BatchValidationRun] = field(default_factory=list)
     done: list[_BatchResult] = field(default_factory=list)
     guard: Lock = field(default_factory=Lock)
 
@@ -548,7 +560,7 @@ class _Schedule:
     statuses: dict[Path, WorktreeStatus]
     orphan_roots: list[Path]
     outcomes: list[ItemOutcome] = field(default_factory=list)
-    follow_ups: list[str] = field(default_factory=list)
+    follow_ups: list[FollowUpRecord] = field(default_factory=list)
     parked_signatures: dict[str, str] = field(default_factory=dict)
     taken: set[str] = field(default_factory=set)
     # Items that failed before their claim; they stay ready in the tracker
@@ -582,6 +594,11 @@ class _Schedule:
     lease: _TrackerLease | None = None
     heavy: HeavySlots | None = None
     batch: _BatchState | None = None
+
+    def batch_summary(self) -> BatchValidationSummary:
+        if self.batch is None:
+            return BatchValidationSummary()
+        return BatchValidationSummary(tuple(self.batch.history))
 
     def pressure_view(self, capacity: int) -> _PressureView:
         if self.monitor is None:
@@ -620,6 +637,10 @@ class CampaignRunner:
         self._completions: _Completions | None = None
         # Set when the campaign ends, so no hold timer outlives it.
         self._hold_stop = Event()
+        # The id of every tracker item that existed once the campaign held its
+        # tracker lease. Empty until ``run`` fixes it, so nothing is selectable
+        # before then.
+        self._launch_set: frozenset[str] = frozenset()
 
     def run(
         self,
@@ -659,6 +680,7 @@ class CampaignRunner:
         heartbeat: Thread | None = None
         monitor: _PressureMonitor | None = None
         try:
+            launched = self._fix_launch_set(campaign, record)
             heartbeat = self._start_heartbeat(lease, heartbeat_stop, context, record, completions)
             # Fresh heavy slots for every campaign, so a reused item workflow
             # never inherits another campaign's limit or hold.
@@ -666,11 +688,15 @@ class CampaignRunner:
             bind = getattr(self._items, "use_heavy_slots", None)
             if bind is not None:
                 bind(heavy)
-            if campaign.concurrency > 1:
-                monitor = self._start_monitor(campaign, context, record, heavy, completions)
-            schedule = self._schedule(
-                campaign, spec_for, refill, record, context, lease, completions, monitor, heavy
-            )
+            if launched:
+                if campaign.concurrency > 1:
+                    monitor = self._start_monitor(campaign, context, record, heavy, completions)
+                schedule = self._schedule(
+                    campaign, spec_for, refill, record, context, lease, completions, monitor, heavy
+                )
+            else:
+                schedule = _Schedule([], {}, [], orphans_reported=True)
+                schedule.observe_stop(CampaignStopReason.LAUNCH_SET_UNREADABLE)
             # The last batch validation runs before the monitor stops, so it
             # still sees the pressure level it starts at.
             self._finish_batches(schedule, record)
@@ -691,7 +717,7 @@ class CampaignRunner:
                 stop,
                 frozenset(schedule.parked_signatures) | frozenset(schedule.taken),
             )
-            unbuilt = self._allowed_unbuilt(campaign, outcomes, stop)
+            unbuilt = self._allowed_unbuilt(campaign, outcomes, stop, frozenset(schedule.taken))
             relative_report = f"docs/campaigns/{campaign.campaign_id}.md"
             repository_report_ref = self._deliver_report(
                 campaign,
@@ -708,20 +734,23 @@ class CampaignRunner:
                 schedule,
             )
             counts = self._counts(outcomes)
-            self._append(
-                record,
-                RunEvent(
-                    event_type="campaign.completed",
-                    payload={
-                        "stop_reason": stop.value,
-                        "accepted": counts[ItemDisposition.ACCEPTED],
-                        "parked": counts[ItemDisposition.PARKED],
-                        "failed": counts[ItemDisposition.FAILED],
-                        "report": relative_report,
-                        "report_path": repository_report_ref,
-                    },
-                ),
-            )
+            batches = schedule.batch_summary()
+            completed: dict[str, object] = {
+                "stop_reason": stop.value,
+                "accepted": counts[ItemDisposition.ACCEPTED],
+                "parked": counts[ItemDisposition.PARKED],
+                "failed": counts[ItemDisposition.FAILED],
+                "report": relative_report,
+                "report_path": repository_report_ref,
+                "batch_validation": batches.verdict.value,
+            }
+            last = batches.last
+            if batches.verdict is BatchVerdict.FAILED and last is not None:
+                completed["batch_revision"] = last.revision
+                completed["batch_stdout_ref"] = last.stdout_ref
+                if last.error:
+                    completed["batch_error"] = last.error
+            self._append(record, RunEvent(event_type="campaign.completed", payload=completed))
             summary = (
                 f"campaign={campaign.campaign_id}; items={len(outcomes)}; "
                 f"stop={stop.value}; report={repository_report_ref}"
@@ -737,6 +766,7 @@ class CampaignRunner:
                 peak_concurrency=schedule.peak,
                 makespan_seconds=schedule.makespan,
                 item_seconds=schedule.item_seconds,
+                batch_validation=batches,
             )
         finally:
             self._hold_stop.set()
@@ -746,6 +776,29 @@ class CampaignRunner:
             if monitor is not None:
                 monitor.stop()
             self._release_tracker_lease(lease.get(), record)
+
+    def _fix_launch_set(self, campaign: CampaignRef, record: RunRecordRef) -> bool:
+        """Read the launch set once, with the tracker lease held. Returns False
+        when the tracker cannot list its items, so the campaign admits nothing."""
+
+        self._launch_set = frozenset()
+        try:
+            known = frozenset(self._ports.tracker.known_item_ids(campaign))
+        except Exception as exc:
+            self._append(
+                record,
+                RunEvent(
+                    event_type="campaign.launch_set_failed",
+                    payload={"error": f"{type(exc).__name__}: {exc}"},
+                ),
+            )
+            return False
+        self._launch_set = known
+        self._append(
+            record,
+            RunEvent(event_type="campaign.launch_set_fixed", payload={"items": len(known)}),
+        )
+        return True
 
     def scheduler_idle(self) -> bool:
         """True while the running campaign's scheduler waits with no completion
@@ -809,6 +862,7 @@ class CampaignRunner:
         decide again. A decision held back for pressure with nothing running
         waits for the next nudge rather than ending the campaign."""
 
+        self._lift_prior_pause(record)
         schedule = self._scan_resumes(campaign, record, context)
         schedule.monitor = monitor
         schedule.lease = lease
@@ -899,9 +953,22 @@ class CampaignRunner:
         A hold on admissions (lanes exhausted, a pending tracker write or an
         unreachable tracker) admits nothing until its probe clears; running
         items go on. A hold longer than ``hold_limit_seconds`` ends the
-        campaign."""
+        campaign.
+
+        A pause request is read first, so no other stop reason is observed
+        once the operator has asked for a pause."""
 
         schedule.held = False
+        if self._ports.records.pause_requested(record):
+            self._append(
+                record,
+                RunEvent(
+                    event_type="campaign.pause_requested",
+                    payload={"running": sorted(schedule.running)},
+                ),
+            )
+            schedule.observe_stop(CampaignStopReason.PAUSED)
+            return False
         if (
             schedule.hold is None
             and schedule.batch is not None
@@ -1017,6 +1084,18 @@ class CampaignRunner:
                 f"{type(exc).__name__}: {exc}",
             )
             return self._hold_released(campaign, record, schedule)
+        if item is not None and item.item_id not in self._launch_set:
+            self._append(
+                record,
+                RunEvent(
+                    event_type="campaign.scope_fence_violation",
+                    item_id=item.item_id,
+                    payload={
+                        "error": f"selected item {item.item_id!r} is outside the launch set"
+                    },
+                ),
+            )
+            item = None
         self._record_skips(record, schedule)
         if item is None:
             if schedule.running:
@@ -1045,6 +1124,17 @@ class CampaignRunner:
         )
         return True
 
+    def _lift_prior_pause(self, record: RunRecordRef) -> None:
+        """A new run on a paused repository is its resume: lift the prior
+        run's pause request before the first admission."""
+
+        prior = self._ports.records.clear_prior_pause(record)
+        if prior is not None:
+            self._append(
+                record,
+                RunEvent(event_type="campaign.resumed", payload={"prior_run_id": prior}),
+            )
+
     def _admit_resume(
         self,
         campaign: CampaignRef,
@@ -1071,7 +1161,13 @@ class CampaignRunner:
         if not assessment.good:
             schedule.outcomes.append(
                 self._park_resume(
-                    campaign, item, marker, record, assessment.reason, schedule.statuses
+                    campaign,
+                    item,
+                    marker,
+                    record,
+                    assessment.reason,
+                    candidate.worktree_roots,
+                    context,
                 )
             )
             return
@@ -1433,7 +1529,7 @@ class CampaignRunner:
             ),
             argv=policy.argv,
             cwd=checkout.root,
-            environment=self._ports.item_environment(f"batch-{number}"),
+            environment=self._ports.item_environment(record.run_id, f"batch-{number}"),
             timeout_seconds=policy.timeout_seconds,
         )
 
@@ -1512,6 +1608,17 @@ class CampaignRunner:
                 payload["patient"] = True
             if result.error:
                 payload["error"] = result.error
+            batch.history.append(
+                BatchValidationRun(
+                    result.number,
+                    result.final,
+                    result.revision or "unknown",
+                    result.passed,
+                    result.exit_code,
+                    result.stdout_ref,
+                    result.error,
+                )
+            )
             if result.passed:
                 proven = set(result.commits)
                 batch.unproven = [commit for commit in batch.unproven if commit not in proven]
@@ -1593,7 +1700,9 @@ class CampaignRunner:
     ) -> None:
         if not campaign.refill_enabled:
             return
+        report_ref = f"docs/campaigns/{campaign.campaign_id}.md"
         for proposal in refill.proposals:
+            proposal = replace(proposal, report_ref=report_ref)
             ref = self._ports.tracker.propose(proposal, actor=COORDINATOR_ACTOR)
             if ref.runnable:
                 raise ValueError("refill made a workflow proposal runnable")
@@ -1603,7 +1712,7 @@ class CampaignRunner:
                     record,
                     unpublished_write(ref.proposal_id, "proposal", ref.publication_note),
                 )
-            schedule.follow_ups.append(proposal.title)
+            schedule.follow_ups.append(FollowUpRecord(ref.proposal_id, proposal))
         for fog in refill.fog:
             self._ports.knowledge.record_fog(fog)
 
@@ -1839,7 +1948,7 @@ class CampaignRunner:
         except Exception:
             return
         for entry in entries:
-            if entry.item_id in schedule.skipped:
+            if entry.item_id in schedule.skipped or entry.item_id not in self._launch_set:
                 continue
             schedule.skipped[entry.item_id] = entry.reason
             self._append(
@@ -1884,7 +1993,7 @@ class CampaignRunner:
         state = self._ports.lane_state
         if state is None:
             return 0.0
-        now = datetime.now(UTC)
+        now = datetime.fromisoformat(self._ports.records.timestamp())
         waits: list[float] = []
         for lane in self._ports.lanes:
             try:
@@ -1967,11 +2076,25 @@ class CampaignRunner:
     ) -> None:
         """A failed renewal is retried on the next beat. The third failure in a
         row records one ``campaign.lease_withheld`` event and withholds new
-        admissions until a renewal succeeds; running items are never stopped."""
+        admissions until a renewal succeeds; running items are never stopped.
+
+        Every beat also looks for a pause request and wakes the scheduler when
+        one is present, since a hold with nothing running may otherwise not
+        decide again for hours."""
 
         port = self._ports.lease
         assert port is not None
+        pause_failures = 0
         while not self._ports.heartbeat_wait(stop, interval):
+            try:
+                paused = self._ports.records.pause_requested(record)
+            except Exception as exc:
+                pause_failures += 1
+                self._pause_check_failed(record, exc, pause_failures)
+            else:
+                pause_failures = 0
+                if paused:
+                    completions.nudge()
             grant = lease.get()
             if grant is None:
                 return
@@ -1985,16 +2108,34 @@ class CampaignRunner:
                 self._append(record, RunEvent(event_type="campaign.lease_restored", payload={}))
                 completions.nudge()
 
+    def _pause_check_failed(self, record: RunRecordRef, exc: Exception, consecutive: int) -> None:
+        """Record one failed heartbeat pause check.
+
+        The append is not guarded by another record: the run record is what
+        failed, and the lease renewal on the same beat must still run."""
+
+        try:
+            self._append(
+                record,
+                RunEvent(
+                    event_type="campaign.pause_check_failed",
+                    payload={"error": str(exc), "consecutive": consecutive},
+                ),
+            )
+        except Exception:
+            pass
+
     def _append(self, record: RunRecordRef, event: RunEvent) -> str:
         """Append one run event and emit its owner progress line.
 
-        The event is stamped here when it arrives without a timestamp, so its
-        recorded payload and its rendered progress line carry the same instant.
+        The event is stamped here from the run-record port's clock when it
+        arrives without a timestamp, so its recorded payload and its rendered
+        progress line carry the same instant.
         An event that renders to nothing (its type carries no owner meaning) is
         recorded without emitting a line."""
 
         stamped = (
-            replace(event, occurred_at=datetime.now(UTC).isoformat())
+            replace(event, occurred_at=self._ports.records.timestamp())
             if not event.occurred_at.strip()
             else event
         )
@@ -2088,8 +2229,11 @@ class CampaignRunner:
         The scheduler admits candidates first, in this order: a good state
         resumes from the marker on a worker, counted in the item bound; a
         mismatch parks with ``resume:<reason>`` and snapshots the worktree in
-        place. A registered worktree that no claimed item owns is an orphan,
-        reported once the candidates are admitted and left untouched."""
+        place. A claimed item's worktrees are the one its marker names and every
+        one the workspace says belongs to it, so a park with no usable marker
+        still names its own worktree. A registered worktree that no claimed item
+        owns is an orphan, reported once the candidates are admitted and left
+        untouched."""
 
         try:
             claims = self._ports.tracker.resumable_claims(campaign)
@@ -2103,12 +2247,19 @@ class CampaignRunner:
         candidates: list[_ResumeCandidate] = []
         attached: set[Path] = set()
         for item in claims:
+            owned = [
+                root
+                for root, status in statuses.items()
+                if self._ports.workspace.worktree_belongs_to(status, item.item_id)
+            ]
             if not campaign.selection.permits(item.item_id):
+                attached.update(owned)
                 continue
             marker = self._ports.records.latest_phase_marker(item.item_id)
             if marker is not None and marker.worktree_root in statuses:
-                attached.add(marker.worktree_root)
-            candidates.append(_ResumeCandidate(item, marker))
+                owned = [marker.worktree_root, *(r for r in owned if r != marker.worktree_root)]
+            attached.update(owned)
+            candidates.append(_ResumeCandidate(item, marker, worktree_roots=tuple(owned)))
         orphan_roots = [root for root in statuses if root not in attached]
         return _Schedule(candidates, statuses, orphan_roots)
 
@@ -2182,13 +2333,18 @@ class CampaignRunner:
         marker: PhaseMarker | None,
         record,
         reason: str,
-        statuses: dict[Path, WorktreeStatus],
+        worktree_roots: tuple[Path, ...],
+        context: CampaignContext,
     ) -> ItemOutcome:
         """Park an interrupted item that is not in a good state and continue.
 
-        The tracker records ``resume:<reason>``. When the worktree still exists
-        and no other writer holds it, it is snapshotted into the run record and
-        left in place so nothing is lost."""
+        The tracker records ``resume:<reason>``. When the item's worktree still
+        exists and no other writer holds it or the tracker, it is snapshotted
+        into the run record and left in place so nothing is lost. The worktree
+        is the marker's when the marker names a listed one; otherwise it is the
+        item's only owned worktree, and with several owned none is snapshotted
+        because nothing says which holds the work. A held lease is never
+        snapshotted."""
 
         try:
             publication = self._ports.tracker.park(item.item_id, reason, actor=COORDINATOR_ACTOR)
@@ -2212,12 +2368,9 @@ class CampaignRunner:
                 title=item.title,
             )
         snapshot_dir = ""
-        if (
-            reason in {"resume:head-moved", "resume:revision-changed"}
-            and marker is not None
-            and marker.worktree_root in statuses
-        ):
-            snapshot_dir = self._snapshot_resume(campaign, item, marker, record, reason)
+        target = self._resume_snapshot_root(marker, worktree_roots, reason)
+        if target is not None and not self._resume_lease_held(campaign, target, context):
+            snapshot_dir = self._snapshot_resume(campaign, item, target, record, reason)
         self._append(
             record,
             RunEvent(
@@ -2227,6 +2380,7 @@ class CampaignRunner:
                     "reason": reason,
                     "marker_state": marker.state if marker is not None else "",
                     "snapshot_path": snapshot_dir,
+                    "worktree_roots": [str(root) for root in worktree_roots],
                 },
             ),
         )
@@ -2238,11 +2392,25 @@ class CampaignRunner:
             title=item.title,
         )
 
+    @staticmethod
+    def _resume_snapshot_root(
+        marker: PhaseMarker | None, worktree_roots: tuple[Path, ...], reason: str
+    ) -> Path | None:
+        """The one worktree a resume park snapshots, or None."""
+
+        if reason == "resume:lease-held" or not worktree_roots:
+            return None
+        if marker is not None and marker.worktree_root in worktree_roots:
+            return marker.worktree_root
+        if len(worktree_roots) == 1:
+            return worktree_roots[0]
+        return None
+
     def _snapshot_resume(
         self,
         campaign: CampaignRef,
         item: WorkItem,
-        marker: PhaseMarker,
+        root: Path,
         record,
         reason: str,
     ) -> str:
@@ -2252,9 +2420,7 @@ class CampaignRunner:
 
         base = f"{item.item_id}-park"
         try:
-            workspace = self._ports.workspace.adopt_worktree(
-                campaign, item, marker.worktree_root
-            )
+            workspace = self._ports.workspace.adopt_worktree(campaign, item, root)
             snapshot = self._ports.workspace.snapshot(workspace)
         except Exception as exc:
             self._append(
@@ -2330,7 +2496,9 @@ class CampaignRunner:
         admits: Callable[[WorkItem], bool] | None = None,
         peek: bool = True,
     ) -> WorkItem | None:
-        """Choose the next item to build. With an allow-list the closed universe is
+        """Choose the next item to build, only ever from the launch set: an item
+        created after the campaign started, its own follow-ups included, is
+        never returned. With an allow-list the closed universe is
         consulted in dispatch order; otherwise the tracker's next item is used. The
         exclude-list is checked at every selection. Items already parked with a lane
         signature this campaign, taken by another writer or in flight are skipped,
@@ -2339,35 +2507,54 @@ class CampaignRunner:
         also declares). A campaign that builds more than one item at a time reads
         the ready listing, so it can pass over a refused item. When an allow-list
         has no admissible ready item, the live queue is peeked so the scoped
-        tracker can refuse out-of-fence work rather than let the campaign consult
-        the live queue for a build. ``peek`` is False while items are in flight:
-        the allowed items may then be running, not missing."""
+        tracker can refuse out-of-fence work; an in-fence item it offers is
+        selected. Every mode takes items in the tracker's dispatch order, which
+        ``ready_items`` carries, the allow-list order first. ``peek`` is False
+        while items are in flight: the allowed items may then be running, not
+        missing."""
 
         selection = campaign.selection
+        launch_set = self._launch_set
 
         def allowed(item: WorkItem) -> bool:
             return admits is None or admits(item)
 
-        if selection.allow:
-            ready = {item.item_id: item for item in self._ports.tracker.ready_items(campaign)}
-            for item_id in selection.allow:
-                if item_id in selection.exclude or item_id in skip:
-                    continue
-                if item_id in ready and allowed(ready[item_id]):
-                    return ready[item_id]
-            if peek:
-                self._ports.tracker.next_item(campaign)
-            return None
-        if selection.exclude or skip or campaign.concurrency > 1:
+        def first_ready() -> WorkItem | None:
             for item in self._ports.tracker.ready_items(campaign):
                 if (
-                    item.item_id not in selection.exclude
+                    item.item_id in launch_set
+                    and item.item_id not in selection.exclude
                     and item.item_id not in skip
                     and allowed(item)
                 ):
                     return item
             return None
-        return self._ports.tracker.next_item(campaign)
+
+        if selection.allow:
+            ready = {item.item_id: item for item in self._ports.tracker.ready_items(campaign)}
+            for item_id in selection.allow:
+                if item_id in selection.exclude or item_id in skip or item_id not in launch_set:
+                    continue
+                if item_id in ready and allowed(ready[item_id]):
+                    return ready[item_id]
+            if peek:
+                head = self._ports.tracker.next_item(campaign)
+                if (
+                    head is not None
+                    and head.item_id in selection.allow
+                    and head.item_id in launch_set
+                    and head.item_id not in selection.exclude
+                    and head.item_id not in skip
+                    and allowed(head)
+                ):
+                    return head
+            return None
+        if selection.exclude or skip or campaign.concurrency > 1:
+            return first_ready()
+        head = self._ports.tracker.next_item(campaign)
+        if head is None or head.item_id in launch_set:
+            return head
+        return first_ready()
 
     def _deliver_report(
         self,
@@ -2376,7 +2563,7 @@ class CampaignRunner:
         outcomes: list[ItemOutcome],
         stop: CampaignStopReason,
         next_ref: str,
-        follow_ups: list[str],
+        follow_ups: list[FollowUpRecord],
         unbuilt: list[tuple[str, str]],
         reclaims: list[LeaseRecord],
         orphans: list[tuple[str, str]],
@@ -2428,6 +2615,13 @@ class CampaignRunner:
             return "queue dry"
         if stop is CampaignStopReason.HOLD_LIMIT:
             return "hold limit"
+        if stop is CampaignStopReason.LAUNCH_SET_UNREADABLE:
+            return "launch set unreadable"
+        if stop is CampaignStopReason.PAUSED:
+            return (
+                "paused on request; run `autobuild run` with the same profile "
+                "to resume this campaign"
+            )
         try:
             peek = self._select_item(campaign, skip)
         except ScopeFenceViolation:
@@ -2441,6 +2635,7 @@ class CampaignRunner:
         campaign: CampaignRef,
         outcomes: list[ItemOutcome],
         stop: CampaignStopReason,
+        taken: frozenset[str],
     ) -> list[tuple[str, str]]:
         """Name every allow-list item that was not built and why. An item that ran
         (accepted, parked or failed) already appears in the report body; this list
@@ -2449,7 +2644,6 @@ class CampaignRunner:
         selection = campaign.selection
         if not selection.allow:
             return []
-        accepted = {o.item_id for o in outcomes if o.disposition is ItemDisposition.ACCEPTED}
         processed = {o.item_id for o in outcomes}
         try:
             ready = {item.item_id for item in self._ports.tracker.ready_items(campaign)}
@@ -2457,38 +2651,59 @@ class CampaignRunner:
             # Fence refusal or a read failure: the report then names no
             # allowed item as ready.
             ready = set()
-        results: list[tuple[str, str]] = []
-        for index, item_id in enumerate(selection.allow):
-            if item_id in processed:
-                continue
-            results.append(
-                (item_id, self._unbuilt_reason(item_id, index, selection, accepted, ready, stop))
+        try:
+            blocked = frozenset(self._ports.tracker.blocked_item_ids(campaign))
+        except Exception:
+            blocked = frozenset()
+        # An unreadable launch set is unknown, not empty: no item is then
+        # reported outside it.
+        launch_set = (
+            None if stop is CampaignStopReason.LAUNCH_SET_UNREADABLE else self._launch_set
+        )
+        return [
+            (
+                item_id,
+                self._unbuilt_reason(
+                    item_id, selection, ready, blocked, taken, stop, launch_set
+                ),
             )
-        return results
+            for item_id in selection.allow
+            if item_id not in processed
+        ]
 
     @staticmethod
     def _unbuilt_reason(
         item_id: str,
-        index: int,
         selection,
-        accepted: set[str],
-        ready: set[str],
+        ready: set[str] | frozenset[str],
+        blocked: frozenset[str],
+        taken: frozenset[str],
         stop: CampaignStopReason,
+        launch_set: frozenset[str] | None = None,
     ) -> str:
+        """Readiness decides first: a stop explains only why a ready item was
+        left, since an item that was not ready would have been left at any stop."""
+
         if item_id in selection.exclude:
             return "excluded"
+        if launch_set is not None and item_id not in launch_set:
+            return "outside the launch set"
+        # The tracker may leave a claimed item out of its ready listing.
+        if item_id in taken:
+            return "claim taken"
+        if item_id not in ready:
+            if item_id in blocked:
+                return "blocked"
+            return "not ready"
         if stop is CampaignStopReason.ITEM_BOUND:
             return "item bound"
-        if item_id in ready:
-            if stop is CampaignStopReason.HOLD_LIMIT:
-                return "hold limit"
-            return "item bound"
-        preceding = selection.allow[:index]
-        if any(
-            pid not in accepted and pid not in selection.exclude for pid in preceding
-        ):
-            return "blocked"
-        return "not ready"
+        if stop is CampaignStopReason.HOLD_LIMIT:
+            return "hold limit"
+        if stop is CampaignStopReason.PAUSED:
+            return "paused"
+        if stop is CampaignStopReason.LAUNCH_SET_UNREADABLE:
+            return "launch set unreadable"
+        return "ready after the last selection"
 
     @staticmethod
     def _counts(outcomes: list[ItemOutcome]) -> dict[ItemDisposition, int]:
@@ -2525,11 +2740,62 @@ def _holder_payload(record: LeaseRecord) -> dict[str, object]:
     }
 
 
+def _follow_up_section(follow_up: FollowUpRecord) -> list[str]:
+    """One registered proposal in full, so a triage reads it from the
+    repository alone."""
+
+    proposal = follow_up.proposal
+    blocking = "none" if proposal.blocking is None else ("yes" if proposal.blocking else "no")
+    return [
+        heading_text(f"### {follow_up.proposal_id} {proposal.title}"),
+        "",
+        *labelled_value("Parent item", proposal.parent_item or "none"),
+        *labelled_value("Finding code", proposal.finding_code or "none"),
+        f"- Blocking: {blocking}",
+        *labelled_value("Evidence reference", proposal.evidence_ref or "none"),
+        "",
+        "Question:",
+        "",
+        fenced_block(proposal.question),
+        "",
+        "Rationale:",
+        "",
+        fenced_block(proposal.rationale),
+        "",
+    ]
+
+
+def _batch_validation_section(batches: BatchValidationSummary) -> list[str]:
+    lines = ["## Batch validation", ""]
+    last = batches.last
+    if last is None:
+        return [*lines, "none", ""]
+    if batches.verdict is BatchVerdict.FAILED:
+        lines.append(
+            f"The delivery target head `{last.revision}` failed validation at campaign end "
+            "and is not proven."
+        )
+        lines.append("")
+    for run in batches.runs:
+        parts = [
+            f"- batch {run.number}{' (final)' if run.final else ''}",
+            f"revision `{run.revision}`",
+            "passed" if run.passed else "failed",
+            f"exit {'none' if run.exit_code is None else run.exit_code}",
+            f"output `{run.stdout_ref or 'none'}`",
+        ]
+        if run.error:
+            parts.append(f"error {run.error}")
+        lines.append(", ".join(parts))
+    lines.append("")
+    return lines
+
+
 def _render_report(
     campaign: CampaignRef,
     outcomes: list[ItemOutcome],
     next_ref: str,
-    follow_ups: list[str],
+    follow_ups: list[FollowUpRecord],
     unbuilt: list[tuple[str, str]],
     reclaims: list[LeaseRecord],
     orphans: list[tuple[str, str]],
@@ -2578,6 +2844,12 @@ def _render_report(
         lines.append("none")
     lines.append("")
 
+    lines.extend(
+        _batch_validation_section(
+            schedule.batch_summary() if schedule is not None else BatchValidationSummary()
+        )
+    )
+
     if unfinished:
         lines.append("## Unfinished")
         lines.append("")
@@ -2607,11 +2879,11 @@ def _render_report(
     lines.append("## Follow-ups")
     lines.append("")
     if follow_ups:
-        for title in follow_ups:
-            lines.append(f"- {title}")
+        for follow_up in follow_ups:
+            lines.extend(_follow_up_section(follow_up))
     else:
         lines.append("none")
-    lines.append("")
+        lines.append("")
 
     if unpublished:
         lines.append("## Unpublished tracker writes")
@@ -2670,6 +2942,29 @@ def _render_report(
             )
     if not any_seat:
         lines.append("| none | - | - | - | - | - | - | - | - |")
+    lines.append("")
+
+    lines.append("## Review depth")
+    lines.append("")
+    lines.append(
+        "| item | seat | duration seconds | changed paths inspected | clauses checked | "
+        "depth | reasons |"
+    )
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    any_review = False
+    for outcome in outcomes:
+        for depth in outcome.review_depths:
+            any_review = True
+            seat_label = depth.seat.value + (f" ({depth.boundary})" if depth.boundary else "")
+            lines.append(
+                f"| {outcome.item_id} | {seat_label} | {_seat_cell(depth.duration_seconds)} | "
+                f"{depth.inspected_changed_paths} of {depth.changed_paths} | "
+                f"{depth.clauses_checked} of {depth.clauses} | "
+                f"{'shallow' if depth.shallow else 'ok'} | "
+                f"{'; '.join(depth.reasons) or '-'} |"
+            )
+    if not any_review:
+        lines.append("| none | - | - | - | - | - | - |")
     lines.append("")
 
     if schedule is not None:

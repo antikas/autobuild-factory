@@ -111,7 +111,7 @@ def test_every_sdk_lane_seat_runs_unattended(
     payload = (
         {"summary": "done", "report_ref": "r"}
         if seat is Seat.BUILDER
-        else {"decision": "pass", "findings": [], "evidence_ref": "e"}
+        else {"decision": "pass", "findings": [], "evidence_ref": "e", "inspected": [], "acceptance": []}
     )
     client = FakeAgentSdkClient(
         scripts=[

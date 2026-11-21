@@ -106,8 +106,14 @@ def _require_close_evidence(
 ) -> None:
     if evidence.item_id != evidence.verdict.item_id:
         raise EvidenceError("close item and verdict item do not match")
-    if evidence.verdict.decision is not ReviewDecision.PASS:
-        raise EvidenceError("only a passing review can close an item")
+    decision = evidence.verdict.decision
+    at_round_limit = (
+        decision is ReviewDecision.CORRECT and evidence.accepted_at_round_limit
+    )
+    if decision is not ReviewDecision.PASS and not at_round_limit:
+        raise EvidenceError(
+            "only a passing review, or a correct review at the round limit, can close an item"
+        )
     if evidence.diff.workspace != workspace:
         raise EvidenceError("close diff belongs to a different workspace")
     revisions = {
@@ -256,6 +262,9 @@ class EnforcedWorkspacePort:
             _require_path(status.root, self._config, "resumable worktree")
         return statuses
 
+    def worktree_belongs_to(self, status, item_id: str) -> bool:
+        return self._port.worktree_belongs_to(status, item_id)
+
     def adopt_worktree(self, campaign: CampaignRef, item, root: Path):
         _require_path(campaign.repository, self._config, "campaign repository")
         _require_path(root, self._config, "resumable worktree")
@@ -364,6 +373,14 @@ class EnforcedTrackerPort:
         _require_path(campaign.repository, self._config, "campaign repository")
         return self._port.ready_items(campaign)
 
+    def blocked_item_ids(self, campaign: CampaignRef):
+        _require_path(campaign.repository, self._config, "campaign repository")
+        return self._port.blocked_item_ids(campaign)
+
+    def known_item_ids(self, campaign: CampaignRef):
+        _require_path(campaign.repository, self._config, "campaign repository")
+        return self._port.known_item_ids(campaign)
+
     def resumable_claims(self, campaign: CampaignRef):
         _require_path(campaign.repository, self._config, "campaign repository")
         return self._port.resumable_claims(campaign)
@@ -436,6 +453,9 @@ class EnforcedRunRecordPort:
         _require_path(record.root, self._config, "run record")
         return self._port.append(record, event)
 
+    def timestamp(self) -> str:
+        return self._port.timestamp()
+
     def write_evidence(self, record: RunRecordRef, name: str, content: str):
         _require_path(record.root, self._config, "run record")
         if not name.strip():
@@ -452,6 +472,14 @@ class EnforcedRunRecordPort:
         if not item_id.strip():
             raise EvidenceError("phase marker lookup requires an item id")
         return self._port.latest_phase_marker(item_id)
+
+    def pause_requested(self, record: RunRecordRef):
+        _require_path(record.root, self._config, "run record")
+        return self._port.pause_requested(record)
+
+    def clear_prior_pause(self, record: RunRecordRef):
+        _require_path(record.root, self._config, "run record")
+        return self._port.clear_prior_pause(record)
 
     def complete(self, record: RunRecordRef, summary: str):
         _require_path(record.root, self._config, "run record")

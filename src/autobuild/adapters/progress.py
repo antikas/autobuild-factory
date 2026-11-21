@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
@@ -111,14 +112,28 @@ class CommandHookProgressAdapter:
             self._failed()
 
 
+_COMPLETION_OPENING = f"{CAMPAIGN_COMPLETED_PREFIX}: shipped "
+
+
 def is_completion_line(line: str) -> bool:
     """Return whether a rendered progress line is the campaign-completion line.
 
-    The renderer prefixes the line with the event timestamp, so the campaign
-    completion token appears after that stamp. A watcher stops once this line has
-    been printed."""
+    Only the line rendered from the campaign's completion event matches: its body
+    alone, or one timestamp token, one space and that body. Other lines carry
+    item titles, reasons and finding text, so the words "campaign completed"
+    anywhere else in a line do not end a watch. Any text after the body's opening
+    is allowed, which keeps the composite's hook-failure suffix matching."""
 
-    return CAMPAIGN_COMPLETED_PREFIX in line
+    if line.startswith(_COMPLETION_OPENING):
+        return True
+    stamp, separator, body = line.partition(" ")
+    if not separator or not body.startswith(_COMPLETION_OPENING):
+        return False
+    try:
+        datetime.fromisoformat(stamp)
+    except ValueError:
+        return False
+    return True
 
 
 class ProgressLogReader:
@@ -173,8 +188,7 @@ class CompositeProgressAdapter:
             adapter.begin(record)
 
     def emit(self, line: str) -> None:
-        _, _, body = line.partition(" ")
-        if body.startswith(CAMPAIGN_COMPLETED_PREFIX):
+        if is_completion_line(line):
             line = f"{line} progress hook failures: {self._hook_failures()}"
         for adapter in self._adapters:
             adapter.emit(line)

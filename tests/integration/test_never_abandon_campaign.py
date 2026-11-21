@@ -65,7 +65,7 @@ if "Review the actual brief" in prompt:
         "blocking": False,
         "specialist_boundary": None,
     }]
-    payload = {"decision": "pass", "findings": findings, "evidence_ref": "fake-review"}
+    payload = {"decision": "pass", "findings": findings, "evidence_ref": "fake-review", "inspected": [], "acceptance": []}
 else:
     match = re.search(r"WRITE-TARGET: (out-[0-9]+[.]txt)", prompt)
     if match is None:

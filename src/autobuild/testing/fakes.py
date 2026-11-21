@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 from autobuild.domain import (
@@ -56,6 +57,7 @@ from autobuild.domain.models import (
     DeliveryParked,
     DeliveryParkReason,
     RevalidationDecision,
+    SeatLaunch,
     SeatTransport,
     SkippedItem,
     TrackerRecovery,
@@ -145,6 +147,14 @@ class FakeAdapter:
         return ProbeResult.unavailable(*self.diagnostics)
 
 
+# The launch every fake harness seat reports.
+FAKE_SEAT_LAUNCH = SeatLaunch(
+    argv=("fake-harness", "--seat"),
+    set_environment=("DO_NOT_TRACK",),
+    removed_environment=("FAKE_HARNESS_TOKEN",),
+)
+
+
 @dataclass
 class FakeHarnessAdapter(FakeAdapter):
     scripted_results: list[SeatResult] = field(default_factory=list)
@@ -175,6 +185,8 @@ class FakeHarnessAdapter(FakeAdapter):
     def invoke(self, request: SeatRequest) -> SeatResult:
         if request.effort is not None and request.effort not in self.effort_levels:
             raise CapabilityError(f"fake harness cannot pass effort {request.effort.value}")
+        if request.on_launch is not None:
+            request.on_launch(FAKE_SEAT_LAUNCH)
         with self._guard:
             self.requests.append(request)
             script = _item_script(self.results_by_item, request.item_id)
@@ -248,6 +260,9 @@ class FakeTrackerAdapter(FakeAdapter):
     claims: list[tuple[str, str]] = field(default_factory=list)
     closed: list[CloseEvidence] = field(default_factory=list)
     parked: list[tuple[str, str]] = field(default_factory=list)
+    # Every park call with the worktree it was written in (None for a park
+    # recorded from the primary checkout).
+    park_calls: list[tuple[str, str, WorkspaceRef | None]] = field(default_factory=list)
     proposals: list[Proposal] = field(default_factory=list)
     # A scripted failure raised by ``claim`` for the named item, standing in for
     # a tracker that reports the claim taken or stops the campaign.
@@ -261,6 +276,8 @@ class FakeTrackerAdapter(FakeAdapter):
     # blocked by is in ``done``. ``mark_done`` records a delivered item.
     blocked_by: dict[str, frozenset[str]] = field(default_factory=dict)
     done: set[str] = field(default_factory=set)
+    # Ids the tracker holds behind a gate, reported by ``blocked_item_ids``.
+    blocked: set[str] = field(default_factory=set)
     ready_reads: int = 0
     # The results ``recover`` returns in order, then a clear result once the
     # script runs out; ``recoveries`` counts the calls.
@@ -268,6 +285,12 @@ class FakeTrackerAdapter(FakeAdapter):
     recoveries: int = 0
     # The ready items this tracker reports it passed over.
     skipped: list[SkippedItem] = field(default_factory=list)
+    # Ids the tracker holds without listing them in ``queue``, ``ready`` or
+    # ``resumable`` yet, for example an item that becomes ready later.
+    existing: set[str] = field(default_factory=set)
+    # Raised by ``known_item_ids`` when set, standing in for an unreadable tracker.
+    known_error: Exception | None = None
+    known_reads: int = 0
     _guard: threading.Lock = field(default_factory=_lock, init=False, repr=False, compare=False)
 
     def _publication(self, item_id: str) -> TrackerPublication:
@@ -282,8 +305,15 @@ class FakeTrackerAdapter(FakeAdapter):
             self.ready.extend(items)
 
     def next_item(self, campaign: CampaignRef) -> WorkItem | None:
+        # A tracker never offers an item already claimed, so a queued item
+        # claimed through ``ready_items`` is dropped from the head.
         with self._guard:
-            return self.queue.pop(0) if self.queue else None
+            claimed = {item_id for item_id, _ in self.claims}
+            while self.queue:
+                head = self.queue.pop(0)
+                if head.item_id not in claimed:
+                    return head
+            return None
 
     def ready_items(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
         with self._guard:
@@ -294,6 +324,28 @@ class FakeTrackerAdapter(FakeAdapter):
                 for item in self.ready
                 if item.item_id not in claimed
                 and self.blocked_by.get(item.item_id, frozenset()) <= self.done
+            )
+
+    def blocked_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
+        with self._guard:
+            return frozenset(self.blocked) | frozenset(
+                item.item_id
+                for item in self.ready
+                if not self.blocked_by.get(item.item_id, frozenset()) <= self.done
+            )
+
+    def known_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
+        with self._guard:
+            self.known_reads += 1
+            if self.known_error is not None:
+                raise self.known_error
+            return frozenset(
+                {item.item_id for item in (*self.queue, *self.ready, *self.resumable)}
+                | {item_id for item_id, _ in self.claims}
+                | set(self.blocked_by)
+                | self.blocked
+                | self.done
+                | self.existing
             )
 
     def resumable_claims(self, campaign: CampaignRef) -> tuple[WorkItem, ...]:
@@ -322,6 +374,7 @@ class FakeTrackerAdapter(FakeAdapter):
     ) -> TrackerPublication | None:
         with self._guard:
             self.parked.append((item_id, reason))
+            self.park_calls.append((item_id, reason, workspace))
         return self._publication(item_id) if workspace is None else None
 
     def propose(self, proposal: Proposal, actor: str) -> ProposalRef:
@@ -364,6 +417,9 @@ class FakeWorkspaceAdapter(FakeAdapter):
     digest_calls: int = 0
     worktrees: list[WorktreeStatus] = field(default_factory=list)
     adopted: list[Path] = field(default_factory=list)
+    # The owning item id of each listed worktree root; a root not keyed here
+    # belongs to no item.
+    worktree_owners: dict[Path, str] = field(default_factory=dict)
     resume_commits: tuple[str | None, str] = ("item-commit", "tracker-commit")
     # The worktree and the diffs scripted per item id. A keyed item gets its own
     # worktree and takes its own diffs; any other item uses the shared ones.
@@ -371,6 +427,9 @@ class FakeWorkspaceAdapter(FakeAdapter):
     diffs_by_item: dict[str, list[DiffEvidence]] = field(default_factory=dict)
     # Raised by ``deliver`` in order, standing in for a delivery that parks.
     delivery_parks: list[DeliveryParked] = field(default_factory=list)
+    # Raised by ``deliver`` for the keyed item id, standing in for a delivery
+    # that fails for that item only.
+    delivery_errors: dict[str, Exception] = field(default_factory=dict)
     # When true, ``deliver`` reports that integration moved the base outside the
     # tracker paths and runs the request's revalidation once; a failed one parks.
     base_moved: bool = False
@@ -425,6 +484,9 @@ class FakeWorkspaceAdapter(FakeAdapter):
     def list_worktrees(self, campaign: CampaignRef) -> tuple[WorktreeStatus, ...]:
         return tuple(self.worktrees)
 
+    def worktree_belongs_to(self, status: WorktreeStatus, item_id: str) -> bool:
+        return self.worktree_owners.get(status.root) == item_id
+
     def adopt_worktree(
         self, campaign: CampaignRef, item: WorkItem, root: Path
     ) -> WorkspaceRef:
@@ -474,8 +536,11 @@ class FakeWorkspaceAdapter(FakeAdapter):
     def deliver(self, workspace: WorkspaceRef, request: DeliveryRequest) -> FinaliseResult:
         with self._guard:
             parked = self.delivery_parks.pop(0) if self.delivery_parks else None
+            failure = self.delivery_errors.get(self._item_of(workspace) or "")
         if parked is not None:
             raise parked
+        if failure is not None:
+            raise failure
         if self.base_moved and request.revalidate is not None:
             if request.note_revalidation is not None:
                 request.note_revalidation(
@@ -568,10 +633,21 @@ class FakeRunRecordAdapter(FakeAdapter):
     evidence_file_writes: list[tuple[str, bytes]] = field(default_factory=list)
     summaries: list[str] = field(default_factory=list)
     markers: dict[str, PhaseMarker] = field(default_factory=dict)
+    # A pause request on the current run, and the prior run whose request the
+    # next campaign lifts; ``cleared_pauses`` records each lifted run id.
+    paused: bool = False
+    prior_paused_run: str | None = None
+    cleared_pauses: list[str] = field(default_factory=list)
+    pause_checks: int = 0
+    # The run record's clock; a test freezes it by passing a fixed callable.
+    now: Callable[[], datetime] = field(default=lambda: datetime.now(UTC), compare=False)
     _guard: threading.Lock = field(default_factory=_lock, init=False, repr=False, compare=False)
 
     def create(self, campaign: CampaignRef) -> RunRecordRef:
         return RunRecordRef(f"run-{campaign.campaign_id}", Path("/fake/record"))
+
+    def timestamp(self) -> str:
+        return self.now().astimezone(UTC).isoformat()
 
     def append(self, record: RunRecordRef, event: RunEvent) -> str:
         with self._guard:
@@ -594,6 +670,18 @@ class FakeRunRecordAdapter(FakeAdapter):
 
     def latest_phase_marker(self, item_id: str) -> PhaseMarker | None:
         return self.markers.get(item_id)
+
+    def pause_requested(self, record: RunRecordRef) -> bool:
+        with self._guard:
+            self.pause_checks += 1
+            return self.paused
+
+    def clear_prior_pause(self, record: RunRecordRef) -> str | None:
+        with self._guard:
+            run_id, self.prior_paused_run = self.prior_paused_run, None
+            if run_id is not None:
+                self.cleared_pauses.append(run_id)
+            return run_id
 
     def complete(self, record: RunRecordRef, summary: str) -> str:
         self.summaries.append(summary)
@@ -639,6 +727,8 @@ class FakeEnvironmentProbe:
 @dataclass
 class FakeFilesystemProbe:
     files: dict[str, int] = field(default_factory=dict)
+    # Brief text by path; a listed file without text reads as empty.
+    texts: dict[str, str] = field(default_factory=dict)
     directories: set[str] = field(default_factory=set)
     locks: dict[str, tuple[str, ...]] = field(default_factory=dict)
     writable: bool = True
@@ -663,6 +753,9 @@ class FakeFilesystemProbe:
 
     def size(self, path: Path) -> int:
         return self.files.get(str(path), 0)
+
+    def read_text(self, path: Path) -> str:
+        return self.texts.get(str(path), "")
 
 
 @dataclass

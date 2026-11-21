@@ -671,7 +671,7 @@ def test_campaign_start_efforts_preserve_unset_profile_seats(tmp_path: Path) -> 
         ),
     )
 
-    efforts = _starting_lane_efforts(settings, _lane_efforts(settings))
+    efforts = _starting_lane_efforts(settings.lanes[0].name, _lane_efforts(settings))
 
     assert efforts == {
         "builder": EffortLevel.HIGH,
@@ -683,7 +683,7 @@ def test_campaign_start_efforts_preserve_unset_profile_seats(tmp_path: Path) -> 
 def test_campaign_start_efforts_are_all_unset_without_profile_keys(tmp_path: Path) -> None:
     settings = _load(tmp_path, PROFILE)
 
-    assert _starting_lane_efforts(settings, _lane_efforts(settings)) == {
+    assert _starting_lane_efforts(settings.lanes[0].name, _lane_efforts(settings)) == {
         "builder": None,
         "reviewer": None,
         "specialist": None,
@@ -1221,3 +1221,87 @@ command_timeout_seconds = 1
         profile_root = tmp_path / str(index)
         profile_root.mkdir()
         _load(profile_root, profile)
+
+
+# --- the batch verdict in the campaign result and the exit code ------------------------
+
+
+def _batch_outcome(verdict_passed: bool):
+    from autobuild.domain import CampaignOutcome, CampaignStopReason
+    from autobuild.domain.models import BatchValidationRun, BatchValidationSummary
+
+    return CampaignOutcome(
+        "campaign-1",
+        (),
+        CampaignStopReason.QUEUE_DRY,
+        "run-report",
+        batch_validation=BatchValidationSummary(
+            (
+                BatchValidationRun(1, False, "head-1", True, 0, "stdout:1"),
+                BatchValidationRun(2, True, "head-2", verdict_passed, 1, "stdout:2"),
+            )
+        ),
+    )
+
+
+def test_the_campaign_result_carries_the_batch_verdict_and_every_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from test_usage_profile import BASE, _launch
+
+    from autobuild.bootstrap import composition
+
+    settings, _tracker, _meter, _lanes = _launch(tmp_path, monkeypatch, BASE, 0, patch_meter=False)
+
+    class _Runner:
+        def __init__(self, ports, **kwargs) -> None:
+            pass
+
+        def run(self, *args, **kwargs):
+            return _batch_outcome(False)
+
+    monkeypatch.setattr(composition, "CampaignRunner", _Runner)
+
+    result = composition.run_campaign(settings, allow_delivery=True)
+
+    assert result["batch_validation"] == {
+        "verdict": "failed",
+        "runs": [
+            {
+                "batch": 1,
+                "final": False,
+                "revision": "head-1",
+                "passed": True,
+                "exit_code": 0,
+                "stdout_ref": "stdout:1",
+                "error": None,
+            },
+            {
+                "batch": 2,
+                "final": True,
+                "revision": "head-2",
+                "passed": False,
+                "exit_code": 1,
+                "stdout_ref": "stdout:2",
+                "error": None,
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(("verdict", "code"), [("failed", 1), ("passed", 0), ("none", 0)])
+def test_a_failed_batch_verdict_exits_one_with_every_item_accepted(
+    tmp_path: Path, monkeypatch, capsys, verdict: str, code: int
+) -> None:
+    from autobuild import cli
+
+    repository = tmp_path / "project"
+    repository.mkdir()
+    result = {
+        "items": [{"item_id": "item-1", "disposition": "accepted"}],
+        "batch_validation": {"verdict": verdict, "runs": []},
+    }
+    monkeypatch.setattr(cli, "load_settings", lambda *args: object())
+    monkeypatch.setattr(cli, "run_campaign", lambda *args, **kwargs: result)
+
+    assert cli.main(["run", "--repository", str(repository)]) == code

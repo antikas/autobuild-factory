@@ -74,6 +74,31 @@ def _slug(value: str) -> str:
     return cleaned or "item"
 
 
+def _new_file_hunk(posix: str, content: bytes) -> str | None:
+    """``content`` as the new-file hunk ``git diff`` writes, or None when it is
+    binary (a NUL byte, or not valid UTF-8)."""
+
+    if b"\0" in content:
+        return None
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    header = [f"diff --git a/{posix} b/{posix}", "new file mode 100644"]
+    if not text:
+        return "\n".join(header)
+    lines = text.split("\n")
+    complete = lines[-1] == ""
+    if complete:
+        lines.pop()
+    body = [f"+{line}" for line in lines]
+    if not complete:
+        body.append("\\ No newline at end of file")
+    return "\n".join(
+        [*header, "--- /dev/null", f"+++ b/{posix}", f"@@ -0,0 +1,{len(lines)} @@", *body]
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _Lease:
     repository: RepositoryIdentity
@@ -90,6 +115,7 @@ class GitWorkspaceAdapter:
         primary_lock: AbstractContextManager[object] | None = None,
         projection: TrackerProjectionPort | None = None,
         tracker_recovery: Callable[[], object] | None = None,
+        review_patch_limit: int = 1024 * 1024,
     ) -> None:
         """``primary_lock`` is the one lock every local mutation of the primary
         checkout holds; composition shares it with the tracker adapter. It covers
@@ -100,8 +126,11 @@ class GitWorkspaceAdapter:
         appended and did not commit; a locked delivery or report step that
         finds the primary dirty with tracker files only lets the lock go, runs
         it and tries again. It takes the primary-checkout lock itself, so it is
-        never called under it."""
+        never called under it. ``review_patch_limit`` is the byte size the
+        review patch keeps under by omitting the content of the largest added
+        files; a tracked patch alone above it is written whole."""
 
+        self._review_patch_limit = review_patch_limit
         self._primary_lock = primary_lock if primary_lock is not None else Lock()
         self._projection = projection
         self._tracker_recovery = tracker_recovery
@@ -195,6 +224,14 @@ class GitWorkspaceAdapter:
             )
         return tuple(statuses)
 
+    def worktree_belongs_to(self, status: WorktreeStatus, item_id: str) -> bool:
+        # The shape ``create_isolated`` names a worktree with: the item slug
+        # and the first eight hex characters of the lease id.
+        return (
+            re.fullmatch(rf"{re.escape(_slug(item_id))}-[0-9a-f]{{8}}", status.root.name)
+            is not None
+        )
+
     def adopt_worktree(
         self, campaign: CampaignRef, item: WorkItem, root: Path
     ) -> WorkspaceRef:
@@ -244,16 +281,56 @@ class GitWorkspaceAdapter:
             "--",
             check=False,
         )
-        untracked = [
-            f"# untracked {entry.path.as_posix()} sha256={entry.digest}"
-            for entry in changed
-            if entry.kind is ChangeKind.ADDED
-        ]
-        patch_path.write_text(
-            tracked_patch + ("\n" if tracked_patch and untracked else "") + "\n".join(untracked),
-            encoding="utf-8",
-        )
+        patch = self._review_patch(workspace.root, tracked_patch, changed)
+        # The harness refuses evidence by its size on disk, which must be the
+        # size measured against the limit: no newline translation.
+        patch_path.write_bytes(patch.encode("utf-8"))
         return DiffEvidence(workspace, workspace_revision, changed, str(patch_path), head)
+
+    def _review_patch(
+        self, root: Path, tracked_patch: str, changed: tuple[ChangedPath, ...]
+    ) -> str:
+        """The tracked patch, then one new-file hunk per untracked added text
+        file and the digest line of every added file. When the whole would
+        exceed the limit, the largest added files lose their hunk first."""
+
+        loose = set(
+            filter(None, self._git(root, "ls-files", "--others", "--exclude-standard", "-z").split("\0"))
+        )
+        added = [entry for entry in changed if entry.kind is ChangeKind.ADDED]
+        hunks: dict[str, str] = {}
+        for entry in added:
+            posix = entry.path.as_posix()
+            if posix not in loose:
+                continue
+            hunk = _new_file_hunk(posix, (root / entry.path).read_bytes())
+            if hunk is not None:
+                hunks[posix] = hunk
+        omitted: dict[str, int] = {}
+
+        def render() -> str:
+            blocks: list[str] = [tracked_patch] if tracked_patch else []
+            for entry in added:
+                posix = entry.path.as_posix()
+                if posix in hunks and posix not in omitted:
+                    blocks.append(hunks[posix])
+            for entry in added:
+                posix = entry.path.as_posix()
+                blocks.append(f"# untracked {posix} sha256={entry.digest}")
+                if posix in omitted:
+                    blocks.append(
+                        f"# content omitted: {omitted[posix]} bytes, read {posix} in the workspace"
+                    )
+            return "\n".join(blocks)
+
+        patch = render()
+        by_size = sorted(hunks, key=lambda posix: (-len(hunks[posix].encode("utf-8")), posix))
+        for posix in by_size:
+            if len(patch.encode("utf-8")) <= self._review_patch_limit:
+                break
+            omitted[posix] = (root / posix).stat().st_size
+            patch = render()
+        return patch
 
     def progress_digest(self, workspace: WorkspaceRef) -> str:
         """A cheap digest of the worktree's product state for stall detection.
@@ -635,7 +712,7 @@ class GitWorkspaceAdapter:
         if self._is_ancestor(root, commit, "HEAD"):
             return
         before = self._git(root, "rev-parse", "HEAD")
-        self._git(
+        _, _, merge_detail = self._git_result(
             root,
             "merge",
             "--no-ff",
@@ -643,7 +720,6 @@ class GitWorkspaceAdapter:
             "-m",
             f"{INTEGRATION_SUBJECT} {label} into {workspace.branch}",
             commit,
-            check=False,
         )
         merging = bool(
             self._git(root, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).strip()
@@ -679,7 +755,8 @@ class GitWorkspaceAdapter:
                 DeliveryParkReason.CONFLICT,
                 f"integrating {label} conflicted in " + ", ".join(conflicted),
             )
-        raise AdapterError(f"integration merge of {label} did not complete")
+        message = f"integration merge of {label} did not complete"
+        raise AdapterError(f"{message}: {merge_detail}" if merge_detail else message)
 
     def _merge_tracker_gap(self, workspace: WorkspaceRef, local_head: str, target: str) -> None:
         """Merge a local target head whose only new changes are tracker state
@@ -1241,6 +1318,16 @@ class GitWorkspaceAdapter:
 
     @staticmethod
     def _git(root: Path, *args: str, check: bool = True) -> str:
+        returncode, stdout, detail = GitWorkspaceAdapter._git_result(root, *args)
+        if check and returncode != 0:
+            raise AdapterError(f"git {' '.join(args)} failed: {detail}")
+        return stdout
+
+    @staticmethod
+    def _git_result(root: Path, *args: str) -> tuple[int, str, str]:
+        """Run git and return its exit code, its stdout and its own message
+        (stderr, or stdout when stderr is empty)."""
+
         attempts = 5 if args and args[0] in {"add", "commit", "merge", "push", "worktree"} else 1
         for attempt in range(attempts):
             completed = subprocess.run(
@@ -1256,9 +1343,7 @@ class GitWorkspaceAdapter:
             if completed.returncode == 0 or not transient or attempt == attempts - 1:
                 break
             time.sleep(0.2 * (attempt + 1))
-        if check and completed.returncode != 0:
-            raise AdapterError(f"git {' '.join(args)} failed: {detail}")
-        return completed.stdout.rstrip("\r\n")
+        return completed.returncode, completed.stdout.rstrip("\r\n"), detail
 
     @staticmethod
     def _git_bytes(root: Path, *args: str) -> bytes:

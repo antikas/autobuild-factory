@@ -39,7 +39,7 @@ if args[:2] == ["auth", "status"]:
 
 prompt = sys.stdin.read()
 if "Review the actual brief" in prompt:
-    payload = {"decision": "pass", "findings": [], "evidence_ref": "fake-review"}
+    payload = {"decision": "pass", "findings": [], "evidence_ref": "fake-review", "inspected": [], "acceptance": []}
 else:
     match = re.search(r"WRITE-TARGET: (out-[0-9]+[.]txt)", prompt)
     if match is None:

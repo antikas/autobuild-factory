@@ -35,7 +35,7 @@ from autobuild.domain import (
     SeatRequest,
     SeatResult,
 )
-from autobuild.domain.models import SeatTransport
+from autobuild.domain.models import SeatLaunch, SeatTransport
 from autobuild.ports import CommandPort
 
 SDK_MODULE = "claude_agent_sdk"
@@ -321,10 +321,13 @@ class ClaudeSdkHarnessAdapter(ClaudeCodeHarnessAdapter):
         }
 
     def _child_environment(
-        self, config_dir: Path | None, item_id: str | None = None
+        self, config_dir: Path | None, seat: tuple[str, str] | None = None
     ) -> tuple[tuple[str, str], ...]:
+        """``seat`` is the run id and item id of a seat; without it the child
+        gets the adapter's shared scratch."""
+
         environment = dict(
-            self._seat_environment(item_id) if item_id is not None else self._scratch_environment()
+            self._seat_environment(*seat) if seat is not None else self._scratch_environment()
         )
         if config_dir is not None:
             environment["CLAUDE_CONFIG_DIR"] = str(config_dir)
@@ -339,6 +342,13 @@ class ClaudeSdkHarnessAdapter(ClaudeCodeHarnessAdapter):
 
     def seat_spec(self, request: SeatRequest, run_ref: str, config_dir: Path | None) -> SdkSeatSpec:
         """Translate the Claude Code seat vector for ``request`` into SDK options."""
+
+        return self._translated_seat(request, run_ref, config_dir)[1]
+
+    def _translated_seat(
+        self, request: SeatRequest, run_ref: str, config_dir: Path | None
+    ) -> tuple[tuple[str, ...], SdkSeatSpec]:
+        """The seat vector ``_invocation`` returns and the SDK options it becomes."""
 
         argv, _extra, stdin_ref = self._invocation(request, run_ref)
         assert stdin_ref is not None
@@ -367,7 +377,7 @@ class ClaudeSdkHarnessAdapter(ClaudeCodeHarnessAdapter):
             raise CapabilityError(
                 "a Claude Code seat cannot carry a hook and --safe-mode, which switches every hook off"
             )
-        return SdkSeatSpec(
+        return argv, SdkSeatSpec(
             prompt=Path(stdin_ref).read_text(encoding="utf-8"),
             cwd=request.workspace.root,
             model=values["--model"],
@@ -380,7 +390,7 @@ class ClaudeSdkHarnessAdapter(ClaudeCodeHarnessAdapter):
             effort=values.get("--effort"),
             flags=tuple(flags),
             settings=settings,
-            environment=self._child_environment(config_dir, request.item_id),
+            environment=self._child_environment(config_dir, (request.run_id, request.item_id)),
             setting_sources=sources,
         )
 
@@ -426,7 +436,19 @@ class ClaudeSdkHarnessAdapter(ClaudeCodeHarnessAdapter):
             self._append(raw_path, {"message": _ADAPTER_RECORD, "error": {"type": _KEY_FILE_MISSING}})
             outcome = SeatOutcome.FAILED
         else:
-            spec = self.seat_spec(prepared, run_ref, self._fresh_config_dir(run_ref))
+            argv, spec = self._translated_seat(prepared, run_ref, self._fresh_config_dir(run_ref))
+            if request.on_launch is not None:
+                blanked = tuple(self.removed_environment)
+                request.on_launch(
+                    SeatLaunch(
+                        argv=argv,
+                        set_environment=tuple(
+                            sorted(name for name, _ in spec.environment if name not in blanked)
+                        ),
+                        removed_environment=blanked,
+                        in_process=True,
+                    )
+                )
             outcome = self._run(request, run_ref, spec, raw_path, stderr_path)
         ended_at = _now()
         raw = raw_path.read_text(encoding="utf-8")

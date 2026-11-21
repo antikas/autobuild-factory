@@ -188,8 +188,10 @@ def _load_document(profile_path: Path | None) -> tuple[Mapping[str, Any], Path |
     if profile_path is None:
         return {}, None
     resolved = profile_path.expanduser().resolve(strict=False)
-    if not resolved.is_file():
+    if not resolved.exists():
         raise ConfigurationError(f"run profile does not exist: {resolved}")
+    if not resolved.is_file():
+        raise ConfigurationError(f"run profile is not a file: {resolved}")
     try:
         return tomllib.loads(resolved.read_text(encoding="utf-8")), resolved
     except tomllib.TOMLDecodeError as exc:

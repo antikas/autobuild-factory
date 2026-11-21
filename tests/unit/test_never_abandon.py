@@ -33,6 +33,8 @@ from autobuild.domain import (
     ItemDisposition,
     LaneCooling,
     ReviewDecision,
+    ReviewFinding,
+    ReviewVerdict,
     TrackerStop,
     WorktreeStatus,
 )
@@ -115,11 +117,118 @@ def test_a_failed_park_leaves_the_item_unfinished_and_the_campaign_goes_on() -> 
     assert failed[0].payload["worktree_root"] == str(workspace_of("item-1").root)
     report = report_text(ports)
     assert "## Unfinished" in report
-    assert f"- item-1: pinax park exit 5: push rejected (worktree {workspace_of('item-1').root})" in report
+    assert (
+        "- item-1: pinax park exit 5: push rejected; pinax park exit 5: push rejected"
+        f" (worktree {workspace_of('item-1').root})"
+    ) in report
     # A refused park is a tracker failure: the campaign asked the tracker to
     # recover, found it clear and went on without a hold.
     assert tracker.recoveries == 1
     assert not events(ports, "campaign.hold_started")
+
+
+_MERGE_REFUSED = (
+    "integration merge of origin/main did not complete: error: Your local changes to the "
+    "following files would be overwritten by merge: lib.txt"
+)
+
+
+def _review_park(item_id: str):
+    return replace(
+        incomplete_review(item_id),
+        payload=ReviewVerdict(
+            item_id,
+            ReviewDecision.PARK,
+            (ReviewFinding("scope", "needs a decision", f"evidence:{item_id}", True),),
+            f"verdict:{item_id}",
+        ),
+    )
+
+
+def _park_delivery_failing_ports(tracker: FakeTrackerAdapter | None = None):
+    ids = ("item-1", "item-2", "item-3")
+    ports = keyed_ports(ids, reviews={"item-1": _review_park("item-1")})
+    if tracker is not None:
+        ports = replace(ports, tracker=tracker)
+        ports.workspace.on_deliver = (
+            lambda item_id: tracker.mark_done(item_id) if item_id else None
+        )
+    ports.tracker.ready.extend(work(item_id) for item_id in ids)
+    ports.workspace.delivery_errors["item-1"] = AdapterError(_MERGE_REFUSED)
+    return ports
+
+
+def _worktree_lease_released(ports, item_id: str) -> bool:
+    root = str(workspace_of(item_id).root)
+    return any(str(surface.path) == root for surface in ports.lease.released)
+
+
+def test_a_park_whose_delivery_fails_is_recorded_from_the_primary_checkout() -> None:
+    ports = _park_delivery_failing_ports()
+
+    thread, box, _ = run(ports, campaign(3, 4))
+    outcome = finish(thread, box)
+
+    by_id = {entry.item_id: entry for entry in outcome.items}
+    assert outcome.stop_reason is CampaignStopReason.QUEUE_DRY
+    parked = by_id["item-1"]
+    assert parked.disposition is ItemDisposition.PARKED
+    assert "review disposition was park" in (parked.reason or "")
+    assert "lib.txt" in (parked.reason or "")
+    item_calls = [call for call in ports.tracker.park_calls if call[0] == "item-1"]
+    assert item_calls[0][2] == workspace_of("item-1")
+    _, last_reason, last_workspace = item_calls[-1]
+    assert last_workspace is None
+    assert "review disposition was park" in last_reason
+    assert "park delivery failed: " + _MERGE_REFUSED in last_reason
+    assert "[snapshot=evidence/item-1-park]" in last_reason
+    item_events = {
+        event.event_type for event in ports.records.events if event.item_id == "item-1"
+    }
+    assert "item.park_delivery_failed" in item_events
+    assert "item.parked" in item_events
+    assert "item.park_failed" not in item_events
+    failed = [
+        event for event in events(ports, "item.park_delivery_failed") if event.item_id == "item-1"
+    ]
+    assert failed[0].payload["error"] == _MERGE_REFUSED
+    assert failed[0].payload["worktree_root"] == str(workspace_of("item-1").root)
+    emitted = [event for event in events(ports, "item.parked") if event.item_id == "item-1"]
+    assert "lib.txt" in emitted[0].payload["reason"]
+    assert _worktree_lease_released(ports, "item-1")
+    assert "lease-item-1" not in ports.workspace.released
+    assert by_id["item-2"].disposition is ItemDisposition.ACCEPTED
+    assert by_id["item-3"].disposition is ItemDisposition.ACCEPTED
+    assert "## Unfinished" not in report_text(ports)
+
+
+class _PrimaryParkRefusingTracker(FakeTrackerAdapter):
+    def park(self, item_id, reason, actor, workspace=None):
+        if item_id == "item-1" and workspace is None:
+            raise TrackerStop("pinax park exit 5: push rejected", code=5, environment=False)
+        return super().park(item_id, reason, actor, workspace)
+
+
+def test_a_park_whose_delivery_and_primary_fallback_both_fail_is_unfinished() -> None:
+    tracker = _PrimaryParkRefusingTracker(identity("tracker"))
+    ports = _park_delivery_failing_ports(tracker)
+
+    thread, box, _ = run(ports, campaign(3, 4))
+    outcome = finish(thread, box)
+
+    by_id = {entry.item_id: entry for entry in outcome.items}
+    assert by_id["item-1"].disposition is ItemDisposition.FAILED
+    assert by_id["item-2"].disposition is ItemDisposition.ACCEPTED
+    assert by_id["item-3"].disposition is ItemDisposition.ACCEPTED
+    failed = [event for event in events(ports, "item.park_failed") if event.item_id == "item-1"]
+    assert len(failed) == 1
+    error = failed[0].payload["error"]
+    assert error == f"{_MERGE_REFUSED}; pinax park exit 5: push rejected"
+    assert by_id["item-1"].reason == error
+    assert "lease-item-1" not in ports.workspace.released
+    report = report_text(ports)
+    assert "## Unfinished" in report
+    assert f"- item-1: {error} (worktree {workspace_of('item-1').root})" in report
 
 
 def test_lanes_exhausted_holds_until_the_cooling_reset_then_continues() -> None:
@@ -286,7 +395,7 @@ class _BrieflessTracker(FakeTrackerAdapter):
 
 def test_an_item_skipped_without_a_brief_is_recorded_once_and_reported() -> None:
     ports = keyed_ports(("item-1", "item-2"))
-    tracker = _BrieflessTracker(identity("tracker"))
+    tracker = _BrieflessTracker(identity("tracker"), existing={"item-x"})
     tracker.ready.extend([work("item-1"), work("item-2")])
     ports = replace(ports, tracker=tracker)
     ports.workspace.on_deliver = lambda item_id: tracker.mark_done(item_id) if item_id else None

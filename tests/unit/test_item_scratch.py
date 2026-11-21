@@ -119,7 +119,7 @@ def run_two_items(tmp_path: Path) -> tuple[Path, CodexHarnessAdapter, dict[str, 
                 result(
                     outputs,
                     f"{item_id}-reviewer",
-                    message({"decision": "pass", "findings": [], "evidence_ref": f"verdict:{item_id}"}),
+                    message({"decision": "pass", "findings": [], "evidence_ref": f"verdict:{item_id}", "inspected": [], "acceptance": []}),
                 ),
             ]
             for item_id in ITEMS
@@ -218,12 +218,12 @@ def test_two_concurrent_items_share_the_campaign_package_caches(tmp_path: Path) 
 
 
 def test_item_ids_that_clean_to_the_same_name_get_distinct_directories(tmp_path: Path) -> None:
-    slashed = dict(item_scratch_environment(tmp_path / "items", "a/b"))
-    dashed = dict(item_scratch_environment(tmp_path / "items", "a-b"))
+    slashed = dict(item_scratch_environment(tmp_path / "items", "run", "a/b"))
+    dashed = dict(item_scratch_environment(tmp_path / "items", "run", "a-b"))
 
     assert slashed["TMPDIR"] != dashed["TMPDIR"]
     assert basetemp(slashed) != basetemp(dashed)
-    assert dict(item_scratch_environment(tmp_path / "items", "a/b")) == slashed
+    assert dict(item_scratch_environment(tmp_path / "items", "run", "a/b")) == slashed
 
 
 def test_an_inherited_basetemp_is_replaced_and_other_pytest_options_are_kept(
@@ -231,7 +231,7 @@ def test_an_inherited_basetemp_is_replaced_and_other_pytest_options_are_kept(
 ) -> None:
     monkeypatch.setenv("PYTEST_ADDOPTS", "-x --basetemp=/shared/pytest -p no:cacheprovider --basetemp /other")
 
-    environment = dict(item_scratch_environment(tmp_path / "items", "item-a"))
+    environment = dict(item_scratch_environment(tmp_path / "items", "run", "item-a"))
 
     tokens = shlex.split(environment["PYTEST_ADDOPTS"])
     expected = (Path(environment["TMPDIR"]).parent / "pytest").as_posix()

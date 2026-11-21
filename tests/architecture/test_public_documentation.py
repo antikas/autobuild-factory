@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import re
+import textwrap
 import tomllib
 from pathlib import Path
 
 from autobuild.adapters.claude_harness import ClaudeCodeHarnessAdapter
 from autobuild.adapters.codex_harness import CodexHarnessAdapter
 from autobuild.adapters.copilot_harness import CopilotCliHarnessAdapter
+from autobuild.application.campaign import CampaignRunner
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -190,7 +194,7 @@ def test_tracker_commit_hand_over_is_documented_where_coordinators_and_operators
     skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
     rules = (skill_root / "rules.md").read_text(encoding="utf-8")
     guide = (ROOT / "docs" / "running-autobuild.md").read_text(encoding="utf-8")
-    steps = {line.split(".", 1)[0]: line for line in skill.splitlines() if line[:2] in {"1.", "9."}}
+    steps = {line.split(".", 1)[0]: line for line in skill.splitlines() if line[:3] in {"1. ", "10."}}
     tracker_section = skill.split("## Tracker commands", 1)[1].split("\n## ", 1)[0]
 
     assert "never commits `.ergon` by hand" in steps["1"]
@@ -198,8 +202,8 @@ def test_tracker_commit_hand_over_is_documented_where_coordinators_and_operators
     assert "not visible to other machines until it merges" in tracker_section
     assert "states the cause Pinax reports" in tracker_section
     assert "On `BACKLOG.md`, mark the item in progress and commit the change" in steps["1"]
-    assert "Pinax commits the close itself" in steps["9"]
-    assert "On `BACKLOG.md`, set the row to `Done (<commit>)` and commit" in steps["9"]
+    assert "Pinax commits the close itself" in steps["10"]
+    assert "On `BACKLOG.md`, set the row to `Done (<commit>)` and commit" in steps["10"]
     assert "Pinax 0.2.1 or later commits every mutating command itself" in tracker_section
     assert "never stages or commits `.ergon` by hand" in tracker_section
     assert "the coordinator commits the change" in tracker_section
@@ -213,3 +217,40 @@ def test_tracker_commit_hand_over_is_documented_where_coordinators_and_operators
     assert "tracker_environment" in guide and "tracker_refused" in guide
     assert "other machines do not see the claim until the pull request merges" in guide
     assert "the message states the cause Pinax reported" in guide
+
+
+def test_test_commands_use_the_current_uv_certificate_flag() -> None:
+    offending = [
+        f"{name}:{number}"
+        for name in ("AGENTS.md", "README.md", "docs/running-autobuild.md")
+        # AGENTS.md is private context and absent from the public tree.
+        if (ROOT / name).is_file()
+        for number, line in enumerate(
+            (ROOT / name).read_text(encoding="utf-8").splitlines(), start=1
+        )
+        if "--native-tls" in line
+    ]
+    assert offending == [], f"deprecated uv flag --native-tls in: {', '.join(offending)}"
+
+
+def test_campaign_result_lists_every_unbuilt_reason_the_report_can_print() -> None:
+    tree = ast.parse(textwrap.dedent(inspect.getsource(CampaignRunner._unbuilt_reason)))
+    reasons = {
+        node.value.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    assert reasons, "no string literal returned by CampaignRunner._unbuilt_reason"
+
+    guide = (ROOT / "docs" / "running-autobuild.md").read_text(encoding="utf-8")
+    start = guide.index("When the campaign runs with an allow-list")
+    sentence = guide[start : guide.index(".", start)]
+    reason_list = re.sub(r"\s*\([^)]*\)", "", sentence.split(": ", 1)[1])
+    documented = {
+        entry.strip().removeprefix("or ").strip() for entry in reason_list.split(",")
+    }
+
+    missing = sorted(reasons - documented)
+    assert missing == [], f"unbuilt reasons missing from Campaign result: {', '.join(missing)}"

@@ -9,7 +9,9 @@ items can be parked at once. The rules are the only source of the class:
   unrecognised line means ``repository``.
 - Independently, any path under the ``## Declared paths`` heading that resolves
   outside the repository root and the allowed roots forces ``cross-repository``,
-  because such an edit cannot happen inside the worktree fence.
+  because such an edit cannot happen inside the worktree fence. A token that
+  starts with ``/``, has no file extension and names nothing that exists is a
+  route, not a path, and is ignored by every reader of the declared paths.
 """
 
 from __future__ import annotations
@@ -59,15 +61,20 @@ def classify_item_nature(
     class. Otherwise a declared path that escapes the repository root and the
     allowed roots upgrades the class to ``cross-repository``."""
 
-    declared = _declared_class(brief_text)
-    if declared is ItemNature.REPOSITORY and _has_out_of_fence_path(
-        brief_text, repository_root, allowed_roots
+    declared = declared_item_nature(brief_text)
+    if declared is ItemNature.REPOSITORY and out_of_fence_paths(
+        brief_text, repository_root=repository_root, allowed_roots=allowed_roots
     ):
         return ItemNature.CROSS_REPOSITORY
     return declared
 
 
-def _declared_class(brief_text: str) -> ItemNature:
+def declared_item_nature(brief_text: str) -> ItemNature:
+    """The class the brief's ``Item nature:`` line names, before any path check.
+
+    An absent or unrecognised line means ``repository``."""
+
+
     for line in brief_text.splitlines():
         stripped = line.strip()
         if stripped.lower().startswith(_NATURE_LABEL):
@@ -77,13 +84,22 @@ def _declared_class(brief_text: str) -> ItemNature:
     return ItemNature.REPOSITORY
 
 
-def _has_out_of_fence_path(
-    brief_text: str, repository_root: Path, allowed_roots: tuple[Path, ...]
-) -> bool:
+def out_of_fence_paths(
+    brief_text: str,
+    *,
+    repository_root: Path,
+    allowed_roots: tuple[Path, ...] = (),
+) -> tuple[str, ...]:
+    """Every declared path that resolves outside the repository root and the
+    allowed roots, as written and in brief order.
+
+    Any such token upgrades a ``repository`` brief to ``cross-repository``."""
+
     roots = (repository_root, *allowed_roots)
-    return any(
-        _resolves_outside(raw, repository_root, roots)
+    return tuple(
+        raw
         for raw in _declared_paths(brief_text)
+        if _resolves_outside(raw, repository_root, roots)
     )
 
 
@@ -127,7 +143,22 @@ def _declared_paths(brief_text: str) -> tuple[str, ...]:
     section = _section_after_heading(brief_text, _DECLARED_HEADING)
     if section is None:
         return ()
-    return tuple(match.group(1).strip() for match in _BACKTICK_TOKEN.finditer(section))
+    tokens = (match.group(1).strip() for match in _BACKTICK_TOKEN.finditer(section))
+    return tuple(token for token in tokens if not _is_route_token(token))
+
+
+def _is_route_token(token: str) -> bool:
+    """A web route such as ``/account/home`` is written like an absolute path.
+
+    It is told apart from a real declaration when it starts with ``/``, its
+    last segment has no file extension and nothing exists at it, so an existing
+    absolute directory or a missing absolute file still counts as a path."""
+
+    if not token.startswith("/"):
+        return False
+    if "." in token.rstrip("/").rsplit("/", 1)[-1]:
+        return False
+    return not Path(token).exists()
 
 
 def _section_after_heading(brief_text: str, heading: str) -> str | None:
