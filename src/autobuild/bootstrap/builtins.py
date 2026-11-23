@@ -41,6 +41,13 @@ def _models(config: Mapping[str, object]) -> Mapping[str, str] | None:
     return value
 
 
+def _subscription_only(config: Mapping[str, object]) -> bool:
+    value = config.get("subscription_only", False)
+    if not isinstance(value, bool):
+        raise TypeError("subscription_only must be a boolean")
+    return value
+
+
 def register_first_party_harnesses(registry: AdapterRegistry) -> None:
     def claude(config: Mapping[str, object]):
         return ClaudeCodeHarnessAdapter(
@@ -48,14 +55,20 @@ def register_first_party_harnesses(registry: AdapterRegistry) -> None:
             Path(_required(config, "output_root")),
             _command(config, "claude"),
             _models(config),
+            _subscription_only(config),
         )
 
     def codex(config: Mapping[str, object]):
+        prepare = config.get("prepare_argv", ())
+        if not isinstance(prepare, (tuple, list)) or not all(isinstance(part, str) for part in prepare):
+            raise TypeError("prepare_argv must be a string sequence")
         return CodexHarnessAdapter(
             _required(config, "command_port"),
             Path(_required(config, "output_root")),
             _command(config, "codex"),
             _models(config),
+            tuple(prepare),
+            _subscription_only(config),
         )
 
     def claude_sdk(config: Mapping[str, object]):

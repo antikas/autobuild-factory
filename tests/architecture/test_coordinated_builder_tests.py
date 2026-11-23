@@ -16,14 +16,14 @@ BUILDER_VALIDATOR_PHRASES = (
 )
 
 TESTS_RULING_PREFIX = (
-    "TESTS (owner ruling, repeated): run only the test files that cover the files you changed"
+    "TESTS (binding): run only the test files that cover the files you changed"
 )
 
 
 def test_no_coordinated_skill_file_tells_a_builder_to_run_the_validator() -> None:
     offenders = []
     for path in sorted(SKILL.rglob("*")):
-        if not path.is_file():
+        if not path.is_file() or "__pycache__" in path.parts:
             continue
         text = path.read_text(encoding="utf-8")
         for phrase in BUILDER_VALIDATOR_PHRASES:
@@ -35,3 +35,8 @@ def test_no_coordinated_skill_file_tells_a_builder_to_run_the_validator() -> Non
 def test_builder_brief_carries_the_focused_tests_ruling() -> None:
     brief = (SKILL / "templates" / "builder-brief.md").read_text(encoding="utf-8")
     assert any(line.startswith(TESTS_RULING_PREFIX) for line in brief.splitlines())
+
+
+def test_builder_brief_uses_no_internal_ruling_phrase() -> None:
+    brief = (SKILL / "templates" / "builder-brief.md").read_text(encoding="utf-8")
+    assert "owner ruling" not in brief

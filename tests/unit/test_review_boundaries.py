@@ -7,16 +7,16 @@ mode ignores the map."""
 
 from __future__ import annotations
 
-import re
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_process_mode import BASE, STRICT, load, strict_policy
+from test_process_mode import BASE, STRICT, documented_profiles, load, strict_policy
 from test_workflows import builder, campaign, command, make_ports, review, spec
 
 from autobuild.application import ItemWorkflow
 from autobuild.application import item as item_module
+from autobuild.application.prompts import BUILDER_REPORT_SENTENCE, NO_BUILDER_REPORT_SENTENCE
 from autobuild.bootstrap.profile import ConfigurationError
 from autobuild.domain import (
     ChangedPath,
@@ -27,7 +27,13 @@ from autobuild.domain import (
     ReviewVerdict,
     Seat,
 )
-from autobuild.domain.models import ProcessMode, ProcessPolicy, ReviewBoundary, ReviewFinding
+from autobuild.domain.models import (
+    ProcessMode,
+    ProcessPolicy,
+    ResumePlan,
+    ReviewBoundary,
+    ReviewFinding,
+)
 from autobuild.enforcement.review_scope import BLIND_REVIEWER, ReviewSeat, review_seats
 
 SIGN_IN = ReviewBoundary("sign-in", ("src/app/auth/**",), "docs/invariants/sign-in.md")
@@ -78,17 +84,12 @@ def test_the_boundary_map_loads_and_is_checked_in_flow(tmp_path: Path) -> None:
 
 
 def test_the_documented_boundary_example_loads(tmp_path: Path) -> None:
-    guide = (Path(__file__).parents[2] / "docs" / "running-autobuild.md").read_text(encoding="utf-8")
-    block = next(
-        block
-        for block in re.findall(r"```toml\n(.*?)\n```", guide, re.DOTALL)
-        if block.startswith("[process.boundaries.")
+    examples = documented_profiles(
+        tmp_path, lambda profile: "boundaries" in profile.get("process", {})
     )
 
-    boundaries = load(tmp_path, BASE + STRICT + "\n" + block + "\n").process.boundaries
-
-    assert [boundary.name for boundary in boundaries] == [
-        "sign-in", "payments", "personal-data", "schema",
+    assert [example.process.boundaries for example in examples] == [
+        (ReviewBoundary("payments", ("src/payments/*.py",), "docs/invariants/payments.md"),)
     ]
 
 
@@ -287,6 +288,9 @@ def test_a_boundary_specialist_gets_the_builder_report_its_blind_reviewer_got() 
     assert report in sign_in.context_refs
     assert "docs/invariants/sign-in.md" in sign_in.context_refs
     assert "raw:builder" not in sign_in.context_refs
+    assert BUILDER_REPORT_SENTENCE in sign_in.instructions
+    assert report in sign_in.instructions
+    assert NO_BUILDER_REPORT_SENTENCE not in sign_in.instructions
 
 
 def test_a_boundary_without_an_invariants_file_says_so() -> None:
@@ -369,6 +373,31 @@ def test_the_combined_evidence_of_the_first_review_is_named_round_one() -> None:
     assert [event.evidence_refs[0] for event in combined] == [
         f"evidence:{item_id}-review-round-1"
     ]
+
+
+def test_a_resumed_item_past_the_build_keeps_its_marker_round_count() -> None:
+    ports = make_ports(
+        [review(ReviewDecision.PASS), review(ReviewDecision.PASS, "sign-in")],
+        [command()],
+        1,
+    )
+    work = replace(spec(brief_text=brief("src/app/auth/login.py")), process=bounded())
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(),
+        work,
+        ports.records.create(campaign()),
+        resume=ResumePlan("built", Path("/worktree"), 1, "run-old"),
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert seat_names(ports) == ["reviewer", "specialist"]
+    combined = [e for e in ports.records.events if e.event_type == "review.combined"]
+    item_id = spec().item.item_id
+    assert [event.evidence_refs[0] for event in combined] == [
+        f"evidence:{item_id}-review-round-2"
+    ]
+    assert f"{item_id}-review-round-1" not in ports.records.evidence
 
 
 def test_the_review_after_one_correction_is_named_round_two() -> None:

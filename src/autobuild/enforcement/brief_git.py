@@ -23,27 +23,37 @@ an index delivery cannot add. The rules:
 - A part is the text of a clause between commas outside code spans. A prose
   invocation is refused only when its part gives an order. After leading list
   markers (``-``, ``*``, ``+``, a number) and the leading connectives and, or,
-  then, so, also, first, next, finally, now, please and afterwards, the part
-  gives an order when its first word is an imperative verb (add, amend, apply,
-  be, call, commit, delete, do, ensure, execute, finish, invoke, make, move,
-  remember, remove, rename, reset, revert, run, stage, stash, start, unstage,
-  use); when the clause holds, before the invocation, must, should, shall, need,
-  needs, "have to" or "has to"; when the clause is a present-tense passive, that
-  is it holds is, are or be before the invocation and the word directly before
-  the invocation, or before its code span, is with, by, using, via or through;
-  when the part holds nothing but the invocation; or when a connective was
-  stripped and the invocation is the part's first token. Any other prose
-  invocation, including past narration such as "were staged by" or "the patch
-  applied with", is a report of what was done and passes.
+  then, so, also, first, next, finally, now, please, afterwards and afterward,
+  the part gives an order when its first word is an imperative verb (add,
+  amend, apply, be, call, commit, delete, do, ensure, execute, finish, invoke,
+  make, move, remember, remove, rename, reset, retire, revert, run, stage,
+  stash, start, unstage, use); when the clause holds, before the invocation,
+  must, should, shall, need, needs, "have to" or "has to"; when the clause is a
+  present-tense passive, that is it holds is, are, be, get or gets before the
+  word directly before the invocation, or before its code span, and that word
+  is with, by, using, via or through or ends with ``(``; when the part is an
+  elliptical passive, its first word ending in -ed, then an instrument word,
+  then the invocation, as in "removed with `git rm`"; when the part's words
+  before the invocation start with "the builder" or "builder" and a verb ending
+  in s other than is, was and has, as in "The builder runs"; when the part
+  holds nothing but the invocation; or when a connective was stripped and the
+  invocation is the part's first token, unless the invocation is in a code
+  span and the next token in the part is a word of three or more letters
+  ending in s other than this, thus, plus and unless, which makes the command
+  the subject of a report ("so `git commit` finds nothing"). Any other prose
+  invocation, including past narration such as "were staged by", "the patch
+  applied with" or "The builder ran", is a report of what was done and passes.
 - An invocation is exempt when its clause holds, before it, one of the words
-  never, not, no, nor or without, or a word ending in n't. A line whose first
-  non-blank character is ``>`` is a quotation and is exempt. Inside a fenced
-  code block every line is one clause, every invocation counts as an order and
-  no word in it exempts it.
+  never, not, no, nor or without, or a word ending in n't. A clause that
+  directly follows a colon closing a one-word label, that word a negation word
+  or forbidden, prohibited or banned, is exempt, as in "Forbidden: git commit";
+  a negation in a longer clause does not reach across a colon. A line whose
+  first non-blank character is ``>`` is a quotation and is exempt. Inside a
+  fenced code block every line is one clause, every invocation counts as an
+  order and no word in it exempts it.
 
-The reader does not see an order phrased without a listed verb, modal or bare
-command, such as "The builder runs `git add -A` at the end." or "When done,
-`git add -A` and finish."
+The reader does not see an order phrased without a listed verb, modal, builder
+subject or bare command, such as "When done, `git add -A` and finish."
 """
 
 from __future__ import annotations
@@ -64,19 +74,23 @@ _LIST_MARKER = re.compile(r"[-*+]|\(?\d+[.)]?")
 _CONNECTIVES = frozenset(
     {
         "and", "or", "then", "so", "also", "first", "next", "finally", "now", "please",
-        "afterwards",
+        "afterwards", "afterward",
     }
 )
 _IMPERATIVES = frozenset(
     {
         "add", "amend", "apply", "be", "call", "commit", "delete", "do", "ensure",
         "execute", "finish", "invoke", "make", "move", "remember", "remove", "rename",
-        "reset", "revert", "run", "stage", "stash", "start", "unstage", "use",
+        "reset", "retire", "revert", "run", "stage", "stash", "start", "unstage", "use",
     }
 )
 _MODALS = frozenset({"must", "should", "shall", "need", "needs"})
 _MODAL_PAIRS = frozenset({("have", "to"), ("has", "to")})
-_PASSIVE_AUXILIARIES = frozenset({"is", "are", "be"})
+_PASSIVE_AUXILIARIES = frozenset({"is", "are", "be", "get", "gets"})
+_LABELS = frozenset({"forbidden", "prohibited", "banned"})
+_NOT_PRESENT_VERBS = frozenset({"is", "was", "has"})
+_NOT_REPORT_VERBS = frozenset({"this", "thus", "plus", "unless"})
+_LETTERS = re.compile(r"[a-z]+")
 _INSTRUMENTS = frozenset({"with", "by", "using", "via", "through"})
 _WORD = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*")
 _WORD_EDGES = re.compile(r"^[^A-Za-z]+|[^A-Za-z]+$")
@@ -132,7 +146,7 @@ def git_staging_lines(brief_text: str) -> tuple[GitStagingLine, ...]:
             clauses = [[_Token(text, None) for text in line.split()]]
             in_prose = False
         else:
-            clauses = _clauses(line)
+            clauses = _unlabelled(*_clauses(line))
             in_prose = True
         invocations = [
             invocation
@@ -145,8 +159,12 @@ def git_staging_lines(brief_text: str) -> tuple[GitStagingLine, ...]:
     return tuple(found)
 
 
-def _clauses(line: str) -> list[list[_Token]]:
+def _clauses(line: str) -> tuple[list[list[_Token]], list[str]]:
+    """The clauses of a prose line and, for every clause but the last, the mark
+    that ended it."""
+
     clauses: list[list[_Token]] = [[]]
+    ends: list[str] = []
     part = 0
     span_index = 0
     segments = _segments(line)
@@ -166,10 +184,25 @@ def _clauses(line: str) -> list[list[_Token]]:
             if match.group(0) == ",":
                 part += 1
             else:
+                ends.append(match.group(0))
                 clauses.append([])
                 part = 0
         clauses[-1].extend(_Token(word, None, part) for word in text[start:].split())
-    return clauses
+    return clauses, ends
+
+
+def _unlabelled(clauses: list[list[_Token]], ends: list[str]) -> list[list[_Token]]:
+    """Drop every clause that follows a one-word prohibition label and its colon."""
+
+    kept = [clauses[0]]
+    for label, end, clause in zip(clauses, ends, clauses[1:]):
+        if not (end == ":" and len(label) == 1 and _is_prohibition(label[0])):
+            kept.append(clause)
+    return kept
+
+
+def _is_prohibition(token: _Token) -> bool:
+    return token.span is None and (_is_negation(token.text) or _word(token) in _LABELS)
 
 
 def _ends_clause(text: str, dot: int, at_line_end: bool) -> bool:
@@ -274,7 +307,14 @@ def _gives_order(clause: list[_Token], index: int) -> bool:
     first = part[lead]
     if _word(clause[first]) in _IMPERATIVES:
         return True
+    start = _span_start(clause, index)
+    if _is_elliptical_passive(clause, part[lead:], start):
+        return True
+    if _is_builder_subject(clause, part[lead:], index):
+        return True
     if first != index:
+        return False
+    if stripped and _is_report_subject(clause, part[lead:], git):
         return False
     bare = git.span is None or all(
         clause[position].span == git.span for position in part[lead:]
@@ -282,15 +322,64 @@ def _gives_order(clause: list[_Token], index: int) -> bool:
     return stripped or bare
 
 
-def _is_present_passive(clause: list[_Token], index: int, words: list[str]) -> bool:
+def _span_start(clause: list[_Token], index: int) -> int:
     git = clause[index]
     start = index
     if git.span is not None:
         while start > 0 and clause[start - 1].span == git.span:
             start -= 1
+    return start
+
+
+def _is_elliptical_passive(clause: list[_Token], rest: list[int], start: int) -> bool:
+    if len(rest) < 3 or rest[2] != start:
+        return False
+    verb, instrument = clause[rest[0]], clause[rest[1]]
+    return (
+        verb.span is None
+        and instrument.span is None
+        and _word(verb).endswith("ed")
+        and _word(instrument) in _INSTRUMENTS
+    )
+
+
+def _is_builder_subject(clause: list[_Token], rest: list[int], index: int) -> bool:
+    words = []
+    for position in rest:
+        if position >= index or clause[position].span is not None:
+            break
+        words.append(_word(clause[position]))
+    if words[:1] == ["the"]:
+        words = words[1:]
+    if len(words) < 2 or words[0] != "builder":
+        return False
+    return words[1].endswith("s") and words[1] not in _NOT_PRESENT_VERBS
+
+
+def _is_report_subject(clause: list[_Token], rest: list[int], git: _Token) -> bool:
+    """A command in a code span directly followed by a present-tense verb ending
+    in s is that verb's subject, so the clause reports what the command does."""
+
+    if git.span is None:
+        return False
+    after = [position for position in rest if clause[position].span != git.span]
+    if not after or clause[after[0]].span is not None:
+        return False
+    word = _word(clause[after[0]])
+    return (
+        _LETTERS.fullmatch(word) is not None
+        and len(word) >= 3
+        and word.endswith("s")
+        and word not in _NOT_REPORT_VERBS
+    )
+
+
+def _is_present_passive(clause: list[_Token], index: int, words: list[str]) -> bool:
+    start = _span_start(clause, index)
     if start == 0 or clause[start - 1].span is not None:
         return False
-    if _word(clause[start - 1]) not in _INSTRUMENTS:
+    before = clause[start - 1]
+    if _word(before) not in _INSTRUMENTS and not before.text.endswith("("):
         return False
     return any(word in _PASSIVE_AUXILIARIES for word in words[: start - 1])
 

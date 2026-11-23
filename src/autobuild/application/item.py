@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -33,6 +35,7 @@ from autobuild.domain import (
     ItemNature,
     ItemOutcome,
     ItemState,
+    LaneCooling,
     LaneSignal,
     LaneSignalKind,
     LanesExhausted,
@@ -64,6 +67,7 @@ from autobuild.domain import (
     validator_command_id,
 )
 from autobuild.domain.models import (
+    BriefDefect,
     BuilderContinuation,
     SeatLaunch,
     DeliveryParked,
@@ -79,6 +83,7 @@ from autobuild.enforcement import (
     classify_item_nature,
     git_staging_lines,
 )
+from autobuild.enforcement.brief_file import brief_park_reason
 from autobuild.enforcement.pressure import PATIENT_LOOKBACK_SECONDS, stretched_seat_cap
 from autobuild.enforcement.review_scope import (
     BLIND_REVIEWER,
@@ -169,7 +174,9 @@ def _stderr_ref(diagnostics: tuple[str, ...]) -> str:
 
 # A seat whose meter cannot be read under the refuse policy waits this long
 # before the meter is read again, at most this many times, and then ends the
-# item with this signature. The lane is never cooled for a meter failure.
+# item with this signature. A seat held on a failed reading after the warning
+# level re-reads at the same interval. The lane is never cooled for a meter
+# failure.
 USAGE_RETRY_SECONDS = 300.0
 USAGE_RETRY_ATTEMPTS = 3
 USAGE_UNAVAILABLE_SIGNATURE = "usage_meter_unavailable"
@@ -186,6 +193,48 @@ def _limit_payload(limit: UsageLimit) -> dict[str, object]:
     }
 
 
+def _instant(moment: str | None) -> datetime | None:
+    if not moment:
+        return None
+    try:
+        parsed = datetime.fromisoformat(moment)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _already_reset(limit: UsageLimit, reading: UsageReading) -> bool:
+    """True when the limit's window reset at or before the reading was taken,
+    so its percent no longer describes the meter's usage."""
+
+    reset = _instant(limit.resets_at)
+    fetched = _instant(reading.fetched_at)
+    return reset is not None and fetched is not None and reset <= fetched
+
+
+def _worst_limit(policy: UsagePolicy, reading: UsageReading) -> UsageLimit:
+    """The reading's limit nearest its stop: a limit at its stop before any
+    other, then the highest percent."""
+
+    return max(
+        reading.limits,
+        key=lambda limit: (limit.percent >= policy.stop_for(limit.kind), limit.percent),
+    )
+
+
+def reading_age_seconds(timestamp: str, fetched_at: str) -> int | None:
+    """Whole seconds from a reading's fetch time to the run record's
+    ``timestamp``, or None when either instant cannot be read."""
+
+    if not fetched_at:
+        return None
+    try:
+        age = datetime.fromisoformat(timestamp) - datetime.fromisoformat(fetched_at)
+        return round(age.total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 class _UsageGate:
     """The per-campaign usage meter reader for metered lanes.
 
@@ -197,14 +246,30 @@ class _UsageGate:
     ``USAGE_READING_SECONDS``. When it has aged out, one seat fetches the next
     reading while the others keep judging the previous one; seats wait only
     when the lane has no good reading at all. A failed reading is never shared.
-    Every seat still judges a reading against the levels itself."""
+    Every seat still judges a reading against the levels itself.
+
+    Per meter id it also keeps the last good reading with a limit at or above
+    the warning level whose window had not already reset when it was read, so a later failed reading on that meter holds the seat
+    instead of admitting it."""
 
     __slots__ = (
-        "_meter", "policy", "wait", "_clock", "_warned", "_readings", "_refreshing", "_changed"
+        "_meter",
+        "policy",
+        "wait",
+        "_clock",
+        "_warned",
+        "_readings",
+        "_refreshing",
+        "_changed",
+        "_at_warning",
+        "_timestamp",
     )
 
-    def __init__(self, meter, policy: UsagePolicy, wait, clock) -> None:
+    def __init__(self, meter, policy: UsagePolicy, wait, clock, timestamp=None) -> None:
         self._meter = meter
+        # The run record's clock, so a reading's age is judged on the same
+        # clock that stamps the event carrying it.
+        self._timestamp = timestamp
         self.policy = policy
         self.wait = wait
         self._clock = clock
@@ -213,15 +278,39 @@ class _UsageGate:
         self._readings: dict[str, tuple[float, UsageReading]] = {}
         self._refreshing: set[str] = set()
         self._changed = Condition()
+        # Meter id -> the last good reading with a limit at or above warn_percent.
+        self._at_warning: dict[str, UsageReading] = {}
 
-    def assess(self, lane: Lane, emit) -> UsageAssessment:
+    def assess(self, lane: Lane, emit, seat: str | None = None) -> UsageAssessment:
         meter_id = lane.meter_id or ""
         assessment = self.policy.assess_meter(
             lambda requested: self._reading(lane.name, requested), meter_id
         )
         if assessment.reading.ok:
-            self._warn(lane, meter_id, assessment, emit)
+            if any(not _already_reset(limit, assessment.reading) for limit in assessment.warnings):
+                with self._changed:
+                    self._at_warning[meter_id] = assessment.reading
+            self._warn(lane, meter_id, assessment, emit, seat)
         return assessment
+
+    def last_at_warning(self, meter_id: str) -> UsageReading | None:
+        """The meter's last good reading at or above the warning level in this
+        run, or None when it has had none."""
+
+        with self._changed:
+            return self._at_warning.get(meter_id)
+
+    def now(self) -> float:
+        return self._clock()
+
+    def reading_age(self, reading: UsageReading) -> int | None:
+        if self._timestamp is None:
+            return None
+        try:
+            timestamp = self._timestamp()
+        except Exception:
+            return None
+        return reading_age_seconds(timestamp, reading.fetched_at)
 
     def _reading(self, lane_name: str, meter_id: str) -> UsageReading:
         with self._changed:
@@ -255,7 +344,9 @@ class _UsageGate:
             held = self._readings.get(lane_name)
         return held[1] if held is not None else None
 
-    def _warn(self, lane: Lane, meter_id: str, assessment: UsageAssessment, emit) -> None:
+    def _warn(
+        self, lane: Lane, meter_id: str, assessment: UsageAssessment, emit, seat: str | None
+    ) -> None:
         current = {(limit.kind.value, limit.scope): limit for limit in assessment.warnings}
         with self._changed:
             before = self._warned.get(meter_id, frozenset())
@@ -268,8 +359,10 @@ class _UsageGate:
                 {
                     "lane": lane.name,
                     "meter_id": meter_id,
+                    "seat": seat,
                     "warn_percent": self.policy.warn_percent,
                     **_limit_payload(limit),
+                    "reading_age_seconds": self.reading_age(assessment.reading),
                 },
             )
 
@@ -278,7 +371,9 @@ class _LaneRouter:
     """Ordered lane selection and cooling for one item run.
 
     The router walks the configured lanes in preference order, skipping any lane
-    the shared lane state reports as cooled. A structural signal cools the
+    the shared lane state reports as cooled. A lane cooled for usage is first
+    re-judged through ``usage_cleared``, which clears a cooling whose lane now
+    reads below this run's stop levels. A structural signal cools the
     current lane and moves the router to the next capable one; when none remains
     it raises ``LanesExhausted`` carrying the signature the item parks under.
 
@@ -290,6 +385,7 @@ class _LaneRouter:
         "_state",
         "_campaign_id",
         "_emit",
+        "_usage_cleared",
         "_index",
         "_last_signature",
         "builder_lane",
@@ -300,11 +396,12 @@ class _LaneRouter:
         "builder_reports",
     )
 
-    def __init__(self, lanes, lane_state, campaign_id, emit) -> None:
+    def __init__(self, lanes, lane_state, campaign_id, emit, usage_cleared=None) -> None:
         self._lanes: tuple[Lane, ...] = lanes
         self._state = lane_state
         self._campaign_id = campaign_id
         self._emit = emit
+        self._usage_cleared = usage_cleared
         self._index = 0
         self._last_signature = "lanes_exhausted"
         self.builder_lane: str | None = None
@@ -321,8 +418,15 @@ class _LaneRouter:
         self.builder_report_ref: str | None = None
         self.builder_reports = 0
 
-    def _cooled(self, name: str) -> bool:
-        return self._state is not None and self._state.active(name) is not None
+    def _cooled(self, lane: Lane) -> bool:
+        if self._state is None:
+            return False
+        cooling = self._state.active(lane.name)
+        if cooling is None:
+            return False
+        if cooling.signature != LaneSignalKind.USAGE.value or self._usage_cleared is None:
+            return True
+        return not self._usage_cleared(lane, cooling, self._emit)
 
     def current_lane(self, skip: frozenset[str] = frozenset()) -> Lane:
         """The first capable lane from the router's position.
@@ -337,7 +441,7 @@ class _LaneRouter:
             lane = self._lanes[index]
             if lane.name in skip:
                 committed = False
-            elif not self._cooled(lane.name):
+            elif not self._cooled(lane):
                 if committed:
                     self._index = index
                 return lane
@@ -385,6 +489,19 @@ class _ParkGuard:
 
     def __init__(self) -> None:
         self.leave_worktree = False
+
+
+@dataclass(slots=True)
+class _BuilderReservation:
+    """The atomic builder-capacity lease held across claim and first launch."""
+
+    context: object | None
+    lane: Lane
+
+    def close(self) -> None:
+        context, self.context = self.context, None
+        if context is not None:
+            context.__exit__(None, None, None)
 
 
 @dataclass(slots=True)
@@ -748,7 +865,11 @@ class ItemWorkflow:
         # tracked across every item of a campaign.
         self._usage = (
             _UsageGate(
-                ports.usage_meter, ports.usage_policy, ports.usage_retry_wait, ports.usage_clock
+                ports.usage_meter,
+                ports.usage_policy,
+                ports.usage_retry_wait,
+                ports.usage_clock,
+                ports.records.timestamp,
             )
             if ports.usage_meter is not None and ports.usage_policy is not None
             else None
@@ -789,6 +910,50 @@ class ItemWorkflow:
             return False
         assessment = gate.policy.assess(reading)
         return not assessment.failure and bool(assessment.warnings)
+
+    def usage_cooling_cleared(self, lane: Lane, cooling: LaneCooling, emit) -> bool:
+        """Re-judge a lane's usage cooling against this run's stop levels.
+
+        The cooling may have been written by another campaign, or under stop
+        levels the owner has since raised. The lane's reading is taken through
+        the shared usage gate; when it is good and every limit is below its stop
+        level in this run's profile, the cooling is cleared from the shared lane
+        state, ``lane.usage_cooling_cleared`` is emitted and True is returned.
+        A failed reading, a limit at its stop, an unmetered lane, a run without
+        ``[usage]`` or a cooling that changed meanwhile leaves it in force."""
+
+        gate = self._usage
+        state = self._ports.lane_state
+        if (
+            gate is None
+            or state is None
+            or not lane.meter_id
+            or cooling.signature != LaneSignalKind.USAGE.value
+        ):
+            return False
+        assessment = gate.assess(lane, emit)
+        if assessment.failure:
+            return False
+        limits = assessment.reading.limits
+        if any(limit.percent >= gate.policy.stop_for(limit.kind) for limit in limits):
+            return False
+        try:
+            cleared = state.clear(lane.name, cooling)
+        except Exception:
+            return False
+        if not cleared:
+            return False
+        emit(
+            "lane.usage_cooling_cleared",
+            {
+                "lane": lane.name,
+                "meter_id": lane.meter_id,
+                "campaign_id": cooling.campaign_id,
+                "cooled_until": cooling.cooled_until,
+                "percent": max((limit.percent for limit in limits), default=None),
+            },
+        )
+        return True
 
     def _deliver(
         self,
@@ -879,6 +1044,7 @@ class ItemWorkflow:
         workspace: WorkspaceRef | None = None
         worktree_grant: LeaseGrant | None = None
         claimed = False
+        builder_reservation: _BuilderReservation | None = None
         # True once the item branch holds the item's product commit, so a park
         # is recorded from the primary checkout and never delivered from the
         # worktree, which would publish that commit.
@@ -894,9 +1060,11 @@ class ItemWorkflow:
             lambda event_type, payload: self._event(
                 record, event_type, spec.item.item_id, payload=payload
             ),
+            self.usage_cooling_cleared,
         )
         if resume is not None:
             router.builder_raises = resume.builder_raises
+            router.builder_reports = resume.builder_reports
         try:
             if resume is not None:
                 claimed = True
@@ -929,6 +1097,11 @@ class ItemWorkflow:
                     spec, workspace, machine, marker, record, seats, router, resume
                 )
             else:
+                if spec.brief_defect is not None:
+                    result = self._park_by_brief_defect(
+                        spec, machine, marker, record, seats, guard, spec.brief_defect
+                    )
+                    return result
                 nature = classify_item_nature(
                     spec.brief_text,
                     repository_root=campaign.repository,
@@ -946,7 +1119,29 @@ class ItemWorkflow:
                     )
                     return result
                 self._advance(machine, marker, ItemState.VERIFIED)
-                start_lane = router.current_lane().name
+                routing = self._ports.subscription_admission
+                if routing is None:
+                    start_lane = router.current_lane().name
+                else:
+                    def record_admission(decision):
+                        self._event(
+                            record,
+                            "subscription.admission",
+                            spec.item.item_id,
+                            payload={"seat": Seat.BUILDER.value, **decision},
+                        )
+
+                    context = routing.reserve(
+                        spec.builder_model_class,
+                        spec.seat_timeout_seconds,
+                        on_decision=record_admission,
+                    )
+                    lane = context.__enter__()
+                    if lane is None:
+                        context.__exit__(None, None, None)
+                        raise LanesExhausted("subscription-admission", "")
+                    builder_reservation = _BuilderReservation(context, lane)
+                    start_lane = lane.name
                 claim_actor = self._lane_actor(start_lane)
                 receipt = self._ports.tracker.claim(spec.item, actor=claim_actor)
                 claimed = True
@@ -987,8 +1182,17 @@ class ItemWorkflow:
                 )
 
                 verdict, diff, validation = self._build_validate_review(
-                    spec, workspace, machine, marker, record, seats, router, context_refs=()
+                    spec,
+                    workspace,
+                    machine,
+                    marker,
+                    record,
+                    seats,
+                    router,
+                    context_refs=(),
+                    initial_builder_reservation=builder_reservation,
                 )
+                builder_reservation = None
                 self._note_builder_lane_change(spec, record, start_lane, router)
                 corrections = 0
             lane = self._review_lane(spec, diff, None)
@@ -1193,6 +1397,8 @@ class ItemWorkflow:
             )
             return result
         finally:
+            if builder_reservation is not None:
+                builder_reservation.close()
             if guard.leave_worktree:
                 # A kept worktree is evidence; no writer is left in it.
                 worktree_grant = self._release_worktree_lease(worktree_grant, record)
@@ -1328,6 +1534,7 @@ class ItemWorkflow:
             continuations=continuation,
             builder_raises=router.builder_raises,
             builder_context_refs=router.builder_context_refs,
+            builder_reports=router.builder_reports,
         )
         self._event(
             record,
@@ -1559,11 +1766,21 @@ class ItemWorkflow:
         router: _LaneRouter,
         context_refs: tuple[str, ...],
         continuation: bool = False,
+        initial_builder_reservation: _BuilderReservation | None = None,
     ) -> tuple[ReviewVerdict, DiffEvidence, ValidationEvidence]:
         """Build, validate and review one candidate."""
 
         diff, validation, output_ref = self._build_validate(
-            spec, workspace, machine, marker, record, seats, router, context_refs, continuation
+            spec,
+            workspace,
+            machine,
+            marker,
+            record,
+            seats,
+            router,
+            context_refs,
+            continuation,
+            initial_builder_reservation=initial_builder_reservation,
         )
         verdict = self._review(
             spec, workspace, machine, marker, record, seats, router, diff, output_ref
@@ -1582,6 +1799,7 @@ class ItemWorkflow:
         context_refs: tuple[str, ...],
         continuation: bool = False,
         build: bool = True,
+        initial_builder_reservation: _BuilderReservation | None = None,
     ) -> tuple[DiffEvidence, ValidationEvidence, str]:
         """Build and validate one candidate; return its diff, its validation
         and the validator output reference. With ``build`` false the candidate
@@ -1597,8 +1815,9 @@ class ItemWorkflow:
             if build:
                 self._run_builder(
                     spec, workspace, machine, marker, record, seats, router, context_refs,
-                    continuation,
+                    continuation, initial_builder_reservation,
                 )
+                initial_builder_reservation = None
             build = True
             try:
                 return self._validate(spec, workspace, machine, marker, record)
@@ -1649,34 +1868,45 @@ class ItemWorkflow:
         router: _LaneRouter,
         context_refs: tuple[str, ...],
         continuation: bool = False,
+        initial_builder_reservation: _BuilderReservation | None = None,
     ) -> None:
         brief_path = self._workspace_brief(spec, workspace)
         builder_policy = self._workspace_policy(spec.tool_policy, workspace)
         router.builder_context_refs = context_refs
-        builder = self._invoke_seat(
-            router,
-            record,
-            seats,
-            spec,
-            SeatRequest(
-                run_id=record.run_id,
-                item_id=spec.item.item_id,
-                seat=Seat.BUILDER,
-                model_class=spec.builder_model_class,
-                brief_path=brief_path,
-                workspace=workspace,
-                tool_policy=builder_policy,
-                instructions=render_seat_instructions(
-                    spec, Seat.BUILDER, context_refs, brief_path, continuation
+        try:
+            builder = self._invoke_seat(
+                router,
+                record,
+                seats,
+                spec,
+                SeatRequest(
+                    run_id=record.run_id,
+                    item_id=spec.item.item_id,
+                    seat=Seat.BUILDER,
+                    model_class=spec.builder_model_class,
+                    brief_path=brief_path,
+                    workspace=workspace,
+                    tool_policy=builder_policy,
+                    instructions=render_seat_instructions(
+                        spec, Seat.BUILDER, context_refs, brief_path, continuation
+                    ),
+                    result_contract="builder-report-v1",
+                    timeout_seconds=spec.seat_timeout_seconds,
+                    context_refs=context_refs,
+                    brief_ref=spec.item.brief_ref,
+                    progress_deadline_seconds=spec.seat_stall_seconds,
+                    progress_digest=self._progress_digest(workspace),
+                    test_guard=seat_test_guard(spec, Seat.BUILDER),
                 ),
-                result_contract="builder-report-v1",
-                timeout_seconds=spec.seat_timeout_seconds,
-                context_refs=context_refs,
-                progress_deadline_seconds=spec.seat_stall_seconds,
-                progress_digest=self._progress_digest(workspace),
-                test_guard=seat_test_guard(spec, Seat.BUILDER),
-            ),
-        )
+                reserved_lane=(
+                    initial_builder_reservation.lane
+                    if initial_builder_reservation is not None
+                    else None
+                ),
+            )
+        finally:
+            if initial_builder_reservation is not None:
+                initial_builder_reservation.close()
         if builder.outcome is not SeatOutcome.SUCCEEDED:
             raise self._seat_failure(Seat.BUILDER, builder)
         if not isinstance(builder.payload, BuilderReport):
@@ -1753,6 +1983,7 @@ class ItemWorkflow:
                 result_contract="review-verdict-v1",
                 timeout_seconds=spec.seat_timeout_seconds,
                 context_refs=evidence,
+                brief_ref=spec.item.brief_ref,
                 progress_deadline_seconds=spec.seat_stall_seconds,
                 progress_digest=self._progress_digest(workspace),
             ),
@@ -1947,6 +2178,7 @@ class ItemWorkflow:
                 result_contract="review-verdict-v1",
                 timeout_seconds=spec.seat_timeout_seconds,
                 context_refs=refs,
+                brief_ref=spec.item.brief_ref,
                 progress_deadline_seconds=spec.seat_stall_seconds,
                 progress_digest=self._progress_digest(workspace),
             ),
@@ -2131,6 +2363,7 @@ class ItemWorkflow:
                 result_contract="review-verdict-v1",
                 timeout_seconds=spec.seat_timeout_seconds,
                 context_refs=(triggering.evidence_ref,),
+                brief_ref=spec.item.brief_ref,
                 progress_deadline_seconds=spec.seat_stall_seconds,
                 progress_digest=self._progress_digest(workspace),
             ),
@@ -2197,6 +2430,8 @@ class ItemWorkflow:
         seats: list[SeatObservation],
         spec: ItemExecutionSpec,
         request: SeatRequest,
+        *,
+        reserved_lane: Lane | None = None,
     ) -> SeatResult:
         """Invoke one seat, moving lanes on a structural limit signal.
 
@@ -2211,32 +2446,49 @@ class ItemWorkflow:
 
         skip: set[str] = set()
         while True:
-            lane = router.current_lane(frozenset(skip))
-            if not self._usage_admits(router, record, lane, request, skip):
-                continue
-            extension = self._seat_stretch(request.timeout_seconds)
-            effort = spec.seat_effort(request.seat, lane.name)
-            if request.seat is Seat.BUILDER:
-                effort = raised_effort(effort, router.builder_raises)
-            attempt = replace(
-                request,
-                effort=effort,
-                timeout_extension=extension,
-                on_launch=self._launch_recorder(record, request, lane.name),
-            )
-            self._event(
-                record,
-                "seat.started",
-                attempt.item_id,
-                payload={
-                    "seat": attempt.seat.value,
-                    "model_class": attempt.model_class,
-                    "model": lane.models.get(attempt.model_class, ""),
-                    "effort": attempt.effort.value if attempt.effort is not None else None,
-                    "lane": lane.name,
-                },
-            )
-            result = lane.harness.invoke(attempt)
+            routing = self._ports.subscription_admission
+            if reserved_lane is not None:
+                reservation = nullcontext(reserved_lane)
+            elif routing is None:
+                lane = router.current_lane(frozenset(skip))
+                if not self._usage_admits(router, record, lane, request, skip):
+                    continue
+                reservation = nullcontext(lane)
+            else:
+                def record_admission(decision):
+                    self._event(
+                        record, "subscription.admission", request.item_id,
+                        payload={"seat": request.seat.value, **decision},
+                    )
+
+                reservation = routing.reserve(request.model_class, request.timeout_seconds, skip, record_admission)
+            with reservation as lane:
+                if lane is None:
+                    raise LanesExhausted("subscription-admission", "")
+                extension = self._seat_stretch(request.timeout_seconds)
+                effort = spec.seat_effort(request.seat, lane.name)
+                if request.seat is Seat.BUILDER:
+                    effort = raised_effort(effort, router.builder_raises)
+                attempt = replace(
+                    request,
+                    effort=effort,
+                    timeout_extension=extension,
+                    on_launch=self._launch_recorder(record, request, lane.name),
+                )
+                self._event(
+                    record,
+                    "seat.started",
+                    attempt.item_id,
+                    payload={
+                        "seat": attempt.seat.value,
+                        "model_class": attempt.model_class,
+                        "model": lane.models.get(attempt.model_class, ""),
+                        "effort": attempt.effort.value if attempt.effort is not None else None,
+                        "lane": lane.name,
+                    },
+                )
+                result = lane.harness.invoke(attempt)
+            reserved_lane = None
             extended = extension()
             if result.lane != lane.name:
                 result = replace(result, lane=lane.name)
@@ -2327,10 +2579,16 @@ class ItemWorkflow:
         meter read. An unscoped limit at its stop level cools the lane through
         the router until the latest binding reset. A model-scoped limit at its
         stop level that covers this seat's model sends only this seat past the
-        lane: nothing is cooled and the router's position is unchanged. A meter
-        failure is admitted under ``allow``; under ``refuse`` the meter is read
-        again after a bounded wait, and a meter that stays unavailable ends the
-        item without cooling the lane."""
+        lane: nothing is cooled and the router's position is unchanged.
+
+        A meter failure on a meter that has had a good reading at or above the
+        warning level in this run never starts the seat: it holds, re-reading
+        every ``USAGE_RETRY_SECONDS``, until a reading succeeds, and ends the
+        item without cooling the lane once the hold outlasts
+        ``usage_hold_limit_seconds``. Otherwise a meter failure is admitted
+        under ``allow``; under ``refuse`` the meter is read again after a
+        bounded wait, and a meter that stays unavailable ends the item without
+        cooling the lane."""
 
         gate = self._usage
         if gate is None or not lane.meter_id:
@@ -2339,34 +2597,51 @@ class ItemWorkflow:
         def emit(event_type: str, payload: dict[str, object]) -> None:
             self._event(record, event_type, request.item_id, payload=payload)
 
-        assessment = gate.assess(lane, emit)
+        seat = request.seat.value
+        assessment = gate.assess(lane, emit, seat)
         attempt = 0
+        held_since: float | None = None
         while assessment.failure:
-            refuse = gate.policy.on_probe_failure is UsageProbeFailure.REFUSE
-            if not refuse:
+            last_good = gate.last_at_warning(lane.meter_id)
+            if last_good is not None:
+                now = gate.now()
+                if held_since is None:
+                    held_since = now
+                within = now - held_since < self._ports.usage_hold_limit_seconds
+                action = "hold" if within else "stop"
+            elif gate.policy.on_probe_failure is not UsageProbeFailure.REFUSE:
                 action = "allow"
             elif attempt < USAGE_RETRY_ATTEMPTS:
                 action = "retry"
             else:
                 action = "stop"
-            emit(
-                "usage.meter_failed",
-                {
-                    "lane": lane.name,
-                    "meter_id": lane.meter_id,
-                    "seat": request.seat.value,
-                    "error": assessment.failure,
-                    "action": action,
-                    "retry_seconds": USAGE_RETRY_SECONDS if action == "retry" else None,
-                },
-            )
+            waits = action in ("retry", "hold")
+            payload: dict[str, object] = {
+                "lane": lane.name,
+                "meter_id": lane.meter_id,
+                "seat": seat,
+                "error": assessment.failure,
+                "action": action,
+                "retry_seconds": USAGE_RETRY_SECONDS if waits else None,
+                "reading_age_seconds": gate.reading_age(assessment.reading),
+            }
+            if last_good is not None:
+                worst = _worst_limit(gate.policy, last_good)
+                payload["last_good"] = {
+                    **_limit_payload(worst),
+                    "fetched_at": last_good.fetched_at,
+                }
+                payload["warn_percent"] = gate.policy.warn_percent
+                payload["stop_percent"] = gate.policy.stop_for(worst.kind)
+                payload["hold_limit_seconds"] = self._ports.usage_hold_limit_seconds
+            emit("usage.meter_failed", payload)
             if action == "allow":
                 return True
             if action == "stop":
                 raise LanesExhausted(USAGE_UNAVAILABLE_SIGNATURE, lane.name)
             attempt += 1
             gate.wait(USAGE_RETRY_SECONDS)
-            assessment = gate.assess(lane, emit)
+            assessment = gate.assess(lane, emit, seat)
         if assessment.stops_lane:
             detail = assessment.describe_stop(gate.policy)
             emit(
@@ -2378,6 +2653,7 @@ class ItemWorkflow:
                     "limits": [_limit_payload(limit) for limit in assessment.lane_stops],
                     "reset_at": assessment.reset_at,
                     "detail": detail,
+                    "reading_age_seconds": gate.reading_age(assessment.reading),
                 },
             )
             router.signal(
@@ -2708,6 +2984,31 @@ class ItemWorkflow:
             delivery_park=True,
         )
 
+    def _park_by_brief_defect(
+        self,
+        spec: ItemExecutionSpec,
+        machine: ItemStateMachine,
+        marker: _PhaseMarker,
+        record: RunRecordRef,
+        seats: list[SeatObservation],
+        guard: _ParkGuard,
+        defect: BriefDefect,
+    ) -> ItemOutcome:
+        """Park an item whose brief file cannot be used before any claim or
+        worktree, so no seat runs without the brief text. The park reason names
+        the cause and the brief."""
+
+        reason = brief_park_reason(defect, spec.item.brief_ref)
+        if len(reason) >= PARK_REASON_LIMIT:
+            reason = reason[: PARK_REASON_LIMIT - 4] + "..."
+        self._event(
+            record,
+            "item.triaged",
+            spec.item.item_id,
+            payload={"triage": f"brief:{defect.cause.value}", "reason": reason},
+        )
+        return self._park(spec, machine, marker, record, None, seats, guard, reason)
+
     def _park_by_nature(
         self,
         spec: ItemExecutionSpec,
@@ -2821,6 +3122,7 @@ class ItemWorkflow:
         )
         tracker_reason = f"{reason} [snapshot={snapshot_dir}]" if snapshot_dir else reason
         finalise = None
+        landed_tracker_error: Exception | None = None
         try:
             publication = self._ports.tracker.park(
                 spec.item.item_id, tracker_reason, actor=COORDINATOR_ACTOR, workspace=workspace
@@ -2838,6 +3140,7 @@ class ItemWorkflow:
                 )
         except Exception as exc:
             park_error: Exception | None = exc
+            carried_error: Exception = exc
             failure = str(exc)
             if workspace is not None:
                 # The worktree park did not land, so the park is recorded from
@@ -2880,10 +3183,20 @@ class ItemWorkflow:
                         )
                 except Exception as primary_error:
                     park_error = primary_error
-                    failure = f"{failure}; {primary_error}"
+                    # The primary park is the last tracker write attempted, so
+                    # its tracker failure wins; the worktree's is kept only
+                    # when the primary error is not a tracker failure.
+                    if isinstance(primary_error, TrackerStop):
+                        carried_error = primary_error
+                    primary_text = str(primary_error)
+                    if primary_text == failure:
+                        failure = f"{failure}; the primary park failed the same way"
+                    else:
+                        failure = f"{failure}; {primary_text}"
                 else:
                     reason = fallback_reason
                     park_error = None
+                    landed_tracker_error = exc
             if park_error is not None:
                 # The item is unfinished: its worktree and evidence are kept and
                 # the campaign goes on.
@@ -2901,7 +3214,7 @@ class ItemWorkflow:
                 )
                 return _with_tracker_failure(
                     self._unfinished_item(spec, machine, record, evidence, seats, guard, failure),
-                    park_error,
+                    carried_error,
                 )
         self._emit_parked(
             record,
@@ -2917,15 +3230,18 @@ class ItemWorkflow:
             kill,
         )
         marker.write("parked")
-        return ItemOutcome(
-            item_id=spec.item.item_id,
-            disposition=ItemDisposition.PARKED,
-            states=tuple(machine.history),
-            reason=reason,
-            finalise=finalise,
-            structural_failure=structural,
-            title=spec.item.title,
-            seats=tuple(seats),
+        return _with_tracker_failure(
+            ItemOutcome(
+                item_id=spec.item.item_id,
+                disposition=ItemDisposition.PARKED,
+                states=tuple(machine.history),
+                reason=reason,
+                finalise=finalise,
+                structural_failure=structural,
+                title=spec.item.title,
+                seats=tuple(seats),
+            ),
+            landed_tracker_error,
         )
 
     def _snapshot(

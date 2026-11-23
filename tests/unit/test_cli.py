@@ -6,6 +6,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from test_process_mode import BASE, documented_toml_blocks, load
 
 from autobuild.adapters import (
     ClaudeCodeHarnessAdapter,
@@ -26,6 +27,7 @@ from autobuild.bootstrap.profile import (
     ConfigurationError,
     LaneProfile,
     ProfileOverrides,
+    _BOUNDARY_KEYS,
     _PROFILE_ALLOWED_KEYS,
     load_settings,
 )
@@ -84,7 +86,7 @@ def test_profile_supplies_explicit_runtime_configuration(tmp_path: Path) -> None
     assert settings.specialist_model == "reviewer-model"
     assert settings.validator_argv == ("uv", "run", "pytest", "-q")
     assert settings.max_items == 7
-    assert settings.scratch_root is None
+    assert settings.scratch_root == default_scratch_root()
     assert settings.tracker_kind == "auto"
     assert settings.backlog_path == (repository / "BACKLOG.md").resolve()
     assert settings.allowed_roots == ((tmp_path / "shared-briefs").resolve(),)
@@ -471,6 +473,14 @@ def test_current_branch_options_are_rejected_with_protected_delivery_before_pref
             allow_delivery=True,
             push_current_branch=True,
         )
+
+
+def test_preflight_takes_the_delivery_modes_of_run() -> None:
+    parser = _parser()
+
+    assert parser.parse_args(["preflight"]).delivery_mode == DeliveryMode.PROTECTED_DEFAULT.value
+    chosen = parser.parse_args(["preflight", "--delivery-mode", "current-branch-pr"])
+    assert chosen.delivery_mode == DeliveryMode.CURRENT_BRANCH_PR.value
 
 
 LANE_PROFILE = """
@@ -938,7 +948,7 @@ def test_progress_command_timeout_must_be_positive(tmp_path: Path) -> None:
         _settings_with_progress(tmp_path, "\n[progress]\ncommand_timeout_seconds = 0\n")
 
 
-def test_watch_runs_root_prefers_the_scratch_override(tmp_path: Path) -> None:
+def test_watch_runs_root_prefers_the_scratch_override(tmp_path: Path, monkeypatch) -> None:
     repository = tmp_path / "project"
     repository.mkdir()
     # The override wins and is honoured without reading any profile at all.
@@ -947,6 +957,11 @@ def test_watch_runs_root_prefers_the_scratch_override(tmp_path: Path) -> None:
     root = resolve_runs_root(str(repository), None, str(override))
 
     assert root == override.resolve() / "runs"
+
+    elsewhere = tmp_path / "working"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert resolve_runs_root(repository, None, "shared") == (repository / "shared").resolve() / "runs"
 
 
 def test_watch_runs_root_reads_only_the_run_scratch_root_from_the_profile(
@@ -1132,22 +1147,36 @@ def test_watcher_resolves_scratch_root_from_a_profile_with_an_unknown_field(
     assert resolve_runs_root(str(repository), None, None) == (repository / "scratch").resolve() / "runs"
 
 
-def test_running_autobuild_toml_blocks_use_only_documented_profile_keys() -> None:
-    document = Path(__file__).parents[2] / "docs" / "running-autobuild.md"
-    blocks = re.findall(r"\x60\x60\x60toml\n(.*?)\n\x60\x60\x60", document.read_text(encoding="utf-8"), re.DOTALL)
+def test_documented_toml_blocks_use_only_profile_keys() -> None:
+    blocks = documented_toml_blocks()
 
     assert blocks
-    for block in blocks:
+    for label, block in blocks:
         profile = tomllib.loads(block)
-        assert set(profile) <= _PROFILE_ALLOWED_KEYS["profile"]
+        assert set(profile) <= _PROFILE_ALLOWED_KEYS["profile"], label
         for table_name, table in profile.items():
-            assert isinstance(table, dict)
+            assert isinstance(table, dict), label
             if table_name == "lanes":
                 for lane in table.values():
-                    assert isinstance(lane, dict)
-                    assert set(lane) <= _PROFILE_ALLOWED_KEYS["lanes.*"]
+                    assert isinstance(lane, dict), label
+                    assert set(lane) <= _PROFILE_ALLOWED_KEYS["lanes.*"], label
             else:
-                assert set(table) <= _PROFILE_ALLOWED_KEYS[table_name]
+                assert set(table) <= _PROFILE_ALLOWED_KEYS[table_name], label
+        for boundary in profile.get("process", {}).get("boundaries", {}).values():
+            assert set(boundary) <= _BOUNDARY_KEYS, label
+
+
+def test_documented_toml_blocks_load(tmp_path: Path) -> None:
+    whole = 0
+    for label, block in documented_toml_blocks():
+        is_whole = {"run", "validator"} <= set(tomllib.loads(block))
+        whole += is_whole
+        try:
+            load(tmp_path, block if is_whole else f"{BASE}\n{block}\n")
+        except ConfigurationError as refusal:
+            pytest.fail(f"{label} does not load: {refusal}")
+
+    assert whole
 
 
 def test_neutral_machine_profile_forms_load_with_their_known_fields(tmp_path: Path) -> None:
@@ -1305,3 +1334,13 @@ def test_a_failed_batch_verdict_exits_one_with_every_item_accepted(
     monkeypatch.setattr(cli, "run_campaign", lambda *args, **kwargs: result)
 
     assert cli.main(["run", "--repository", str(repository)]) == code
+
+
+def test_the_usage_scratch_root_help_says_what_the_option_selects(capsys) -> None:
+    with pytest.raises(SystemExit):
+        _parser().parse_args(["usage", "--help"])
+
+    assert (
+        "--scratch-root SCRATCH_ROOT "
+        "Folder that holds the shared reading and the meter command's output files."
+    ) in " ".join(capsys.readouterr().out.split())

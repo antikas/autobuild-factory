@@ -29,6 +29,7 @@ from autobuild.domain import (
     ItemExecutionSpec,
     LaneSignalKind,
     PortKind,
+    RepositoryIdentity,
     ReviewDecision,
     SeatOutcome,
     SeatResult,
@@ -209,10 +210,12 @@ def work_item() -> WorkItem:
     return WorkItem("item-1", "test item", "plan", ("passes",))
 
 
-def spec() -> ItemExecutionSpec:
+def spec(tmp_path: Path) -> ItemExecutionSpec:
+    brief = tmp_path / "brief.md"
+    brief.write_text("brief", encoding="utf-8")
     return ItemExecutionSpec(
         work_item(),
-        Path("brief.md"),
+        brief,
         "validator",
         ("python", "-m", "pytest"),
         ToolPolicy(frozenset({"read", "write", "python"}), (Path("/worktree"),)),
@@ -338,7 +341,7 @@ def test_with_the_subscription_lane_at_the_stop_level_the_seats_run_on_the_sdk_l
         meter=meter, lane_state=state,
     )
 
-    outcome = ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+    outcome = ItemWorkflow(ports).run(campaign(), spec(tmp_path), ports.records.create(campaign()))
 
     assert outcome.disposition is ItemDisposition.ACCEPTED
     assert subscription.requests == []
@@ -360,7 +363,7 @@ def test_with_both_lanes_cooled_the_item_parks_cleanly(tmp_path: Path) -> None:
         meter=meter, lane_state=state, queue=True,
     )
 
-    outcome = CampaignRunner(ports).run(campaign(), lambda item: spec())
+    outcome = CampaignRunner(ports).run(campaign(), lambda item: spec(tmp_path))
 
     # Exhausted lanes hold admissions; the item bound of one ends the campaign.
     assert outcome.stop_reason is CampaignStopReason.ITEM_BOUND
@@ -386,7 +389,7 @@ def test_a_credit_or_spend_limit_stop_cools_the_sdk_lane_and_is_not_a_builder_fa
         [("claude-sdk", sdk_adapter(tmp_path, client)), ("fallback", fallback)], lane_state=state
     )
 
-    outcome = ItemWorkflow(ports).run(campaign(), spec(), ports.records.create(campaign()))
+    outcome = ItemWorkflow(ports).run(campaign(), spec(tmp_path), ports.records.create(campaign()))
 
     assert outcome.disposition is ItemDisposition.ACCEPTED
     assert [request.seat.value for request in fallback.requests] == ["builder", "reviewer"]
@@ -400,7 +403,7 @@ def test_the_key_appears_in_no_brief_log_run_record_or_commit(tmp_path: Path) ->
     adapter = sdk_adapter(tmp_path, client)
     ports = workflow_ports([("claude-sdk", adapter)], queue=True)
 
-    outcome = CampaignRunner(ports).run(campaign(), lambda item: spec())
+    outcome = CampaignRunner(ports).run(campaign(), lambda item: spec(tmp_path))
 
     assert outcome.items[0].disposition is ItemDisposition.ACCEPTED
     surfaces = [
@@ -469,9 +472,11 @@ def _preflight_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, key: 
     monkeypatch.setattr(composition, "configure_scratch_environment", lambda root: scratch)
     monkeypatch.setattr(composition, "_command_adapter", lambda root: commands)
     monkeypatch.setattr(composition, "PinaxTrackerAdapter", lambda *args, **kwargs: tracker)
+    workspace = FakeWorkspaceAdapter(identity("workspace"))
     monkeypatch.setattr(
-        composition, "GitWorkspaceAdapter", lambda *args, **kwargs: FakeWorkspaceAdapter(identity("workspace"))
+        workspace, "identify", lambda root: RepositoryIdentity(root, "main", "main", "origin", "base", True)
     )
+    monkeypatch.setattr(composition, "GitWorkspaceAdapter", lambda *args, **kwargs: workspace)
     monkeypatch.setattr(
         composition, "FilesystemLeaseAdapter", lambda *args, **kwargs: FakeLeaseAdapter(identity("lease"))
     )

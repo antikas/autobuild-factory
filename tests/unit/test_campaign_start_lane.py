@@ -11,6 +11,8 @@ from autobuild.domain import (
     AdapterIdentity,
     EffortLevel,
     LaneCooling,
+    LaneSignal,
+    LaneSignalKind,
     LeaseSurface,
     RepositoryIdentity,
     SurfaceKind,
@@ -150,6 +152,23 @@ def test_a_first_lane_cooling_from_an_earlier_campaign_starts_the_campaign_on_th
     )
 
     context = _launch(tmp_path, monkeypatch, TWO_LANES, _manifest(True), lane_state)
+
+    _assert_second_lane(context)
+
+
+def test_a_first_lane_cooled_by_the_usage_preflight_starts_the_campaign_on_the_second(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def cooling_preflight(settings, lanes_raw, meter, lane_state, campaign_id):
+        signal = LaneSignal(LaneSignalKind.USAGE, reset_at="2999-01-01T00:00:00+00:00")
+        lane_state.cool("claude-code", signal, campaign_id)
+        return None
+
+    monkeypatch.setattr(composition, "_usage_preflight", cooling_preflight)
+
+    context = _launch(
+        tmp_path, monkeypatch, TWO_LANES, _manifest(True), FakeLaneStateAdapter(identity("lanes"))
+    )
 
     _assert_second_lane(context)
 

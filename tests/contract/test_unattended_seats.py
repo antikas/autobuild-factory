@@ -61,6 +61,7 @@ def execution_spec(process: ProcessPolicy) -> ItemExecutionSpec:
 def seat_request(tmp_path: Path, seat: Seat, process: ProcessPolicy) -> SeatRequest:
     workspace = WorkspaceRef(tmp_path / "worktree", "autobuild/item", "base", "lease")
     workspace.root.mkdir(exist_ok=True)
+    (tmp_path / "brief.md").write_text("# Brief\n", encoding="utf-8")
     tools = frozenset({"read", "write", "python"}) if seat is Seat.BUILDER else frozenset({"read"})
     contract = "builder-report-v1" if seat is Seat.BUILDER else "review-verdict-v1"
     return SeatRequest(

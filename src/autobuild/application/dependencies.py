@@ -95,12 +95,19 @@ class WorkflowPorts:
     # no ``[usage]`` table, and then no meter is ever read.
     usage_meter: UsageMeterPort | None = None
     usage_policy: UsagePolicy | None = None
+    # Optional injected cross-process subscription allocator. The application
+    # sees only its preview/acquire/release protocol, never a provider adapter.
+    subscription_admission: object | None = None
     # How a seat waits before it re-reads a meter that failed under the refuse
     # policy. Tests inject a recorder so no test sleeps.
     usage_retry_wait: Callable[[float], None] = time.sleep
     # The monotonic clock, in seconds, that ages a lane's shared meter reading.
     # Tests inject a fake clock.
     usage_clock: Callable[[], float] = time.monotonic
+    # How long a seat held on failed meter readings, after the run has seen
+    # its warning level, may hold before the item ends. Measured on
+    # ``usage_clock``; the production composition sets the run's hold limit.
+    usage_hold_limit_seconds: float = 21600.0
     # The environment one item's validator command runs with, so concurrent
     # items never share temporary directories. The production composition maps
     # each item to its own directories under the scratch root; the default adds

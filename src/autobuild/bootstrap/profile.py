@@ -70,6 +70,7 @@ class LaneProfile:
     # The file holding the lane's API key, for a lane whose adapter reads one.
     # Only the path is held; the key itself is never read into the profile.
     key_file: Path | None = None
+    prepare_argv: tuple[str, ...] = ()
 
     def efforts(self) -> dict[Seat, EffortLevel]:
         """The seats that set an effort on this lane, with their levels."""
@@ -101,7 +102,7 @@ class RunSettings:
     lease_stale_seconds: float
     item_classes: Mapping[str, float]
     command_timeout_seconds: float
-    scratch_root: Path | None
+    scratch_root: Path
     lanes: tuple[LaneProfile, ...]
     lane_state_root: Path | None
     lane_cool_seconds: float
@@ -119,6 +120,7 @@ class RunSettings:
     progress_command_timeout_seconds: float
     # The ``[usage]`` levels, or None when the profile has no ``[usage]`` table.
     usage: UsagePolicy | None = None
+    subscription_routing: bool = False
     # ``[run] concurrency`` and ``heavy_concurrency`` with the ``[capacity]`` terms.
     capacity: CapacityPolicy = CapacityPolicy()
     # The ``[pressure]`` thresholds of the host pressure monitor.
@@ -327,7 +329,7 @@ _PROFILE_ALLOWED_KEYS: dict[str, frozenset[str]] = {
         {
             "run", "models", "validator", "harness", "policy", "tracker", "preflight",
             "refill", "knowledge", "selection", "progress", "lanes", "usage",
-            "capacity", "pressure", "process",
+            "capacity", "pressure", "process", "subscription_routing",
         }
     ),
     "run": frozenset(
@@ -351,7 +353,8 @@ _PROFILE_ALLOWED_KEYS: dict[str, frozenset[str]] = {
     "usage": frozenset(
         {"warn_percent", "stop_percent", "five_hour_stop_percent", "on_probe_failure"}
     ),
-    "lanes.*": frozenset({"builder", "reviewer", "specialist", "key_file", *_EFFORT_KEYS}),
+    "lanes.*": frozenset({"builder", "reviewer", "specialist", "key_file", "prepare_argv", *_EFFORT_KEYS}),
+    "subscription_routing": frozenset({"enabled"}),
     "capacity": frozenset({"reserve_gb", "per_item_gb", "max_concurrency"}),
     "pressure": frozenset(_PRESSURE_KEYS),
     "process": frozenset({"mode", "test_command", "test_map", "boundaries"}),
@@ -449,6 +452,11 @@ def _lane_profile(lanes_table: Mapping[str, Any], name: str, base: Path) -> Lane
     if not isinstance(table, Mapping):
         raise ConfigurationError(f"[lanes.{name}] must be a TOML table")
     key_file = _optional_string(table.get("key_file"), f"lanes.{name}.key_file")
+    prepare = () if "prepare_argv" not in table else _string_list(
+        table["prepare_argv"], f"lanes.{name}.prepare_argv"
+    )
+    if prepare and name != "codex":
+        raise ConfigurationError(f"lanes.{name}.prepare_argv is only supported by the codex lane")
     builder = _optional_string(table.get("builder"), f"lanes.{name}.builder")
     reviewer = _optional_string(table.get("reviewer"), f"lanes.{name}.reviewer")
     specialist = _optional_string(table.get("specialist"), f"lanes.{name}.specialist")
@@ -470,6 +478,7 @@ def _lane_profile(lanes_table: Mapping[str, Any], name: str, base: Path) -> Lane
         specialist or reviewer,
         *_seat_efforts(table, f"lanes.{name}"),
         key_file=_resolve_path(key_file, base) if key_file else None,
+        prepare_argv=prepare,
     )
 
 
@@ -717,6 +726,30 @@ def _usage(document: Mapping[str, Any]) -> UsagePolicy | None:
         raise ConfigurationError(str(exc)) from exc
 
 
+def _subscription_routing(document: Mapping[str, Any], lanes: tuple[LaneProfile, ...], usage: UsagePolicy | None, harness_command: tuple[str, ...] | None) -> bool:
+    """Validate the explicit opt-in without adding permissive policy switches."""
+
+    if "subscription_routing" not in document:
+        return False
+    table = _table(document, "subscription_routing")
+    enabled = table.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ConfigurationError("subscription_routing.enabled must be a boolean")
+    if not enabled:
+        return False
+    names = {lane.name for lane in lanes}
+    if not names or not names <= {"claude-code", "codex"}:
+        raise ConfigurationError("subscription routing permits only claude-code and codex run.lanes")
+    if any(lane.key_file is not None for lane in lanes):
+        raise ConfigurationError("subscription routing forbids lane API key files")
+    official = {"claude-code": ("claude",), "codex": ("codex",)}
+    if harness_command is not None and (len(lanes) != 1 or harness_command != official[lanes[0].name]):
+        raise ConfigurationError("subscription routing forbids a non-official harness command")
+    if usage is None:
+        raise ConfigurationError("subscription routing requires a [usage] policy")
+    return True
+
+
 # ``run.concurrency`` when the profile does not name it: as many items as the
 # host allows. ``1`` is the serial setting.
 DEFAULT_ITEM_CONCURRENCY: int | str = "auto"
@@ -888,31 +921,54 @@ def _budget_seconds(validator: Mapping[str, Any]) -> float | None:
     return float(value)
 
 
-def read_run_scratch_root(
+def _profile_base(repository: Path, profile: Path | None) -> Path:
+    """The folder relative profile values resolve against: the selected
+    profile's, or the repository when no profile is selected."""
+
+    return repository if profile is None else profile.resolve(strict=False).parent
+
+
+def _scratch_or_lane_state_root(
+    repository: Path,
+    profile: Path | None,
+    key: str,
+    option: str | None,
+    document: Mapping[str, Any] | None = None,
+) -> Path | None:
+    """Resolve one ``[run]`` folder from its option, then its profile key.
+
+    The profile file is read only when there is no option and the caller has not
+    already loaded ``document``."""
+
+    value = option
+    if not value:
+        if document is None:
+            document, _resolved = _load_document(profile)
+        value = _optional_string(_table(document, "run").get(key), f"run.{key}")
+    return _resolve_path(value, _profile_base(repository, profile)) if value else None
+
+
+def resolve_scratch_root(
     repository: str | Path,
     profile_path: str | Path | None,
-    override: str | None,
-) -> Path | None:
-    """Resolve the run scratch root from ``--scratch-root`` then ``[run]
-    scratch_root``, reading no other profile field.
+    option: str | None,
+    document: Mapping[str, Any] | None = None,
+) -> Path:
+    """The scratch root: ``--scratch-root``, then ``[run] scratch_root``, then the
+    default.
 
-    This never loads models, the validator or lane tables, so a watcher can find
-    a run's scratch root from a profile that would not pass full validation. An
-    explicit override is resolved against the working directory and short-circuits
-    the profile entirely. A profile ``[run] scratch_root`` is resolved against the
-    profile's own directory, matching ``load_settings``. Returns ``None`` when
-    neither source sets it, leaving the default to the caller."""
+    No other profile key is read, so a profile that would fail a launch works,
+    and with the option the profile is not read at all. A relative value resolves
+    against the selected profile's folder, or the repository when no profile is
+    selected."""
 
-    if override:
-        return Path(override).expanduser().resolve(strict=False)
+    # environment imports this module, so importing it at the top would be a cycle.
+    from autobuild.bootstrap.environment import default_scratch_root
+
     resolved_repository = Path(repository).expanduser().resolve(strict=False)
-    document, resolved_profile = _load_document(
-        _selected_profile(resolved_repository, profile_path)
-    )
-    base = resolved_profile.parent if resolved_profile is not None else resolved_repository
-    run = _table(document, "run")
-    scratch_value = _optional_string(run.get("scratch_root"), "run.scratch_root")
-    return _resolve_path(scratch_value, base) if scratch_value else None
+    selected = _selected_profile(resolved_repository, profile_path)
+    root = _scratch_or_lane_state_root(resolved_repository, selected, "scratch_root", option, document)
+    return default_scratch_root() if root is None else root
 
 
 def load_settings(
@@ -923,11 +979,10 @@ def load_settings(
     resolved_repository = Path(repository).expanduser().resolve(strict=True)
     if not resolved_repository.is_dir():
         raise ConfigurationError(f"repository is not a directory: {resolved_repository}")
-    document, resolved_profile = _load_document(
-        _selected_profile(resolved_repository, profile_path)
-    )
+    selected_profile = _selected_profile(resolved_repository, profile_path)
+    document, resolved_profile = _load_document(selected_profile)
     _validate_profile_fields(document)
-    base = resolved_profile.parent if resolved_profile is not None else resolved_repository
+    base = _profile_base(resolved_repository, selected_profile)
     run = _table(document, "run")
     models = _table(document, "models")
     validator = _table(document, "validator")
@@ -976,14 +1031,12 @@ def load_settings(
         raise ConfigurationError("run bounds and timeouts must be positive")
     item_classes = _item_classes(run)
 
-    scratch_value = overrides.scratch_root or _optional_string(
-        run.get("scratch_root"), "run.scratch_root"
+    scratch_root = resolve_scratch_root(
+        resolved_repository, profile_path, overrides.scratch_root, document
     )
-    scratch_root = _resolve_path(scratch_value, base) if scratch_value else None
-    lane_state_value = overrides.lane_state_root or _optional_string(
-        run.get("lane_state_root"), "run.lane_state_root"
+    lane_state_root = _scratch_or_lane_state_root(
+        resolved_repository, selected_profile, "lane_state_root", overrides.lane_state_root, document
     )
-    lane_state_root = _resolve_path(lane_state_value, base) if lane_state_value else None
     lane_cool_seconds = float(run.get("lane_cool_seconds", 3600))
     if lane_cool_seconds <= 0:
         raise ConfigurationError("run.lane_cool_seconds must be a positive number of seconds")
@@ -1029,6 +1082,7 @@ def load_settings(
             "a refill plan containing fog requires knowledge.command and knowledge.fog_ledger"
         )
     progress_command, progress_file, progress_stderr, progress_timeout = _progress(progress)
+    usage = _usage(document)
     return RunSettings(
         repository=resolved_repository,
         harness=harness_name,
@@ -1063,7 +1117,8 @@ def load_settings(
         progress_file=progress_file,
         progress_stderr=progress_stderr,
         progress_command_timeout_seconds=progress_timeout,
-        usage=_usage(document),
+        usage=usage,
+        subscription_routing=_subscription_routing(document, lanes, usage, harness_command),
         capacity=_capacity(document),
         pressure=_pressure(document),
         hold_limit_seconds=hold_limit,

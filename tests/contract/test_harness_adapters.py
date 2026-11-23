@@ -59,6 +59,8 @@ def command_result(tmp_path: Path, name: str, stdout: str, exit_code: int = 0) -
 def request(tmp_path: Path, seat: Seat, contract: str, tools: frozenset[str]) -> SeatRequest:
     workspace = WorkspaceRef(tmp_path / "worktree", "autobuild/item", "base", "lease")
     workspace.root.mkdir(exist_ok=True)
+    if not (tmp_path / "brief.md").exists():
+        (tmp_path / "brief.md").write_text("# Brief\n", encoding="utf-8")
     return SeatRequest(
         "run",
         "item",
@@ -141,7 +143,7 @@ def test_codex_uses_read_only_sandbox_for_review_and_normalises_jsonl(tmp_path: 
     assert argv[-1] == "-"
     stdin_ref = commands.requests[0].stdin_ref
     assert stdin_ref is not None
-    assert Path(stdin_ref).read_text(encoding="utf-8") == "Seat instructions"
+    assert Path(stdin_ref).read_text(encoding="utf-8").startswith("Seat instructions\n\nApproved brief: ")
 
 
 def test_codex_streams_materialised_large_evidence_instead_of_argv(tmp_path: Path) -> None:
@@ -220,7 +222,7 @@ def test_copilot_uses_programmatic_json_mode_and_confined_permissions(tmp_path: 
     assert argv[argv.index("--prompt") + 1] == "-"
     stdin_ref = commands.requests[0].stdin_ref
     assert stdin_ref is not None
-    assert Path(stdin_ref).read_text(encoding="utf-8") == "Seat instructions"
+    assert Path(stdin_ref).read_text(encoding="utf-8").startswith("Seat instructions\n\nApproved brief: ")
     assert "--output-format=json" in argv
     assert "--disallow-temp-dir" in argv
     assert "--no-ask-user" in argv
@@ -726,6 +728,72 @@ def test_claude_reads_the_api_error_status_of_a_failed_result(
         assert signal.detail == detail
 
 
+def _claude_adapter(tmp_path: Path) -> ClaudeCodeHarnessAdapter:
+    return ClaudeCodeHarnessAdapter(
+        FakeCommandAdapter(identity()), tmp_path / "harness", command=(sys.executable,)
+    )
+
+
+@pytest.mark.parametrize(
+    "name, fields",
+    [
+        ("outer", {"reset_at": "2026-11-21T10:00:00Z"}),
+        (
+            "nested",
+            {"error": {"message": "slow down", "reset_at": "2026-11-21T10:00:00Z"}},
+        ),
+    ],
+)
+def test_claude_carries_the_reset_time_of_a_limit_read_from_the_api_error_status(
+    tmp_path: Path, name, fields
+) -> None:
+    stdout = json.dumps(
+        {"type": "result", "is_error": True, "api_error_status": 429, "result": "API Error: 429", **fields}
+    )
+    failed = seat_result_with_stderr(tmp_path, f"api-reset-{name}", stdout, "")
+
+    signal = _claude_adapter(tmp_path).classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is LaneSignalKind.RATE_LIMIT
+    assert signal.detail == "api 429"
+    assert signal.reset_at == "2026-11-21T10:00:00Z"
+
+
+def test_claude_reads_a_code_field_before_the_api_error_status(tmp_path: Path) -> None:
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "is_error": True,
+            "api_error_status": 401,
+            "error": {"type": "rate_limit_error"},
+            "result": "API Error: 401",
+        }
+    )
+    failed = seat_result_with_stderr(tmp_path, "api-code-first", stdout, "")
+
+    signal = _claude_adapter(tmp_path).classify_failure(failed)
+
+    assert signal is not None
+    assert signal.kind is LaneSignalKind.RATE_LIMIT
+    assert signal.detail == "rate_limit_error"
+
+
+@pytest.mark.parametrize(
+    "name, fields",
+    [("false", {"is_error": False}), ("absent", {}), ("string", {"is_error": "true"})],
+)
+def test_claude_reads_the_api_error_status_only_when_is_error_is_true(
+    tmp_path: Path, name, fields
+) -> None:
+    stdout = json.dumps(
+        {"type": "result", "api_error_status": 429, "result": "API Error: 429", **fields}
+    )
+    failed = seat_result_with_stderr(tmp_path, f"api-is-error-{name}", stdout, "")
+
+    assert _claude_adapter(tmp_path).classify_failure(failed) is None
+
+
 _LIMIT_WITH_RESET = {
     "type": "error",
     "error": {"type": "rate_limit_error", "code": "rate_limit_exceeded"},
@@ -1172,10 +1240,111 @@ def test_oversized_evidence_is_refused_before_cli_dispatch(tmp_path: Path) -> No
         (str(evidence),),
     )
 
-    with pytest.raises(EvidenceError, match="evidence exceeds 1 MiB"):
+    with pytest.raises(EvidenceError) as refused:
         adapter.invoke(seat)
 
+    assert str(refused.value) == "seat evidence exceeds 1 MiB: large.patch"
     assert commands.requests == []
+
+
+def test_unreadable_evidence_is_refused_without_its_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "outside" / "change.patch"
+    evidence.parent.mkdir()
+    evidence.write_text("patch", encoding="utf-8")
+    read_text = Path.read_text
+
+    def refusing(path: Path, *args, **kwargs) -> str:
+        if path == evidence:
+            raise PermissionError(13, "Permission denied", str(path))
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", refusing)
+    commands = FakeCommandAdapter(identity())
+    adapter = CodexHarnessAdapter(commands, tmp_path / "harness", command=(sys.executable,))
+    seat = request(tmp_path, Seat.REVIEWER, "review-verdict-v1", frozenset({"read"}))
+    seat = replace(
+        seat,
+        context_refs=(str(evidence),),
+        workspace=replace(seat.workspace, root=tmp_path / "worktree"),
+    )
+
+    with pytest.raises(EvidenceError) as refused:
+        adapter.invoke(seat)
+
+    assert str(refused.value) == (
+        "seat evidence cannot be read (Permission denied): change.patch"
+    )
+    assert commands.requests == []
+
+
+@pytest.mark.parametrize(
+    "adapter_class", [ClaudeCodeHarnessAdapter, CodexHarnessAdapter, CopilotCliHarnessAdapter]
+)
+@pytest.mark.parametrize("as_directory", [False, True], ids=["absent", "directory"])
+def test_a_seat_whose_brief_is_not_a_file_is_refused_before_cli_dispatch(
+    tmp_path: Path, adapter_class, as_directory: bool
+) -> None:
+    commands = FakeCommandAdapter(identity())
+    adapter = adapter_class(commands, tmp_path / "harness", command=(sys.executable,))
+    seat = request(tmp_path, Seat.BUILDER, "builder-report-v1", frozenset({"read", "write"}))
+    seat.brief_path.unlink()
+    if as_directory:
+        seat.brief_path.mkdir()
+
+    with pytest.raises(EvidenceError) as caught:
+        adapter._materialise_evidence(seat)
+    assert str(caught.value) == "seat brief is missing: brief.md"
+
+    with pytest.raises(EvidenceError) as caught:
+        adapter._materialise_evidence(replace(seat, brief_ref="docs/item.md"))
+    assert str(caught.value) == "seat brief is missing: docs/item.md"
+
+    with pytest.raises(EvidenceError, match="seat brief is missing"):
+        adapter.invoke(seat)
+    assert commands.requests == []
+
+
+@pytest.mark.parametrize(
+    ("content", "cause"),
+    [
+        (b"", "is empty"),
+        (b" \n\t\n", "is empty"),
+        (b"x" * 1_048_577, "exceeds 1 MiB"),
+        (b"# Brief \xff\xfe\n", "cannot be read as text"),
+    ],
+    ids=["empty", "whitespace", "too-large", "not-utf8"],
+)
+def test_a_seat_without_the_full_brief_text_is_refused_before_cli_dispatch(
+    tmp_path: Path, content: bytes, cause: str
+) -> None:
+    commands = FakeCommandAdapter(identity())
+    adapter = ClaudeCodeHarnessAdapter(commands, tmp_path / "harness", command=(sys.executable,))
+    seat = request(tmp_path, Seat.BUILDER, "builder-report-v1", frozenset({"read", "write"}))
+    seat.brief_path.write_bytes(content)
+
+    with pytest.raises(EvidenceError) as caught:
+        adapter.invoke(replace(seat, brief_ref="docs/item.md"))
+
+    assert str(caught.value) == f"seat brief {cause}: docs/item.md"
+    assert commands.requests == []
+
+
+def test_an_agent_sdk_seat_whose_brief_is_not_a_file_is_refused(tmp_path: Path) -> None:
+    key = tmp_path / "sdk.key"
+    key.write_text("key", encoding="utf-8")
+    client = FakeAgentSdkClient(scripts=[])
+    adapter = ClaudeSdkHarnessAdapter(
+        FakeCommandAdapter(identity()), tmp_path / "harness", key, client=client
+    )
+    seat = request(tmp_path, Seat.BUILDER, "builder-report-v1", frozenset({"read", "write"}))
+    seat.brief_path.unlink()
+
+    with pytest.raises(EvidenceError, match="seat brief is missing"):
+        adapter.invoke(seat)
+
+    assert client.specs == []
 
 
 # -- the Agent SDK lane: the same classification contract over SDK messages ------

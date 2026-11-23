@@ -35,6 +35,7 @@ from autobuild.domain import (
     ReviewDecision,
     ReviewFinding,
     ReviewVerdict,
+    TrackerPublication,
     TrackerStop,
     WorktreeStatus,
 )
@@ -118,7 +119,7 @@ def test_a_failed_park_leaves_the_item_unfinished_and_the_campaign_goes_on() -> 
     report = report_text(ports)
     assert "## Unfinished" in report
     assert (
-        "- item-1: pinax park exit 5: push rejected; pinax park exit 5: push rejected"
+        "- item-1: pinax park exit 5: push rejected; the primary park failed the same way"
         f" (worktree {workspace_of('item-1').root})"
     ) in report
     # A refused park is a tracker failure: the campaign asked the tracker to
@@ -229,6 +230,118 @@ def test_a_park_whose_delivery_and_primary_fallback_both_fail_is_unfinished() ->
     report = report_text(ports)
     assert "## Unfinished" in report
     assert f"- item-1: {error} (worktree {workspace_of('item-1').root})" in report
+    assert tracker.recoveries == 1
+    tracker_failed = _tracker_failed(ports, "item-1")
+    assert len(tracker_failed) == 1
+    assert tracker_failed[0].payload["exit_code"] == 5
+
+
+def _tracker_failed(ports, item_id: str):
+    return [event for event in events(ports, "item.tracker_failed") if event.item_id == item_id]
+
+
+class _ScriptedParkTracker(FakeTrackerAdapter):
+    """Raises ``worktree_error`` on item-1's worktree park and
+    ``primary_error`` on its primary park; either may be None."""
+
+    worktree_error: Exception | None = None
+    primary_error: Exception | None = None
+
+    def park(self, item_id, reason, actor, workspace=None):
+        if item_id == "item-1":
+            error = self.worktree_error if workspace is not None else self.primary_error
+            if error is not None:
+                raise error
+        return super().park(item_id, reason, actor, workspace)
+
+
+def _scripted_park_tracker(
+    worktree_error: Exception | None, primary_error: Exception | None
+) -> _ScriptedParkTracker:
+    tracker = _ScriptedParkTracker(identity("tracker"))
+    tracker.worktree_error = worktree_error
+    tracker.primary_error = primary_error
+    return tracker
+
+
+def test_a_tracker_failure_in_the_worktree_park_is_checked_when_the_fallback_lands() -> None:
+    tracker = _scripted_park_tracker(
+        TrackerStop("pinax park exit 5: push rejected", code=5, environment=False), None
+    )
+    ports = _park_delivery_failing_ports(tracker)
+
+    thread, box, _ = run(ports, campaign(3, 4))
+    outcome = finish(thread, box)
+
+    by_id = {entry.item_id: entry for entry in outcome.items}
+    assert outcome.stop_reason is CampaignStopReason.QUEUE_DRY
+    assert by_id["item-1"].disposition is ItemDisposition.PARKED
+    assert by_id["item-2"].disposition is ItemDisposition.ACCEPTED
+    assert by_id["item-3"].disposition is ItemDisposition.ACCEPTED
+    tracker_failed = _tracker_failed(ports, "item-1")
+    assert len(tracker_failed) == 1
+    assert tracker_failed[0].payload["kind"] == "tracker_refused"
+    assert tracker_failed[0].payload["exit_code"] == 5
+    assert tracker.recoveries == 1
+
+
+def test_an_unpublished_fallback_park_is_recorded() -> None:
+    ports = _park_delivery_failing_ports()
+    ports.tracker.publications_by_item["item-1"] = TrackerPublication(False, "push deferred")
+
+    thread, box, _ = run(ports, campaign(3, 4))
+    outcome = finish(thread, box)
+
+    by_id = {entry.item_id: entry for entry in outcome.items}
+    assert by_id["item-1"].disposition is ItemDisposition.PARKED
+    unpublished = [
+        event
+        for event in events(ports, "tracker.unpublished")
+        if event.item_id == "item-1" and event.payload["operation"] == "park"
+    ]
+    assert len(unpublished) == 1
+    assert unpublished[0].payload == {"operation": "park", "note": "push deferred"}
+    report = report_text(ports)
+    assert "## Unpublished tracker writes" in report
+    assert "- item-1 park" in report.splitlines()
+    assert "- item-1 claim" in report.splitlines()
+
+
+def test_a_worktree_tracker_failure_is_carried_when_the_primary_error_is_not_one() -> None:
+    tracker = _scripted_park_tracker(
+        TrackerStop("pinax park exit 4: tracker unreachable", code=4, environment=True),
+        AdapterError("primary refused"),
+    )
+    ports = _park_delivery_failing_ports(tracker)
+
+    thread, box, _ = run(ports, campaign(3, 4))
+    outcome = finish(thread, box)
+
+    by_id = {entry.item_id: entry for entry in outcome.items}
+    assert by_id["item-1"].disposition is ItemDisposition.FAILED
+    tracker_failed = _tracker_failed(ports, "item-1")
+    assert len(tracker_failed) == 1
+    assert tracker_failed[0].payload["kind"] == "tracker_environment"
+    assert tracker.recoveries == 1
+
+
+def test_the_primary_tracker_failure_wins_over_the_worktree_one() -> None:
+    tracker = _scripted_park_tracker(
+        TrackerStop("pinax park exit 4: tracker unreachable", code=4, environment=True),
+        TrackerStop("pinax park exit 5: push rejected", code=5, environment=False),
+    )
+    ports = _park_delivery_failing_ports(tracker)
+
+    thread, box, _ = run(ports, campaign(3, 4))
+    outcome = finish(thread, box)
+
+    by_id = {entry.item_id: entry for entry in outcome.items}
+    assert by_id["item-1"].disposition is ItemDisposition.FAILED
+    tracker_failed = _tracker_failed(ports, "item-1")
+    assert len(tracker_failed) == 1
+    assert tracker_failed[0].payload["kind"] == "tracker_refused"
+    assert tracker_failed[0].payload["exit_code"] == 5
+    assert tracker.recoveries == 1
 
 
 def test_lanes_exhausted_holds_until_the_cooling_reset_then_continues() -> None:

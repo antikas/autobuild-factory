@@ -49,6 +49,7 @@ from autobuild.adapters.tracker_commits import (
     require_committed,
     require_no_foreign_changes,
 )
+from autobuild.enforcement.brief_file import is_absolute_reference
 
 _TRACKER_PATHS = (".ergon",)
 _REMOTE = "origin"
@@ -277,8 +278,10 @@ class PinaxTrackerAdapter:
                 dep.strip().strip("'\"")
                 for dep in front.get("deps", "").strip().strip("[]").split(",")
             ]
-            if status(item_id) == "blocked" or any(
-                dep and status(dep) != "done" for dep in deps
+            own = status(item_id)
+            if own == "blocked" or (
+                own not in ("done", "parked")
+                and any(dep and status(dep) != "done" for dep in deps)
             ):
                 blocked.add(item_id)
         return frozenset(blocked)
@@ -566,16 +569,11 @@ class PinaxTrackerAdapter:
     @staticmethod
     def validate_proposal(proposal: Proposal) -> None:
         reference = proposal.brief_ref.strip()
-        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", reference):
+        absolute = is_absolute_reference(reference)
+        if not absolute and re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", reference):
             return
-        normalised = reference.replace("\\", "/")
-        path = PurePosixPath(normalised)
-        unsafe = (
-            normalised.startswith(("/", "~"))
-            or re.match(r"^[A-Za-z]:/", normalised) is not None
-            or any(part in {".", ".."} for part in path.parts)
-        )
-        if unsafe:
+        path = PurePosixPath(reference.replace("\\", "/"))
+        if absolute or any(part in {".", ".."} for part in path.parts):
             raise EvidenceError(
                 "proposal brief_ref must be a repository-relative path or durable URI"
             )

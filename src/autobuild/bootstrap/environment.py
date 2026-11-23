@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 from autobuild.adapters.harness_cli import scratch_environment
-from autobuild.bootstrap.profile import read_run_scratch_root
+from autobuild.bootstrap.profile import resolve_scratch_root
 
 # Run records live under this subdirectory of the scratch root, created by the
 # campaign's run-record adapter as ``<scratch>/runs/<run-id>``.
@@ -41,12 +41,7 @@ def resolve_runs_root(
 ) -> Path:
     """Locate the directory that holds run records.
 
-    The scratch root is ``--scratch-root`` when given, otherwise ``[run]
-    scratch_root`` from the profile, otherwise the same default the campaign uses.
     Resolving it reads only ``[run] scratch_root`` and never requires a complete
-    run profile. The runs root is ``<scratch>/runs`` under that scratch root."""
+    run profile. The runs root is ``<scratch>/runs`` under the scratch root."""
 
-    scratch_root = read_run_scratch_root(repository, profile_path, scratch_override)
-    if scratch_root is None:
-        scratch_root = default_scratch_root()
-    return scratch_root / RUNS_SUBDIRECTORY
+    return resolve_scratch_root(repository, profile_path, scratch_override) / RUNS_SUBDIRECTORY

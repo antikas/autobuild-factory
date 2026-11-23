@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from autobuild.adapters import LocalRunRecordAdapter
-from autobuild.application import CampaignRunner, ItemWorkflow, Lane, WorkflowPorts
+from autobuild.application import CampaignRunner, ItemWorkflow, Lane, WorkflowPorts, prompts
 from autobuild.application.progress import render_progress_line
 from autobuild.domain import (
     AdapterError,
@@ -54,7 +54,12 @@ from autobuild.domain import (
     WorktreeStatus,
 )
 from autobuild.domain import ClaimTaken, ScopeFenceViolation, TrackerPublication, TrackerStop
-from autobuild.domain.models import BuilderContinuation, raised_effort
+from autobuild.domain.models import (
+    BriefDefect,
+    BriefDefectCause,
+    BuilderContinuation,
+    raised_effort,
+)
 from autobuild.enforcement import ScopedTrackerPort
 from autobuild.domain import (
     CampaignContext,
@@ -803,6 +808,68 @@ def test_an_item_whose_brief_orders_git_staging_parks_at_triage_and_next_item_bu
     ]
 
 
+@pytest.mark.parametrize(
+    "defect, reason",
+    [
+        (BriefDefect(BriefDefectCause.MISSING), "brief:missing docs/brief.md"),
+        (BriefDefect(BriefDefectCause.EMPTY), "brief:empty docs/brief.md"),
+        (
+            BriefDefect(BriefDefectCause.TOO_LARGE, size=1_048_577),
+            "brief:too-large 1048577 bytes, over 1048576 docs/brief.md",
+        ),
+        (
+            BriefDefect(BriefDefectCause.UNREADABLE, error="/home/someone/brief.md"),
+            "brief:unreadable docs/brief.md",
+        ),
+    ],
+    ids=lambda value: value.cause.value if isinstance(value, BriefDefect) else "",
+)
+def test_an_item_with_a_brief_defect_parks_before_the_nature_rule(
+    monkeypatch: pytest.MonkeyPatch, defect: BriefDefect, reason: str
+) -> None:
+    ports = make_ports([], [], diff_count=0)
+    work = replace(
+        spec(WorkItem("item-1", "test item", "docs/brief.md", ("passes",)), brief_text="Item nature: machine"),
+        brief_defect=defect,
+    )
+    workspaces: list[object] = []
+    park = ports.tracker.park
+
+    def recording_park(item_id, reason, actor, workspace=None):
+        workspaces.append(workspace)
+        return park(item_id, reason, actor=actor, workspace=workspace)
+
+    monkeypatch.setattr(ports.tracker, "park", recording_park)
+
+    outcome = ItemWorkflow(ports).run(campaign(), work, ports.records.create(campaign()))
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert outcome.reason == reason
+    assert ports.tracker.parked == [("item-1", reason)]
+    assert workspaces == [None]
+    assert ports.tracker.claims == []
+    assert ports.workspace.created == []
+    assert ports.harness.requests == []
+    events = [
+        event for event in ports.records.events if event.event_type in {"item.triaged", "item.parked"}
+    ]
+    assert [event.event_type for event in events] == ["item.triaged", "item.parked"]
+    assert events[0].payload == {"triage": f"brief:{defect.cause.value}", "reason": reason}
+
+
+def test_a_long_brief_reference_is_cut_to_the_park_reason_limit() -> None:
+    ports = make_ports([], [], diff_count=0)
+    work = replace(
+        spec(WorkItem("item-1", "test item", "docs/" + "b" * 600 + ".md", ("passes",))),
+        brief_defect=BriefDefect(BriefDefectCause.MISSING),
+    )
+
+    outcome = ItemWorkflow(ports).run(campaign(), work, ports.records.create(campaign()))
+
+    assert (outcome.reason or "").startswith("brief:missing docs/b")
+    assert len(outcome.reason or "") == 499
+
+
 def test_owner_gated_item_offered_by_the_tracker_parks_with_its_class() -> None:
     ports = make_ports([], [], diff_count=0)
     ports.tracker.queue.append(item())
@@ -1294,6 +1361,38 @@ def test_an_in_fence_item_the_allow_list_peek_offers_is_claimed_and_built() -> N
     assert [(o.item_id, o.disposition) for o in outcome.items] == [
         ("a", ItemDisposition.ACCEPTED)
     ]
+
+
+def test_a_taken_item_the_allow_list_peek_keeps_offering_is_claimed_once() -> None:
+    a = WorkItem("a", "Item A", "plan", ("passes",))
+
+    class _RepeatingHeadTracker(FakeTrackerAdapter):
+        head_reads = 0
+        claim_attempts: list[str]
+
+        def next_item(self, campaign: CampaignRef) -> WorkItem | None:
+            # Bounded so a selection that forgets the skip set still ends.
+            self.head_reads += 1
+            return a if self.head_reads <= 6 else None
+
+        def claim(self, item: WorkItem, actor: str):
+            self.claim_attempts.append(item.item_id)
+            return super().claim(item, actor)
+
+    ports = make_ports([], [], diff_count=0)
+    base = _RepeatingHeadTracker(identity("tracker"), existing={"a"})
+    base.claim_attempts = []
+    base.claim_errors["a"] = ClaimTaken("a", "claimed elsewhere")
+    selection = CampaignSelection(allow=("a",))
+    ports = replace(ports, tracker=ScopedTrackerPort(base, selection))
+
+    outcome = CampaignRunner(ports).run(
+        campaign(max_items=5, selection=selection), lambda selected: spec(selected)
+    )
+
+    assert base.claim_attempts == ["a"]
+    assert outcome.items == ()
+    assert outcome.stop_reason is CampaignStopReason.QUEUE_DRY
 
 
 # --- Single-writer lease per surface ------------------------------------------
@@ -1930,6 +2029,34 @@ def test_a_timed_out_raised_builder_continues_at_the_raised_level_with_its_trigg
     assert "stdout:red" in continued.context_refs
     assert _CONTINUATION in continued.instructions
     assert _started_builder_efforts(ports) == ["medium", "high", "high"]
+
+
+def test_a_continued_builder_writes_its_report_beside_the_first_builder_report() -> None:
+    timed_out = SeatResult(
+        "builder", SeatOutcome.TIMED_OUT, None, "raw", SeatUsage(), "start", "end"
+    )
+    ports = make_ports(
+        [builder("first"), timed_out, builder("continued"), review(ReviewDecision.PASS)],
+        [command(exit_code=1, suffix="red"), command(suffix="green")],
+        diff_count=2,
+    )
+    item_spec = _builder_spec(EffortLevel.MEDIUM)
+
+    with pytest.raises(BuilderContinuation) as handed:
+        ItemWorkflow(ports).run(campaign(), item_spec, ports.records.create(campaign()))
+    assert handed.value.plan.builder_reports == 1
+
+    outcome = ItemWorkflow(ports).run(
+        campaign(), item_spec, ports.records.create(campaign()), resume=handed.value.plan
+    )
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    first = ports.records.evidence["item-1-builder-report-1"]
+    continued = ports.records.evidence["item-1-builder-report-2"]
+    assert "report:first" in first and "report:continued" not in first
+    assert "report:continued" in continued
+    reviewer = next(r for r in ports.harness.requests if r.seat is Seat.REVIEWER)
+    assert reviewer.context_refs[-1] == "evidence:item-1-builder-report-2"
 
 
 def test_a_red_validator_retry_after_a_continued_builder_is_not_told_to_continue() -> None:
@@ -2833,6 +2960,9 @@ def test_the_reviewer_is_handed_the_builder_report_as_evidence() -> None:
     content = _builder_report(ports, reviewer.context_refs[2])
     assert "built" in content and "report:builder" in content
     assert json.loads(content) == {"summary": "built", "report_ref": "report:builder"}
+    assert prompts.BUILDER_REPORT_SENTENCE in reviewer.instructions
+    assert reviewer.context_refs[2] in reviewer.instructions
+    assert prompts.NO_BUILDER_REPORT_SENTENCE not in reviewer.instructions
 
 
 def test_each_reviewer_gets_the_latest_builder_report_of_its_round() -> None:

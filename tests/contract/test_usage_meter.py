@@ -16,7 +16,7 @@ from autobuild.adapters.claude_usage import (
     NullUsageMeterAdapter,
     normalise_usage,
 )
-from autobuild.domain import AdapterIdentity, CommandResult, UsageLimitKind
+from autobuild.domain import AdapterIdentity, CommandResult, UsageFailure, UsageLimitKind
 from autobuild.ports import UsageMeterPort
 from autobuild.testing import FakeCommandAdapter
 
@@ -234,11 +234,14 @@ def test_the_null_meter_always_fails() -> None:
     assert reading.ok is False and reading.meter_id == "anything"
 
 
-def test_only_the_claude_code_adapter_declares_a_meter(tmp_path: Path) -> None:
+def test_subscription_harnesses_declare_their_meters(tmp_path: Path) -> None:
     command = FakeCommandAdapter(AdapterIdentity("command", "1"))
 
     assert ClaudeCodeHarnessAdapter(command, tmp_path / "c", ("claude",)).meter_id == CLAUDE_SUBSCRIPTION_METER
     assert CodexHarnessAdapter(command, tmp_path / "x", ("codex",)).meter_id is None
+    assert CodexHarnessAdapter(
+        command, tmp_path / "subscription", ("codex",), subscription_only=True
+    ).meter_id == "chatgpt-subscription"
     assert CopilotCliHarnessAdapter(command, tmp_path / "p", ("copilot",)).meter_id is None
     assert CodexHarnessAdapter(command, tmp_path / "x", ("codex",)).meter_scope_covers("Fable", "reviewer") is False
 
@@ -265,3 +268,103 @@ def test_the_claude_code_adapter_decides_which_seat_models_a_scope_covers(
     )
 
     assert harness.meter_scope_covers(scope, model_class) is covered
+
+
+def answered(status: int, retry_after: str, body: str) -> str:
+    return f"{body}\nautobuild-meter-status:{status} retry-after:{retry_after}"
+
+
+RATE_LIMIT_BODY = json.dumps({"type": "error", "error": {"type": "rate_limit_error"}})
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "retry_at"),
+    [
+        ("241", "2026-10-21T20:04:01+00:00"),
+        ("0", "2026-10-21T20:01:00+00:00"),
+        ("Wed, 21 Oct 2026 20:10:00 GMT", "2026-10-21T20:10:00+00:00"),
+        ("", "2026-10-21T20:05:00+00:00"),
+        ("soon", "2026-10-21T20:05:00+00:00"),
+        ("%header{retry-after}", "2026-10-21T20:05:00+00:00"),
+        ("9" * 30, "2026-10-21T20:05:00+00:00"),
+    ],
+    ids=["seconds", "zero", "date", "absent", "unreadable", "old-curl", "unrepresentable"],
+)
+def test_a_429_is_a_rate_limited_reading_with_the_meters_retry_time(
+    tmp_path: Path, retry_after: str, retry_at: str
+) -> None:
+    command = scripted(tmp_path, answered(429, retry_after, RATE_LIMIT_BODY))
+
+    reading = adapter(tmp_path, command).read(CLAUDE_SUBSCRIPTION_METER)
+
+    assert reading.ok is False and reading.failure is UsageFailure.RATE_LIMITED
+    assert reading.retry_at == retry_at
+    assert reading.error == f"{CLAUDE_SUBSCRIPTION_METER} meter rate-limited, next read at {retry_at}"
+
+
+def test_a_429_without_a_json_body_is_still_rate_limited(tmp_path: Path) -> None:
+    reading = adapter(tmp_path, scripted(tmp_path, answered(429, "90", ""))).read(CLAUDE_SUBSCRIPTION_METER)
+
+    assert reading.failure is UsageFailure.RATE_LIMITED
+
+
+def test_a_200_reading_is_unchanged_by_the_status_line(tmp_path: Path) -> None:
+    command = scripted(tmp_path, answered(200, "", json.dumps(BODY)))
+
+    reading = adapter(tmp_path, command).read(CLAUDE_SUBSCRIPTION_METER)
+
+    assert reading.ok and reading.limits[0].percent == 7.0
+    [request] = command.requests
+    assert request.argv[request.argv.index("-w") + 1].endswith("%{http_code} retry-after:%header{retry-after}")
+    assert not {"-i", "-v", "-D", "--include", "--verbose", "--dump-header"} & set(request.argv)
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "failure"),
+    [
+        (503, "", UsageFailure.TRANSPORT),
+        (500, json.dumps(BODY), UsageFailure.TRANSPORT),
+        (401, json.dumps({"error": {"type": "authentication_error"}}), None),
+        (401, "", None),
+        (302, json.dumps(BODY), None),
+    ],
+)
+def test_only_a_lost_answer_is_a_transport_failure(tmp_path: Path, status: int, body: str, failure) -> None:
+    reading = adapter(tmp_path, scripted(tmp_path, answered(status, "", body))).read(CLAUDE_SUBSCRIPTION_METER)
+
+    assert reading.ok is False and reading.failure is failure
+
+
+def _expiring(tmp_path: Path, expires_at: object) -> tuple[ClaudeUsageMeterAdapter, FakeCommandAdapter]:
+    command = scripted(tmp_path, answered(200, "", json.dumps(BODY)))
+    path = tmp_path / "expiring.json"
+    path.write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": SENTINEL, "expiresAt": expires_at}}), encoding="utf-8"
+    )
+    return ClaudeUsageMeterAdapter(command, tmp_path / "usage", credentials_path=path, now=lambda: NOW), command
+
+
+def test_an_expired_sign_in_is_named_without_a_request(tmp_path: Path) -> None:
+    meter, command = _expiring(tmp_path, int(NOW.timestamp() * 1000) - 16 * 3_600_000)
+
+    for reading in (meter.read(CLAUDE_SUBSCRIPTION_METER), meter.sign_in_failure(CLAUDE_SUBSCRIPTION_METER)):
+        assert reading.failure is UsageFailure.SIGN_IN_EXPIRED
+        assert reading.error == (
+            "sign-in expired: run Claude once in this venue to refresh it "
+            "(expired at 2026-10-21T04:00:00+00:00)"
+        )
+        assert SENTINEL not in repr(reading)
+    assert command.requests == []
+    assert meter.sign_in_failure("another-meter") is None
+
+
+@pytest.mark.parametrize(
+    "expires_at", [int(NOW.timestamp() * 1000) + 1, None, "soon", True, float("inf"), 1e300],
+    ids=["future", "absent", "text", "boolean", "infinite", "unrepresentable"],
+)
+def test_a_sign_in_not_known_to_have_expired_is_read(tmp_path: Path, expires_at: object) -> None:
+    meter, command = _expiring(tmp_path, expires_at)
+
+    assert meter.sign_in_failure(CLAUDE_SUBSCRIPTION_METER) is None
+    assert meter.read(CLAUDE_SUBSCRIPTION_METER).ok
+    assert len(command.requests) == 1

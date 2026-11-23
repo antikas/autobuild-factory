@@ -50,6 +50,7 @@ def builder_stdout() -> str:
 def seat_request(tmp_path: Path, **changes) -> SeatRequest:
     workspace = WorkspaceRef(tmp_path / "worktree", "autobuild/item", "base", "lease")
     workspace.root.mkdir(exist_ok=True)
+    (tmp_path / "brief.md").write_text("# Brief\n", encoding="utf-8")
     request = SeatRequest(
         "run", "item", Seat.BUILDER, "model-class", tmp_path / "brief.md", workspace,
         ToolPolicy(frozenset({"read", "write", "python"}), (workspace.root,)),
@@ -109,10 +110,16 @@ def test_the_sdk_lane_reports_its_seat_vector_and_the_names_it_blanks(tmp_path: 
         model_map={"model-class": "model-id"}, client=client,
     )
 
-    adapter.invoke(seat_request(tmp_path, on_launch=launches.append))
+    request = seat_request(tmp_path, on_launch=launches.append)
+    adapter.invoke(request)
 
     (launch,) = launches
     (spec,) = client.specs
+    run_ref = f"{request.run_id}:{request.item_id}:{request.seat.value}:{adapter.adapter_name}"
+    prepared = replace(request, instructions=adapter._materialise_evidence(request))
+    expected = list(adapter._invocation(prepared, run_ref)[0])
+    expected[expected.index("--session-id") + 1] = spec.session_id
+    assert list(launch.argv) == expected
     environment = dict(spec.environment)
     assert launch.in_process is True
     assert launch.removed_environment == SDK_REMOVED

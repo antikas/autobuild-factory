@@ -556,6 +556,36 @@ def test_workspace_confirm_delivery_rejects_an_out_of_root_workspace(tmp_path: P
     assert fake.confirmed == []
 
 
+def test_a_brief_or_evidence_outside_the_roots_is_refused_without_its_absolute_path(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "allowed" / "worktree"
+    request = SeatRequest(
+        "run", "item", Seat.BUILDER, "model", tmp_path / "private" / "brief.md",
+        WorkspaceRef(worktree, "branch", "base", "lease"),
+        ToolPolicy(frozenset(), (worktree,)), "Build it", "builder-report-v1", 60,
+    )
+    port = PolicyGateway(policy(tmp_path / "allowed")).harness(FakeHarnessAdapter(identity("h")))
+
+    with pytest.raises(PolicyViolation) as refused:
+        port.invoke(request)
+    assert str(refused.value) == "seat brief is outside the allowed roots: brief.md"
+
+    with pytest.raises(PolicyViolation) as refused:
+        port.invoke(replace(request, brief_ref="../private/brief.md"))
+    assert str(refused.value) == "seat brief is outside the allowed roots: ../private/brief.md"
+
+    with pytest.raises(PolicyViolation) as refused:
+        port.invoke(
+            replace(
+                request,
+                brief_path=worktree / "brief.md",
+                context_refs=(str(tmp_path / "private" / "change.patch"),),
+            )
+        )
+    assert str(refused.value) == "seat evidence is outside the allowed roots: change.patch"
+
+
 # --- Selection fence -----------------------------------------------------------
 
 
@@ -824,7 +854,9 @@ def preflight_request(tmp_path: Path, **overrides) -> PreflightRequest:
 def passing_probes(tmp_path: Path):
     network = FakeNetworkProbe()
     environment = FakeEnvironmentProbe(executables={"python": "/bin/python"})
-    filesystem = FakeFilesystemProbe(files={str(tmp_path / "brief.md"): 10})
+    filesystem = FakeFilesystemProbe(
+        files={str(tmp_path / "brief.md"): 10}, texts={str(tmp_path / "brief.md"): "# Build it\n"}
+    )
     command = FakeCommandAdapter(
         identity("command"),
         scripted_results=[_cmd(tmp_path, "version"), _cmd(tmp_path, "offline")],
@@ -1244,14 +1276,37 @@ def test_preflight_quotes_at_most_160_characters_of_a_refused_line(tmp_path: Pat
     assert line[:161] not in detail
 
 
-def test_preflight_reads_a_brief_without_text_as_empty_and_passes(tmp_path: Path) -> None:
-    probes = passing_probes(tmp_path)
+@pytest.mark.parametrize("text", ["", " \n\t\n"], ids=["zero-byte", "whitespace"])
+def test_preflight_stops_when_a_ready_brief_is_empty(tmp_path: Path, text: str) -> None:
+    probes = _brief_probes(tmp_path, text)
 
-    briefs = run(_fenced_request(tmp_path), *probes)[-1]
+    with pytest.raises(PreflightError) as caught:
+        run(_fenced_request(tmp_path), *probes)
 
-    assert briefs.passed
-    assert "declared paths inside the fence" in briefs.detail
-    assert "no git staging instructions" in briefs.detail
+    assert str(caught.value) == (
+        f"briefs preflight failed: brief for APP-1 is empty: {tmp_path / 'brief.md'}"
+    )
+
+
+def test_preflight_keeps_the_messages_of_an_unusable_brief(tmp_path: Path) -> None:
+    path = tmp_path / "brief.md"
+
+    def message(prepare) -> str:
+        network, environment, filesystem, command = passing_probes(tmp_path)
+        prepare(filesystem)
+        with pytest.raises(PreflightError) as caught:
+            run(preflight_request(tmp_path), network, environment, filesystem, command)
+        return str(caught.value)
+
+    assert message(lambda fs: fs.files.clear()) == (
+        f"briefs preflight failed: brief for APP-1 is missing: {path}"
+    )
+    assert message(lambda fs: fs.files.update({str(path): 1_048_577})) == (
+        f"briefs preflight failed: brief for APP-1 exceeds 1048576 bytes: {path}"
+    )
+    assert message(lambda fs: fs.read_errors.update({str(path): OSError("not text")})) == (
+        "briefs preflight failed: brief for APP-1 cannot be read as text: not text"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1288,6 +1343,21 @@ def test_preflight_reads_a_brief_without_text_as_empty_and_passes(tmp_path: Path
         "Afterwards `git add -A`.",
         "- Run `git add -A`.",
         "You have to run `git add -A`.",
+        "Afterward `git add -A`.",
+        "The patch gets applied with `git apply --index x.patch`.",
+        "The old file is removed (`git rm`).",
+        "Old files: removed with `git rm`.",
+        "Retire the old module with `git rm`.",
+        "The builder removes them with `git rm`.",
+        "The builder runs `git add -A` at the end.",
+        "Do not edit main: run `git add -A` instead.",
+        "Required: git commit -m x",
+        "Build it, then `git reset --hard` so nothing stays.",
+        "Afterwards `git add -A` as well.",
+        "Build it, then `git add -A` plus the docs.",
+        "Be sure to run `git add -A`.",
+        "Let the old file be removed with `git rm`.",
+        "The old file is removed with `cd x && git rm a`.",
     ],
 )
 def test_the_git_reader_refuses_a_staging_instruction(line: str) -> None:
@@ -1312,6 +1382,20 @@ def test_the_git_reader_refuses_a_staging_instruction(line: str) -> None:
         "A fake seat that runs `git commit --allow-empty` makes the close raise.",
         "The deletions were staged by `git rm` in the first build.",
         "Apply with `git apply -3`; the earlier build cleared the index with `git reset -q`.",
+        "Five test files still commit by hand after such a command, so `git commit` "
+        "finds nothing to commit and the fixture helper raises.",
+        "Leave changes uncommitted. Forbidden: git commit, checkout, stash, clean, "
+        "branch, rebase, reset, amend, force flags.",
+        "The test commits by hand, and `git commit` finds nothing.",
+        "Never: `git add -A`.",
+        "The patch got applied with `git apply --index x.patch`.",
+        "Cause: the patch applied with `git apply --index`.",
+        "The builder ran `git add -A` at the end.",
+        "The builder's notes quote `git add -A`.",
+        "The builder was shown `git add -A` output.",
+        "The builder has staged them with `git add -A` already.",
+        "The lock is held with a lease while the earlier `git commit` finishes.",
+        "The old file removed with `git rm` is still listed.",
     ],
 )
 def test_the_git_reader_passes_a_line_that_does_not_stage(line: str) -> None:
@@ -1321,14 +1405,13 @@ def test_the_git_reader_passes_a_line_that_does_not_stage(line: str) -> None:
 @pytest.mark.parametrize(
     "line",
     [
-        "The builder runs `git add -A` at the end.",
         "When done, `git add -A` and finish.",
     ],
 )
 def test_the_git_reader_does_not_see_an_order_without_a_verb_modal_or_bare_command(
     line: str,
 ) -> None:
-    # Known gaps: these order the builder to stage, but carry no cue the reader reads.
+    # Known gap: this orders the builder to stage, but carries no cue the reader reads.
     assert git_staging_lines(line) == ()
 
 
@@ -1364,16 +1447,6 @@ def test_the_git_reader_ignores_negation_words_inside_a_fenced_block() -> None:
     (refused,) = git_staging_lines(text)
 
     assert refused.line_number == 5
-
-
-def test_this_item_brief_and_the_constraints_pass_both_brief_checks() -> None:
-    root = Path(__file__).resolve().parents[2]
-    if not (root / "docs" / "items").is_dir():
-        pytest.skip("item briefs are private and absent from the public tree")
-    for name in ("brief-faults-refused-early.md", "CONSTRAINTS.md"):
-        text = (root / "docs" / "items" / name).read_text(encoding="utf-8")
-        assert git_staging_lines(text) == (), name
-        assert out_of_fence_paths(text, repository_root=root, allowed_roots=(root,)) == ()
 
 
 def test_the_launch_preflight_passes_the_claim_time_roots(
