@@ -32,6 +32,7 @@ from autobuild.domain import (
     review_verdict_rule_error,
 )
 from autobuild.domain import LeaseGrant, LeaseRequest, LeaseSurface
+from autobuild.enforcement.brief_file import portable_path, seat_brief_name
 from autobuild.ports import (
     CommandPort,
     HarnessPort,
@@ -90,9 +91,12 @@ def _is_within(path: Path, roots: tuple[Path, ...]) -> bool:
     )
 
 
-def _require_path(path: Path, config: PolicyConfig, label: str) -> None:
+def _require_path(
+    path: Path, config: PolicyConfig, label: str, named: str | None = None
+) -> None:
     if not _is_within(path, config.allowed_roots):
-        raise PolicyViolation(f"{label} is outside the allowed roots: {path}")
+        shown = path if named is None else named
+        raise PolicyViolation(f"{label} is outside the allowed roots: {shown}")
 
 
 def _require_workspace(workspace: WorkspaceRef, config: PolicyConfig) -> None:
@@ -191,7 +195,9 @@ class EnforcedHarnessPort:
 
     def invoke(self, request: SeatRequest):
         _require_workspace(request.workspace, self._config)
-        _require_path(request.brief_path, self._config, "seat brief")
+        _require_path(
+            request.brief_path, self._config, "seat brief", seat_brief_name(request)
+        )
         if request.timeout_seconds > self._config.max_seat_timeout_seconds:
             raise PolicyViolation("seat timeout exceeds the policy ceiling")
         if not request.tool_policy.allowed_tools <= self._config.allowed_tools:
@@ -211,7 +217,12 @@ class EnforcedHarnessPort:
         for reference in request.context_refs:
             path = Path(reference).expanduser()
             if path.is_absolute():
-                _require_path(path, self._config, "seat evidence")
+                _require_path(
+                    path,
+                    self._config,
+                    "seat evidence",
+                    portable_path(reference, request.workspace.root),
+                )
         if request.tool_policy.allow_destructive and not self._config.allow_destructive:
             raise PolicyViolation("destructive tool access has no human gate")
         if request.tool_policy.allow_publication and not self._config.allow_publication:

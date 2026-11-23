@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import TypeVar
 from uuid import uuid4
@@ -36,7 +36,12 @@ from autobuild.domain import (
     WorktreeSnapshot,
     WorktreeStatus,
 )
-from autobuild.domain.models import DeliveryParked, DeliveryParkReason, ValidationCheckout
+from autobuild.domain.models import (
+    DefaultBranchUnknown,
+    DeliveryParked,
+    DeliveryParkReason,
+    ValidationCheckout,
+)
 from autobuild.adapters.tracker_commits import (
     require_one_tracker_commit,
 )
@@ -144,6 +149,7 @@ class GitWorkspaceAdapter:
             raise ValueError("tracker_paths must contain repository-relative paths")
         self._leases: dict[str, _Lease] = {}
         self._lock = Lock()
+        self._launch: RepositoryIdentity | None = None
 
     def probe(self) -> ProbeResult:
         try:
@@ -164,16 +170,27 @@ class GitWorkspaceAdapter:
             str(self._scratch_root),
         )
 
+    def bind_launch(self, launch: RepositoryIdentity) -> None:
+        """Keep the launch's default branch for every later identity of its
+        repository, whatever the remote answers afterwards."""
+
+        if not launch.default_branch_established:
+            raise ValueError("a launch is bound to an established default branch only")
+        self._launch = launch
+
     def identify(self, root: Path) -> RepositoryIdentity:
         resolved = Path(self._git(root, "rev-parse", "--show-toplevel")).resolve(strict=True)
         revision = self._git(resolved, "rev-parse", "HEAD")
-        default_branch = self._default_branch(resolved)
+        if self._launch is not None and self._launch.root == resolved:
+            default_branch, established = self._launch.default_branch, True
+        else:
+            default_branch, established = self._default_branch(resolved)
         current_branch = self._git(resolved, "branch", "--show-current")
         remotes = self._git(resolved, "remote").splitlines()
         if self._remote not in remotes:
             raise AdapterError(f"required git remote is missing: {self._remote}")
         return RepositoryIdentity(
-            resolved, default_branch, current_branch, self._remote, revision
+            resolved, default_branch, current_branch, self._remote, revision, established
         )
 
     def create_isolated(self, campaign: CampaignRef, item: WorkItem) -> WorkspaceRef:
@@ -373,8 +390,14 @@ class GitWorkspaceAdapter:
         if not current.changed_paths:
             raise EvidenceError("accepted item has no scoped product change")
         paths = [entry.path.as_posix() for entry in current.changed_paths]
-        self._git(workspace.root, "add", "-A", "--", *paths)
-        self._git(workspace.root, "commit", "-m", request.commit_message, "--", *paths)
+        real = self._worktree_changes(workspace.root, workspace.start_commit)
+        replaced = self._replaced_paths(current.changed_paths)
+        committed = [path for path in paths if path in real and path not in replaced]
+        if not committed:
+            raise EvidenceError("accepted item has no scoped product change")
+        staged = [path for path in paths if path not in replaced]
+        self._stage(workspace.root, staged)
+        self._git(workspace.root, "commit", "-m", request.commit_message, "--", *committed)
         item_commit = self._git(workspace.root, "rev-parse", "HEAD")
         self._require_full_commit(workspace.root, paths)
         return item_commit
@@ -1121,7 +1144,69 @@ class GitWorkspaceAdapter:
     def _changed_paths(self, workspace: WorkspaceRef) -> tuple[ChangedPath, ...]:
         return self._changed_against(workspace.root, workspace.start_commit)
 
+    def _stage(self, root: Path, paths: list[str]) -> None:
+        """Stage ``paths`` from the working tree. Git refuses the whole call for
+        one path that is in neither the working tree nor the index, and such a
+        path is a deletion that is staged already."""
+
+        indexed = set(self._git(root, "ls-files", "-z").split("\0"))
+        present = [path for path in paths if path in indexed or os.path.lexists(root / path)]
+        if present:
+            self._git(root, "add", "-A", "--", *present)
+
+    @staticmethod
+    def _replaced_paths(changed: tuple[ChangedPath, ...]) -> set[str]:
+        """The deleted paths whose place a present changed path takes: a file
+        that became a folder, or a folder that became a file or a link. Git
+        follows the new entry on disk when such a path is named, and refuses;
+        staging the new entry removes the old one by itself."""
+
+        present = {
+            entry.path.as_posix() for entry in changed if entry.kind is not ChangeKind.DELETED
+        }
+        folders = {parent.as_posix() for path in present for parent in PurePosixPath(path).parents}
+        return {
+            path
+            for path in (
+                entry.path.as_posix() for entry in changed if entry.kind is ChangeKind.DELETED
+            )
+            if path in folders
+            or any(parent.as_posix() in present for parent in PurePosixPath(path).parents)
+        }
+
     def _changed_against(self, root: Path, base: str) -> tuple[ChangedPath, ...]:
+        """Every product path the working tree or the index holds differently
+        from ``base``. A path changed in the index alone, a new file staged and
+        then deleted or an edit staged and then undone, is listed too: it must
+        be restaged for the delivered worktree to be clean."""
+
+        entries = self._worktree_changes(root, base)
+        for path, kind in self._index_changes(root, base).items():
+            if path not in entries:
+                entries[path] = (
+                    ChangeKind.DELETED if kind is ChangeKind.ADDED else ChangeKind.MODIFIED
+                )
+        changed: list[ChangedPath] = []
+        for value, kind in sorted(entries.items()):
+            path = root / value
+            if kind is not ChangeKind.DELETED and path.is_symlink():
+                kind = ChangeKind.SYMLINK
+            digest = None if kind is ChangeKind.DELETED else self._digest(path)
+            changed.append(ChangedPath(Path(value), kind, digest))
+        return tuple(changed)
+
+    def _worktree_changes(self, root: Path, base: str) -> dict[str, ChangeKind]:
+        entries = self._name_status(root, base)
+        untracked = self._git(root, "ls-files", "--others", "--exclude-standard", "-z")
+        for path in filter(None, untracked.split("\0")):
+            if self._is_product_path(path):
+                entries[path] = ChangeKind.ADDED
+        return entries
+
+    def _index_changes(self, root: Path, base: str) -> dict[str, ChangeKind]:
+        return self._name_status(root, "--cached", "--ita-visible-in-index", base)
+
+    def _name_status(self, root: Path, *against: str) -> dict[str, ChangeKind]:
         entries: dict[str, ChangeKind] = {}
         raw = self._git(
             root,
@@ -1129,7 +1214,7 @@ class GitWorkspaceAdapter:
             "--name-status",
             "-z",
             "--no-renames",
-            base,
+            *against,
             "--",
         )
         fields = raw.split("\0")
@@ -1149,18 +1234,7 @@ class GitWorkspaceAdapter:
                 else:
                     kind = ChangeKind.MODIFIED
                 entries[path] = kind
-        untracked = self._git(root, "ls-files", "--others", "--exclude-standard", "-z")
-        for path in filter(None, untracked.split("\0")):
-            if self._is_product_path(path):
-                entries[path] = ChangeKind.ADDED
-        changed: list[ChangedPath] = []
-        for value, kind in sorted(entries.items()):
-            path = root / value
-            if kind is not ChangeKind.DELETED and path.is_symlink():
-                kind = ChangeKind.SYMLINK
-            digest = None if kind is ChangeKind.DELETED else self._digest(path)
-            changed.append(ChangedPath(Path(value), kind, digest))
-        return tuple(changed)
+        return entries
 
     @staticmethod
     def _revision_digest(head: str, changed: tuple[ChangedPath, ...]) -> str:
@@ -1297,24 +1371,28 @@ class GitWorkspaceAdapter:
                 "brings in: " + ", ".join(collisions)
             )
 
-    def _default_branch(self, root: Path) -> str:
+    def _default_branch(self, root: Path) -> tuple[str, bool]:
+        """The default branch, and whether it is established: a recorded remote
+        head or the remote's answer establishes it, the current branch is a
+        guess."""
+
         symbolic = self._git(
             root, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{self._remote}/HEAD", check=False
         )
         prefix = f"{self._remote}/"
         if symbolic.startswith(prefix):
-            return symbolic[len(prefix) :]
+            return symbolic[len(prefix) :], True
         remote_head = self._git(root, "ls-remote", "--symref", self._remote, "HEAD", check=False)
         for line in remote_head.splitlines():
             if not line.startswith("ref: refs/heads/"):
                 continue
             reference, _, name = line.partition("\t")
             if name == "HEAD":
-                return reference.removeprefix("ref: refs/heads/")
+                return reference.removeprefix("ref: refs/heads/"), True
         current = self._git(root, "branch", "--show-current")
         if not current:
-            raise AdapterError("cannot determine the repository default branch")
-        return current
+            raise DefaultBranchUnknown("cannot determine the repository default branch")
+        return current, False
 
     @staticmethod
     def _git(root: Path, *args: str, check: bool = True) -> str:

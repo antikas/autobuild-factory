@@ -7,18 +7,27 @@ import json
 import math
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from autobuild.adapters.local_records import request_pause
 from autobuild.adapters.progress import ProgressLogReader, is_completion_line
+from autobuild.adapters.usage_cache import SOURCE_METER, SourcedReading
 from autobuild.bootstrap.composition import (
     host_capacity,
     preflight_report,
     read_usage,
     run_campaign,
+    subscription_status,
 )
+from autobuild.bootstrap.subscription_review import ReviewError, subscription_review
 from autobuild.bootstrap.environment import resolve_runs_root
-from autobuild.bootstrap.profile import ConfigurationError, ProfileOverrides, load_settings
+from autobuild.bootstrap.profile import (
+    ConfigurationError,
+    ProfileOverrides,
+    load_settings,
+    resolve_scratch_root,
+)
 from autobuild.domain import (
     CapacityPolicy,
     DeliveryMode,
@@ -41,12 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     _profile_arguments(run)
     run.add_argument("--campaign-id")
     run.add_argument("--allow-delivery", action="store_true")
-    run.add_argument(
-        "--delivery-mode",
-        choices=tuple(mode.value for mode in DeliveryMode),
-        default=DeliveryMode.PROTECTED_DEFAULT.value,
-        help="Delivery target: protected default branch or the invoking PR branch.",
-    )
+    _delivery_mode_argument(run)
     run.add_argument(
         "--push-current-branch",
         action="store_true",
@@ -99,7 +103,26 @@ def _parser() -> argparse.ArgumentParser:
         help="Read the subscription usage meter once, read-only",
     )
     usage.add_argument("--json", action="store_true", help="Print the normalised reading as JSON.")
-    usage.add_argument("--scratch-root", help="Directory for the meter command's output files.")
+    usage.add_argument("--repository", default=".")
+    usage.add_argument("--profile")
+    usage.add_argument("--scratch-root", help=(
+        "Folder that holds the shared reading and the meter command's output files."
+    ))
+
+    subscription = subcommands.add_parser("subscription-status", help="Read subscription admission state without claiming work")
+    subscription.add_argument("--repository", default=".")
+    subscription.add_argument("--profile")
+    subscription.add_argument("--scratch-root")
+    subscription.add_argument("--json", action="store_true")
+
+    review = subcommands.add_parser("subscription-review", help="Run one independent read-only subscription review")
+    review.add_argument("--repository", default=".")
+    review.add_argument("--profile")
+    review.add_argument("--scratch-root")
+    review.add_argument("--commit", required=True)
+    review.add_argument("--brief", type=Path, required=True)
+    review.add_argument("--timeout-seconds", type=float, default=900.0)
+    review.add_argument("--json", action="store_true")
 
     host = subcommands.add_parser(
         "host",
@@ -120,8 +143,18 @@ def _parser() -> argparse.ArgumentParser:
         help="Probe every lane and run the launch preflight without claiming any item",
     )
     _profile_arguments(preflight)
+    _delivery_mode_argument(preflight)
     preflight.add_argument("--json", action="store_true", help="Print the report as JSON.")
     return parser
+
+
+def _delivery_mode_argument(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--delivery-mode",
+        choices=tuple(mode.value for mode in DeliveryMode),
+        default=DeliveryMode.PROTECTED_DEFAULT.value,
+        help="Delivery target: protected default branch or the invoking PR branch.",
+    )
 
 
 def _profile_arguments(command: argparse.ArgumentParser) -> None:
@@ -290,19 +323,41 @@ def usage_payload(reading: UsageReading) -> dict[str, object]:
     }
 
 
-def _usage(args: argparse.Namespace, read=read_usage) -> int:
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _reading_source_line(sourced: SourcedReading, now: datetime) -> str:
+    """How old the reading is and whether the shared file or the meter gave it."""
+
+    reading = sourced.reading
+    try:
+        fetched = datetime.fromisoformat(reading.fetched_at)
+        age = f"{round((now - fetched).total_seconds())} s old"
+    except (TypeError, ValueError, OverflowError):
+        age = "of unknown age"
+    if sourced.from_shared_file:
+        return f"  reading {age}, from the shared subscription cache"
+    return f"  reading {age}, read from the meter"
+
+
+def _usage(
+    args: argparse.Namespace, read=read_usage, now=_utc_now, scratch: Path | None = None
+) -> int:
     """Print one meter reading; exit 0 when the meter answered and 1 when not."""
 
-    scratch = Path(args.scratch_root) if args.scratch_root else None
     try:
-        reading = read(scratch)
+        result = read(scratch)
     except Exception as exc:
         print(f"usage meter unavailable: {type(exc).__name__}", file=sys.stderr)
         return 1
+    sourced = result if isinstance(result, SourcedReading) else SourcedReading(result, SOURCE_METER)
+    reading = sourced.reading
     if args.json:
         print(json.dumps(usage_payload(reading), indent=2, sort_keys=True))
     elif not reading.ok:
         print(f"usage meter {reading.meter_id} unavailable: {reading.error}")
+        print(_reading_source_line(sourced, now()))
     else:
         print(f"usage meter {reading.meter_id} at {reading.fetched_at}:")
         for limit in reading.limits:
@@ -310,6 +365,7 @@ def _usage(args: argparse.Namespace, read=read_usage) -> int:
         if reading.extra_usage_enabled is not None:
             state = "enabled" if reading.extra_usage_enabled else "off"
             print(f"  extra usage {state}")
+        print(_reading_source_line(sourced, now()))
     return 0 if reading.ok else 1
 
 
@@ -405,11 +461,11 @@ def _host(args: argparse.Namespace, read=host_capacity) -> int:
 
 def _preflight(args: argparse.Namespace, report=preflight_report) -> int:
     """Print the lane probes and the preflight; exit 0 when the launch would
-    pass, 1 when a check fails and 2 when the profile or runtime cannot load."""
+    pass, 1 when a check or the delivery branch fails and 2 when the profile or runtime cannot load."""
 
     try:
         settings = load_settings(args.repository, args.profile, _overrides(args))
-        result = report(settings)
+        result = report(settings, delivery_mode=DeliveryMode(args.delivery_mode))
     except Exception as exc:
         print(f"AutoBuild preflight failed before completion: {exc}", file=sys.stderr)
         return 2
@@ -427,6 +483,40 @@ def _preflight(args: argparse.Namespace, report=preflight_report) -> int:
     return 0 if result["ok"] else 1
 
 
+def _subscription_status(args: argparse.Namespace, status=subscription_status) -> int:
+    try:
+        settings = load_settings(args.repository, args.profile, ProfileOverrides(scratch_root=args.scratch_root))
+        result = status(settings)
+    except Exception:
+        print("AutoBuild subscription status failed", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        for lane in result["lanes"]:
+            state = "available" if lane["eligible"] else "unavailable"
+            print(f"lane {lane['lane']}: {state} ({lane['reason']})")
+        for row in result.get("manifest", ()):
+            if not row["available"]:
+                print(f"lane {row['name']}: unavailable ({row.get('meter_unread') or row['detail']})")
+        print("recommendation: " + (result["recommendation"] or {}).get("lane", "none"))
+    return 0 if result["recommendation"] else 1
+
+
+def _subscription_review(args: argparse.Namespace, review=subscription_review) -> int:
+    try:
+        settings = load_settings(args.repository, args.profile, ProfileOverrides(scratch_root=args.scratch_root))
+        result = review(settings, args.commit, args.brief, args.timeout_seconds)
+    except ReviewError as exc:
+        print(f"AutoBuild subscription review failed: {exc}", file=sys.stderr)
+        return 2
+    except Exception:
+        print("AutoBuild subscription review failed while accessing the configuration, checkout or evidence.", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else f"{result['verdict']} via {result['lane']} ({result['model']})")
+    return 0 if result["verdict"] == "pass" else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "watch":
@@ -434,7 +524,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "pause":
         return _pause(args)
     if args.command == "usage":
-        return _usage(args)
+        try:
+            scratch = resolve_scratch_root(args.repository, args.profile, args.scratch_root)
+        except (ConfigurationError, OSError, UnicodeError) as exc:
+            print(f"autobuild usage: {exc}", file=sys.stderr)
+            return 2
+        return _usage(args, scratch=scratch)
+    if args.command == "subscription-status":
+        return _subscription_status(args)
+    if args.command == "subscription-review":
+        return _subscription_review(args)
     if args.command == "preflight":
         return _preflight(args)
     if args.command == "host":

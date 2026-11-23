@@ -128,6 +128,9 @@ def run_two_items(tmp_path: Path) -> tuple[Path, CodexHarnessAdapter, dict[str, 
     commands.barrier = threading.Barrier(len(ITEMS), timeout=WAIT_SECONDS)
     harness = CodexHarnessAdapter(commands, scratch / "harness" / "codex", command=("codex",))
     workspaces = {item_id: workspace_of(tmp_path, item_id) for item_id in ITEMS}
+    for workspace in workspaces.values():
+        workspace.root.mkdir(parents=True)
+        (workspace.root / "brief.md").write_text("# Brief\n", encoding="utf-8")
     ports = WorkflowPorts(
         FakeTrackerAdapter(identity("tracker")),
         FakeWorkspaceAdapter(

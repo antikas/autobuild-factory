@@ -34,6 +34,7 @@ from autobuild.domain import (
     ItemExecutionSpec,
     ItemOutcome,
     ItemState,
+    LaneSignalKind,
     LeaseGrant,
     LeaseHeld,
     LeaseRecord,
@@ -577,6 +578,8 @@ class _Schedule:
     # Ready items the tracker passed over, with the reason, recorded once.
     skipped: dict[str, str] = field(default_factory=dict)
     stop: CampaignStopReason | None = None
+    # The earliest lane reset named when the campaign stopped for usage.
+    usage_resets_at: str | None = None
     orphans_reported: bool = False
     draining: bool = False
     last_wait: tuple[object, ...] | None = None
@@ -716,6 +719,7 @@ class CampaignRunner:
                 campaign,
                 stop,
                 frozenset(schedule.parked_signatures) | frozenset(schedule.taken),
+                schedule.usage_resets_at,
             )
             unbuilt = self._allowed_unbuilt(campaign, outcomes, stop, frozenset(schedule.taken))
             relative_report = f"docs/campaigns/{campaign.campaign_id}.md"
@@ -1033,7 +1037,7 @@ class CampaignRunner:
             # admitted until the level changes: skip reading the tracker.
             schedule.held = True
             return False
-        if not self._lanes_available():
+        if not self._lanes_available() and not self._usage_cooling_lifted(record):
             self._append(
                 record,
                 RunEvent(
@@ -1041,6 +1045,8 @@ class CampaignRunner:
                     payload={"lanes": [lane.name for lane in self._ports.lanes]},
                 ),
             )
+            if self._stopped_for_usage(record, schedule):
+                return False
             self._begin_hold(record, schedule, HoldCondition.LANES_EXHAUSTED, "")
             # Deciding the new hold arms the timer for its first probe.
             return self._hold_released(campaign, record, schedule)
@@ -1404,7 +1410,9 @@ class CampaignRunner:
         # An item error ends only the item. A condition that blocks all work
         # holds admissions instead of stopping the campaign.
         if outcome.lanes_exhausted:
-            self._begin_hold(record, schedule, HoldCondition.LANES_EXHAUSTED, "")
+            self._usage_cooling_lifted(record)
+            if not self._stopped_for_usage(record, schedule):
+                self._begin_hold(record, schedule, HoldCondition.LANES_EXHAUSTED, "")
         elif outcome.tracker_stop is not None:
             self._append(
                 record,
@@ -2471,6 +2479,76 @@ class CampaignRunner:
         except Exception:
             return False
 
+    def _usage_cooling_lifted(self, record: RunRecordRef) -> bool:
+        """Re-judge every configured lane's usage cooling against this run's
+        stop levels, clearing each one whose lane now reads below them. True
+        when at least one was cleared. An unreadable lane state clears none."""
+
+        lanes = self._ports.lanes
+        state = self._ports.lane_state
+        if not lanes or state is None:
+            return False
+
+        def emit(event_type: str, payload: dict[str, object]) -> None:
+            self._append(record, RunEvent(event_type=event_type, payload=payload))
+
+        lifted = False
+        for lane in lanes:
+            try:
+                cooling = state.active(lane.name)
+                if cooling is not None and self._items.usage_cooling_cleared(
+                    lane, cooling, emit
+                ):
+                    lifted = True
+            except Exception:
+                continue
+        return lifted
+
+    def _stopped_for_usage(self, record: RunRecordRef, schedule: _Schedule) -> bool:
+        """Observe ``usage_stop`` when every configured lane is cooled with the
+        usage signature. A usage reset can be days away, so the campaign drains
+        and ends instead of holding. A campaign already stopping for usage
+        returns True with no new event. Any other cooling, a lane not cooled, an
+        unreadable lane state or another stop already observed returns False
+        and the caller holds as for any exhausted lanes."""
+
+        if schedule.stop is CampaignStopReason.USAGE_STOP:
+            return True
+        lanes = self._ports.lanes
+        state = self._ports.lane_state
+        if not lanes or state is None or schedule.stop is not None:
+            return False
+        try:
+            coolings = [state.active(lane.name) for lane in lanes]
+        except Exception:
+            return False
+        usage = LaneSignalKind.USAGE.value
+        if any(cooling is None or cooling.signature != usage for cooling in coolings):
+            return False
+        held = [cooling for cooling in coolings if cooling is not None]
+        resets_at = _earliest_reset(cooling.cooled_until for cooling in held)
+        self._append(
+            record,
+            RunEvent(
+                event_type="campaign.usage_stop",
+                payload={
+                    "lanes": [
+                        {
+                            "lane": cooling.lane,
+                            "cooled_until": cooling.cooled_until,
+                            "signature": cooling.signature,
+                        }
+                        for cooling in held
+                    ],
+                    "resets_at": resets_at,
+                    "running": sorted(schedule.running),
+                },
+            ),
+        )
+        schedule.usage_resets_at = resets_at
+        schedule.observe_stop(CampaignStopReason.USAGE_STOP)
+        return True
+
     def _lanes_available(self) -> bool:
         """True unless every configured lane is currently cooled.
 
@@ -2610,7 +2688,14 @@ class CampaignRunner:
         campaign: CampaignRef,
         stop: CampaignStopReason,
         skip: frozenset[str] = frozenset(),
+        usage_resets_at: str | None = None,
     ) -> str:
+        if stop is CampaignStopReason.USAGE_STOP:
+            return (
+                "usage_stop: every lane is stopped for usage until "
+                f"{usage_resets_at or 'an unknown time'}; launch the campaign again "
+                "after that reset"
+            )
         if stop is CampaignStopReason.QUEUE_DRY:
             return "queue dry"
         if stop is CampaignStopReason.HOLD_LIMIT:
@@ -2789,6 +2874,25 @@ def _batch_validation_section(batches: BatchValidationSummary) -> list[str]:
         lines.append(", ".join(parts))
     lines.append("")
     return lines
+
+
+def _earliest_reset(moments) -> str | None:
+    """The earliest of the given reset instants; an unreadable one is passed
+    over unless none can be read."""
+
+    named = [moment for moment in moments if moment]
+    readable: list[tuple[datetime, str]] = []
+    for moment in named:
+        try:
+            parsed = datetime.fromisoformat(moment)
+        except (TypeError, ValueError):
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        readable.append((parsed, moment))
+    if readable:
+        return min(readable)[1]
+    return named[0] if named else None
 
 
 def _render_report(

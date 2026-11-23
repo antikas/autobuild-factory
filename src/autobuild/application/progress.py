@@ -45,6 +45,10 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
         )
     if event_type == "item.claimed":
         return f"item {item_id} claimed: {payload.get('title', '')}"
+    if event_type == "subscription.admission":
+        reasons = ", ".join(f"{lane['lane']} {lane['reason']}" for lane in payload.get("lanes", []))
+        selected = (payload.get("recommendation") or {}).get("lane", "on hold")
+        return f"item {item_id} {payload.get('seat')} subscription {selected} ({reasons})"
     if event_type == "seat.started":
         lane = payload.get("lane")
         return (
@@ -264,6 +268,42 @@ def _body(event_type: str, item_id: str, payload: Mapping[str, Any]) -> str:
         )
     if event_type == "item.delivery_waiting":
         return f"item {item_id} delivery waits behind {payload.get('ahead', '?')} delivery(ies)"
+    if event_type == "usage.meter_failed":
+        return _meter_failed(item_id, payload) + _reading_age(payload)
+    if event_type == "usage.warning":
+        return (
+            f"{_seat_on_lane(item_id, payload)}: usage {_limit(payload)} is at or above "
+            f"the warning level {_number(payload.get('warn_percent'))}%; admissions slow "
+            "to one item at a time"
+        ) + _reading_age(payload)
+    if event_type == "usage.stop":
+        return (
+            f"{_seat_on_lane(item_id, payload)}: lane stopped at its usage level "
+            f"({_one_ascii_line(payload.get('detail'))}); the seat moves to the next lane "
+            "or the item waits"
+        ) + _reading_age(payload)
+    if event_type == "usage.seat_rerouted":
+        limits = "; ".join(_limit(entry) for entry in payload.get("limits", ()) or ())
+        return (
+            f"{_seat_on_lane(item_id, payload)}: a scoped usage limit at its stop level "
+            f"({limits}) covers the seat's model; the seat moves past the lane"
+        )
+    if event_type == "campaign.usage_stop":
+        lanes = ", ".join(
+            str(entry.get("lane", "")) for entry in payload.get("lanes", ()) or ()
+        )
+        return (
+            f"every lane is stopped for usage ({lanes}): no new item is admitted; "
+            "the items in flight finish and the campaign ends with usage_stop; "
+            f"the earliest reset is {payload.get('resets_at') or 'unknown'}"
+        )
+    if event_type == "lane.usage_cooling_cleared":
+        return (
+            f"lane {payload.get('lane', '')} usage cooling until "
+            f"{payload.get('cooled_until', '')} from campaign "
+            f"{payload.get('campaign_id', '')} cleared: the meter reads "
+            f"{_number(payload.get('percent'))}%, below this run's stop levels"
+        )
     if event_type == "campaign.completed":
         return (
             f"{CAMPAIGN_COMPLETED_PREFIX}: shipped {payload.get('accepted', 0)}, "
@@ -304,6 +344,79 @@ _PRESSURE_EFFECTS = {
     "high": "no new admissions or heavy commands",
     "critical": "no new admissions; queued heavy commands wait",
 }
+
+
+def _reading_age(payload: Mapping[str, Any]) -> str:
+    if "reading_age_seconds" not in payload:
+        return ""
+    age = payload.get("reading_age_seconds")
+    if isinstance(age, bool) or not isinstance(age, (int, float)):
+        return "; reading age unknown"
+    return f"; reading {_number(age)} s old"
+
+
+def _meter_failed(item_id: str, payload: Mapping[str, Any]) -> str:
+    action = payload.get("action", "")
+    head = (
+        f"{_seat_on_lane(item_id, payload)}: usage meter reading failed "
+        f"({_one_ascii_line(payload.get('error'))})"
+    )
+    last_good = payload.get("last_good")
+    if isinstance(last_good, Mapping):
+        percent = last_good.get("percent")
+        stop = payload.get("stop_percent")
+        if _at_or_above(percent, stop):
+            level = f"stop level {_number(stop)}%"
+        else:
+            level = f"warning level {_number(payload.get('warn_percent'))}%"
+        fetched = _one_ascii_line(last_good.get("fetched_at"))
+        good = (
+            f"last good reading {_limit(last_good)} reached the {level}"
+            + (f" at {fetched}" if fetched else "")
+        )
+        if action == "stop":
+            return (
+                f"{head}; {good}; the hold reached its limit of "
+                f"{_seconds(payload.get('hold_limit_seconds'))} and the item ends"
+            )
+        return (
+            f"{head}; {good}; holding the seat until a reading succeeds, next read in "
+            f"{_seconds(payload.get('retry_seconds'))}"
+        )
+    if action == "allow":
+        return f"{head}; the profile allows a failed reading, so the seat starts"
+    if action == "retry":
+        return f"{head}; the seat waits and reads again in {_seconds(payload.get('retry_seconds'))}"
+    if action == "stop":
+        return f"{head}; the meter stayed unavailable and the item ends"
+    return f"{head}; {_one_ascii_line(action)}"
+
+
+def _seat_on_lane(item_id: str, payload: Mapping[str, Any]) -> str:
+    seat = payload.get("seat") or "?"
+    return f"item {item_id} seat {seat} on lane {payload.get('lane', '')}"
+
+
+def _limit(limit: Any) -> str:
+    if not isinstance(limit, Mapping):
+        return ""
+    scope = limit.get("scope")
+    label = f"{limit.get('kind', '')}" + (f" [{_one_ascii_line(scope)}]" if scope else "")
+    return f"{label} {_number(limit.get('percent'))}%"
+
+
+def _number(value: Any) -> str:
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _at_or_above(value: Any, level: Any) -> bool:
+    try:
+        return float(value) >= float(level)
+    except (TypeError, ValueError):
+        return False
 
 
 def _items(items: Any) -> str:
@@ -369,7 +482,13 @@ def _one_ascii_line(value: Any) -> str:
     if value is None:
         return ""
     flat = " ".join(str(value).split())
-    return flat.encode("ascii", "backslashreplace").decode("ascii")
+    escaped = "".join(
+        f"\\x{ord(character):02x}"
+        if ord(character) < 0x20 or ord(character) == 0x7F
+        else character
+        for character in flat
+    )
+    return escaped.encode("ascii", "backslashreplace").decode("ascii")
 
 
 def _commit(value: Any) -> str:

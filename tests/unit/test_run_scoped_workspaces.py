@@ -178,6 +178,8 @@ def test_seats_of_one_item_in_two_runs_get_different_temporary_trees(tmp_path: P
     )
     harness = CodexHarnessAdapter(commands, tmp_path / "harness" / "codex", command=("codex",))
 
+    (tmp_path / "worktree").mkdir()
+    (tmp_path / "worktree" / "brief.md").write_text("# Brief\n", encoding="utf-8")
     for run_id in ("run-a", "run-b"):
         harness.invoke(_seat_request(run_id, tmp_path / "worktree"))
 

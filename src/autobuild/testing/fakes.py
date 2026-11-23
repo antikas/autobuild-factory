@@ -47,6 +47,7 @@ from autobuild.domain import (
     SeatResult,
     SeatUsage,
     TrackerPublication,
+    UsageFailure,
     UsageReading,
     WorkItem,
     WorkspaceRef,
@@ -442,6 +443,7 @@ class FakeWorkspaceAdapter(FakeAdapter):
     validation_revisions: list[str] = field(default_factory=lambda: ["head"])
     validation_checkouts: list[ValidationCheckout] = field(default_factory=list)
     closed_checkouts: list[Path] = field(default_factory=list)
+    bound_launches: list[RepositoryIdentity] = field(default_factory=list)
     # The remote target head a refreshing checkout fast-forwards to, when set,
     # and the refresh flag of every checkout opened.
     remote_head: str | None = None
@@ -479,7 +481,10 @@ class FakeWorkspaceAdapter(FakeAdapter):
         return None
 
     def identify(self, root: Path) -> RepositoryIdentity:
-        return RepositoryIdentity(root, "main", "feature", "origin", "base")
+        return RepositoryIdentity(root, "main", "feature", "origin", "base", True)
+
+    def bind_launch(self, launch: RepositoryIdentity) -> None:
+        self.bound_launches.append(launch)
 
     def list_worktrees(self, campaign: CampaignRef) -> tuple[WorktreeStatus, ...]:
         return tuple(self.worktrees)
@@ -729,6 +734,8 @@ class FakeFilesystemProbe:
     files: dict[str, int] = field(default_factory=dict)
     # Brief text by path; a listed file without text reads as empty.
     texts: dict[str, str] = field(default_factory=dict)
+    # The error a read of a path raises.
+    read_errors: dict[str, Exception] = field(default_factory=dict)
     directories: set[str] = field(default_factory=set)
     locks: dict[str, tuple[str, ...]] = field(default_factory=dict)
     writable: bool = True
@@ -755,6 +762,8 @@ class FakeFilesystemProbe:
         return self.files.get(str(path), 0)
 
     def read_text(self, path: Path) -> str:
+        if str(path) in self.read_errors:
+            raise self.read_errors[str(path)]
         return self.texts.get(str(path), "")
 
 
@@ -822,16 +831,18 @@ class FakeLaneStateAdapter(FakeAdapter):
     ``cooled`` holds the lanes currently in force; ``cool`` records a signal and
     keeps the lane cooled for the rest of the test, so the router treats it as
     unavailable. The record's ``cooled_until`` is the signal's reset when it
-    carries one. ``cools`` records every call for assertions."""
+    carries one. ``cools`` and ``clears`` record every call for assertions;
+    ``clear`` removes the lane only while it still holds the given cooling."""
 
     cooled: dict[str, LaneCooling] = field(default_factory=dict)
     cools: list[tuple[str, LaneSignal, str]] = field(default_factory=list)
+    clears: list[tuple[str, LaneCooling]] = field(default_factory=list)
     _guard: threading.Lock = field(default_factory=_lock, init=False, repr=False, compare=False)
 
     def active(self, lane: str) -> LaneCooling | None:
         return self.cooled.get(lane)
 
-    def cool(self, lane: str, signal: LaneSignal, campaign_id: str) -> LaneCooling:
+    def cool(self, lane: str, signal: LaneSignal, campaign_id: str, *, only_if_clear: bool = False) -> LaneCooling:
         record = LaneCooling(
             lane=lane,
             cooled_until=signal.reset_at or "2999-01-01T00:00:00+00:00",
@@ -840,9 +851,19 @@ class FakeLaneStateAdapter(FakeAdapter):
             campaign_id=campaign_id,
         )
         with self._guard:
+            if only_if_clear and lane in self.cooled:
+                return self.cooled[lane]
             self.cooled[lane] = record
             self.cools.append((lane, signal, campaign_id))
         return record
+
+    def clear(self, lane: str, cooling: LaneCooling) -> bool:
+        with self._guard:
+            self.clears.append((lane, cooling))
+            if self.cooled.get(lane) != cooling:
+                return False
+            del self.cooled[lane]
+        return True
 
     def snapshot(self) -> tuple[LaneCooling, ...]:
         return tuple(self.cooled.values())
@@ -852,8 +873,13 @@ class FakeLaneStateAdapter(FakeAdapter):
 class FakeUsageMeter(FakeAdapter):
     """Scripted meter readings. Each ``read`` returns the next scripted reading
     for the meter id and repeats the last one once the script runs out, so a
-    test scripts only the readings that change. ``reads`` records every id."""
+    test scripts only the readings that change. ``reads`` records every id.
 
+    ``expired`` holds the failed reading of a meter whose sign-in has expired;
+    such a meter answers with it and counts no read. ``answers_then_rate_limited``
+    and ``transport_error`` build the two other failing scripts."""
+
+    expired: dict[str, UsageReading] = field(default_factory=dict)
     readings: dict[str, list[UsageReading]] = field(default_factory=dict)
     reads: list[str] = field(default_factory=list)
     # Called with the meter id on every read before the reading is returned, so
@@ -861,7 +887,28 @@ class FakeUsageMeter(FakeAdapter):
     on_read: Callable[[str], None] | None = None
     _guard: threading.Lock = field(default_factory=_lock, init=False, repr=False, compare=False)
 
+    @staticmethod
+    def answers_then_rate_limited(good: UsageReading, fetched_at: str, retry_at: str) -> list[UsageReading]:
+        return [good, UsageReading.rate_limited(good.meter_id, retry_at, fetched_at)]
+
+    @staticmethod
+    def transport_error(meter_id: str, fetched_at: str) -> UsageReading:
+        return UsageReading.failed(
+            meter_id, "meter transport failed (exit 28)", fetched_at, UsageFailure.TRANSPORT
+        )
+
+    @staticmethod
+    def expired_sign_in(meter_id: str, fetched_at: str) -> UsageReading:
+        return UsageReading.failed(
+            meter_id, "sign-in expired", fetched_at, UsageFailure.SIGN_IN_EXPIRED
+        )
+
+    def sign_in_failure(self, meter_id: str) -> UsageReading | None:
+        return self.expired.get(meter_id)
+
     def read(self, meter_id: str) -> UsageReading:
+        if meter_id in self.expired:
+            return self.expired[meter_id]
         with self._guard:
             self.reads.append(meter_id)
             script = self.readings.get(meter_id)

@@ -6,12 +6,17 @@ import json
 import os
 import re
 import shutil
+import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from autobuild.adapters.claude_test_hook import hook_settings, write_guard
-from autobuild.adapters.claude_usage import CLAUDE_SUBSCRIPTION_METER
+from autobuild.adapters.claude_usage import CLAUDE_SUBSCRIPTION_METER, ClaudeUsageMeterAdapter
+from autobuild.adapters.usage_cache import SharedUsageMeterCache
+from autobuild.adapters.subscription_admission import reading_or_last_good
+from autobuild.adapters.codex_subscription import _subscription_removed_environment
 from autobuild.adapters.harness_cli import (
     CliHarnessAdapter,
     _kind_for_code,
@@ -22,13 +27,17 @@ from autobuild.domain import (
     CapabilityError,
     EffortLevel,
     LaneSignal,
+    ProbeResult,
     Seat,
     SeatRequest,
     SeatResult,
+    UsagePolicy,
+    UsageReading,
 )
 from autobuild.ports import CommandPort
 
 SEAT_RESULT_FILE = ".autobuild-seat-result.json"
+_CLAUDE_INCLUDED_PLANS = frozenset({"pro", "max"})
 
 
 def refuse_hook_under_safe_mode(argv: tuple[str, ...]) -> None:
@@ -79,6 +88,7 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
         output_root: Path,
         command: tuple[str, ...] = ("claude",),
         model_map=None,
+        subscription_only: bool = False,
     ) -> None:
         super().__init__(
             command_port,
@@ -86,6 +96,16 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
             self._resolve_windows_native(command),
             model_map,
         )
+        self._subscription_only = subscription_only
+        if subscription_only:
+            # Provider variables such as ANTHROPIC_CUSTOM_HEADERS redirect or
+            # re-authenticate a seat without naming a key or a token.
+            self.removed_environment = _subscription_removed_environment(
+                (
+                    *self.removed_environment,
+                    *(name for name in os.environ if name.upper().startswith("ANTHROPIC_")),
+                )
+            )
 
     @staticmethod
     def _resolve_windows_native(command: tuple[str, ...]) -> tuple[str, ...]:
@@ -117,6 +137,22 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
     _limit_code_keys = ("code", "type", "subtype", "error_type", "error_code", "reason")
     effort_levels = frozenset(EffortLevel)
     meter_id = CLAUDE_SUBSCRIPTION_METER
+    # The scratch root whose shared usage reading the sign-in probe uses. The
+    # composition sets it; None keeps the probe's own direct read.
+    shared_usage_root: Path | None = None
+    # The levels the last good reading is held to when the meter cannot be read.
+    # The composition sets it; None never uses the last good reading.
+    usage_policy: UsagePolicy | None = None
+    # The failed reading that made the last sign-in probe refuse the lane.
+    meter_failure: UsageReading | None = None
+    subscription_models = frozenset({"claude-opus-5-5"})
+
+    def probe(self) -> ProbeResult:
+        if self._subscription_only:
+            unsupported = sorted(set(self._model_map.values()) - self.subscription_models)
+            if unsupported:
+                return ProbeResult.unavailable("Claude subscription lane names a non-included model tier")
+        return super().probe()
 
     def meter_scope_covers(self, scope: str, model_class: str) -> bool:
         """True when every word of the meter's model label (for example "Fable")
@@ -142,12 +178,67 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
         if candidate.get("is_error") is not True or not isinstance(status, int) or isinstance(status, bool):
             return None
         kind = _kind_for_code(str(status))
-        return LaneSignal(kind, detail=f"api {status}") if kind is not None else None
+        if kind is None:
+            return None
+        return LaneSignal(
+            kind,
+            detail=f"api {status}",
+            reset_at=self._candidate_reset(candidate, candidate.get("error")),
+        )
 
     def _version_argv(self) -> tuple[str, ...]:
         return (*self._command, "--version")
 
     def _probe_authentication(self) -> tuple[bool, str]:
+        if self._subscription_only:
+            self.meter_failure = None
+            meter = ClaudeUsageMeterAdapter(
+                self._commands, self._output_root / "subscription-preflight"
+            )
+            # Every launch, preflight, status and review probes this lane. Without
+            # the host's shared reading each probe asks the provider itself, and a
+            # few of them inside minutes get the sign-in rate-limited.
+            if self.shared_usage_root is not None:
+                meter = SharedUsageMeterCache(meter, self.shared_usage_root)
+            reading = meter.sign_in_failure(CLAUDE_SUBSCRIPTION_METER) or meter.read(
+                CLAUDE_SUBSCRIPTION_METER
+            )
+            self.login_reading = reading
+            if self.usage_policy is not None and isinstance(meter, SharedUsageMeterCache):
+                reading = reading_or_last_good(
+                    reading,
+                    meter.last_good(CLAUDE_SUBSCRIPTION_METER),
+                    self.usage_policy,
+                    datetime.now(UTC),
+                )
+            if not reading.ok:
+                self.meter_failure = reading
+                return False, reading.error
+            if reading.extra_usage_enabled is not False:
+                return False, "Claude extra usage is not explicitly disabled"
+            result = self._probe_run(
+                "subscription-auth",
+                (sys.executable, "-I", str(Path(__file__).with_name("subscription_identity.py")),
+                 *self._command, "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands", "auth", "status", "--json"),
+            )
+            if result.exit_code != 0:
+                return False, "Claude subscription authentication probe failed"
+            try:
+                payload = json.loads(self._read(result.stdout_ref))
+            except json.JSONDecodeError:
+                return False, "Claude subscription authentication probe returned invalid JSON"
+            plan = payload.get("subscriptionType")
+            subscribed = isinstance(plan, str) and plan.lower() in _CLAUDE_INCLUDED_PLANS
+            authenticated = (
+                payload.get("loggedIn") is True
+                and payload.get("authMethod") == "claude.ai"
+                and payload.get("apiProvider") == "firstParty"
+                and subscribed
+            )
+            available = "Claude included subscription is available"
+            if reading.error:
+                available = f"{available}; {reading.error}; judged on the reading of {reading.fetched_at}"
+            return authenticated, available if authenticated else "Claude is not signed in through the first-party subscription"
         result = self._probe_run("auth", (*self._command, "auth", "status", "--json"))
         if result.exit_code != 0:
             return False, "Claude Code authentication probe failed"
@@ -163,6 +254,8 @@ class ClaudeCodeHarnessAdapter(CliHarnessAdapter):
 
     def _invocation(self, request: SeatRequest, run_ref: str):
         self._require_known_tools(request.tool_policy.allowed_tools)
+        if self._subscription_only and self._model(request.model_class) not in self.subscription_models:
+            raise CapabilityError("Claude subscription lane cannot dispatch a non-included model tier")
         effort = self._effort_arguments(request)
         mapping = {
             "read": ("Read", "Glob", "Grep"),

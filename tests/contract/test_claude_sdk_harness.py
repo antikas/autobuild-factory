@@ -56,6 +56,7 @@ def key_file(tmp_path: Path, content: str = KEY_SENTINEL) -> Path:
 def seat(tmp_path: Path, kind: Seat = Seat.BUILDER, tools=frozenset({"read", "write", "python"}), **changes) -> SeatRequest:
     workspace = WorkspaceRef(tmp_path / "worktree", "autobuild/item", "base", "lease")
     workspace.root.mkdir(exist_ok=True)
+    (tmp_path / "brief.md").write_text("# Brief\n", encoding="utf-8")
     contract = "builder-report-v1" if kind is Seat.BUILDER else "review-verdict-v1"
     request = SeatRequest(
         "run", "item", kind, "model-class", tmp_path / "brief.md", workspace,
@@ -152,7 +153,7 @@ def test_the_seat_carries_the_claude_code_seat_contract(tmp_path: Path, kind, to
     assert spec.permission_mode == "dontAsk"
     assert spec.setting_sources == ()
     assert set(spec.flags) == {"safe-mode", "no-session-persistence"}
-    assert spec.prompt == "Seat instructions"
+    assert spec.prompt.startswith("Seat instructions\n\nApproved brief: ")
     assert spec.cwd == request.workspace.root
 
 

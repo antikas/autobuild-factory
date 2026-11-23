@@ -540,3 +540,26 @@ def test_watch_reads_a_finished_run_from_before_start_events(tmp_path: Path, cap
         render_progress_line(BEFORE_START_EVENTS),
         completion,
     ]
+
+
+def test_bootstrap_carries_the_runs_hold_limit_to_the_usage_hold(tmp_path: Path) -> None:
+    settings = replace(load(tmp_path, BASE), hold_limit_seconds=4321.0)
+    base = make_ports([], [])
+    ports = composition._ports(
+        settings,
+        tmp_path,
+        DeliveryMode.PROTECTED_DEFAULT,
+        base.tracker,
+        base.workspace,
+        base.harness,
+        base.command,
+        base.records,
+        base.knowledge,
+        None,
+        [("claude-code", FakeHarnessAdapter(identity("claude-code")))],
+        FakeLaneStateAdapter(identity("lane-state")),
+        "claude-code",
+        FakeProgressPort(),
+    )
+
+    assert ports.usage_hold_limit_seconds == 4321.0

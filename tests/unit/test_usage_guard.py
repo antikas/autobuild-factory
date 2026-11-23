@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from autobuild.application.item import (
 from autobuild.domain import (
     AdapterIdentity,
     BuilderReport,
+    CampaignContext,
     CampaignRef,
     CampaignStopReason,
     CommandResult,
@@ -28,6 +30,7 @@ from autobuild.domain import (
     DiffEvidence,
     ItemDisposition,
     ItemExecutionSpec,
+    LaneCooling,
     LaneSignal,
     LaneSignalKind,
     LanesExhausted,
@@ -566,7 +569,7 @@ def test_a_stop_crossed_before_seat_two_cools_the_lane_until_the_latest_reset_an
     assert len(stop) == 1 and stop[0].payload["reset_at"] == WEEKLY_RESET
 
 
-def test_a_stop_crossed_on_the_only_lane_parks_the_item_and_holds_admissions() -> None:
+def test_a_stop_crossed_on_the_only_lane_parks_the_item_and_ends_the_campaign_usage_stop() -> None:
     meter = meter_of(reading(weekly(50)), reading(weekly(91)))
     claude = metered([builder()])
     state = FakeLaneStateAdapter(identity("lanes"))
@@ -574,18 +577,291 @@ def test_a_stop_crossed_on_the_only_lane_parks_the_item_and_holds_admissions() -
 
     outcome = CampaignRunner(workflow_ports).run(campaign(), lambda item: spec())
 
-    # Exhausted lanes hold admissions; the item bound of one ends the campaign.
-    assert outcome.stop_reason is CampaignStopReason.ITEM_BOUND
-    assert [
-        event.payload["condition"]
-        for event in workflow_ports.records.events
-        if event.event_type == "campaign.hold_started"
-    ] == ["lanes_exhausted"]
+    # Every lane stopped for usage ends the campaign instead of holding.
+    assert outcome.stop_reason is CampaignStopReason.USAGE_STOP
+    assert events(workflow_ports, "campaign.hold_started") == []
     assert outcome.items[0].disposition is ItemDisposition.PARKED
     assert outcome.items[0].lanes_exhausted
     assert workflow_ports.tracker.parked[0][1].startswith("claude-code:usage")
     assert [lane for lane, _signal, _campaign in state.cools] == ["claude-code"]
     assert state.cools[0][1].reset_at == WEEKLY_RESET
+
+
+# -- a campaign whose every lane is stopped for usage ---------------------------
+
+OTHER_CAMPAIGN = "autobuild-other"
+TWO_DAYS_AHEAD = "2026-10-23T20:00:00+00:00"
+
+
+def campaign_item(item_id: str) -> WorkItem:
+    return WorkItem(item_id, f"title {item_id}", "plan", ("passes",))
+
+
+def campaign_spec(item: WorkItem) -> ItemExecutionSpec:
+    return replace(spec(), item=item)
+
+
+def campaign_builder(item_id: str) -> SeatResult:
+    return SeatResult(
+        f"{item_id}:build", SeatOutcome.SUCCEEDED, BuilderReport(f"report:{item_id}", "built"),
+        f"raw:{item_id}:build", SeatUsage(source="fake"), "start", "end",
+    )
+
+
+def campaign_review(item_id: str) -> SeatResult:
+    return SeatResult(
+        f"{item_id}:review", SeatOutcome.SUCCEEDED,
+        ReviewVerdict(item_id, ReviewDecision.PASS, (), f"verdict:{item_id}"),
+        f"raw:{item_id}:review", SeatUsage(source="fake"), "start", "end",
+    )
+
+
+def campaign_harness(name: str, item_ids: tuple[str, ...], *, metered_lane: bool = True, on_invoke=None):
+    return FakeHarnessAdapter(
+        identity(name),
+        results_by_item={
+            item_id: [campaign_builder(item_id), campaign_review(item_id)] for item_id in item_ids
+        },
+        meter_id=METER if metered_lane else None,
+        on_invoke=on_invoke,
+    )
+
+
+def campaign_ports(
+    lanes: list[tuple[str, FakeHarnessAdapter]],
+    meter: FakeUsageMeter,
+    state: FakeLaneStateAdapter,
+    item_ids: tuple[str, ...],
+) -> WorkflowPorts:
+    tracker = FakeTrackerAdapter(
+        identity("tracker"),
+        queue=[campaign_item(i) for i in item_ids],
+        ready=[campaign_item(i) for i in item_ids],
+    )
+
+    def workspace_of(item_id: str) -> WorkspaceRef:
+        return WorkspaceRef(Path(f"/worktrees/{item_id}"), f"autobuild/{item_id}", "base", f"lease-{item_id}")
+
+    workspace = FakeWorkspaceAdapter(
+        identity("workspace"),
+        workspaces_by_item={item_id: workspace_of(item_id) for item_id in item_ids},
+        diffs_by_item={
+            item_id: [DiffEvidence(workspace_of(item_id), f"revision:{item_id}", (), f"patch:{item_id}")]
+            for item_id in item_ids
+        },
+        on_deliver=lambda item_id: tracker.mark_done(item_id) if item_id else None,
+    )
+    commands = FakeCommandAdapter(
+        identity("command"),
+        results_by_item={item_id: [command(item_id)] for item_id in item_ids},
+    )
+    return WorkflowPorts(
+        tracker,
+        workspace,
+        lanes[0][1],
+        commands,
+        FakeRunRecordAdapter(identity("records")),
+        FakeKnowledgeAdapter(identity("knowledge")),
+        lanes=tuple(lane_of(name, harness) for name, harness in lanes),
+        lane_state=state,
+        usage_meter=meter,
+        usage_policy=POLICY,
+        usage_retry_wait=lambda seconds: None,
+        usage_clock=FakeClock(step=61.0),
+        # Every schedule reading moves an hour on, so a hold outlasts the
+        # small hold limit at its first decision instead of waiting for it.
+        schedule_clock=FakeClock(step=3600.0),
+    )
+
+
+def run_campaign(workflow_ports: WorkflowPorts, *, concurrency: int = 1, max_items: int = 3):
+    context = CampaignContext(
+        harness="fake",
+        models={"builder": "b", "reviewer": "r"},
+        delivery_mode=DeliveryMode.PROTECTED_DEFAULT,
+        validator_id="validator",
+        target_branch="main",
+        target_revision="base",
+        hold_limit_seconds=60.0,
+    )
+    return CampaignRunner(workflow_ports).run(
+        CampaignRef("campaign", Path("/repo"), max_items=max_items, concurrency=concurrency),
+        campaign_spec,
+        context=context,
+    )
+
+
+def usage_cooling(lane: str, campaign_id: str = OTHER_CAMPAIGN, until: str = TWO_DAYS_AHEAD) -> LaneCooling:
+    return LaneCooling(lane, until, LaneSignalKind.USAGE.value, "2026-10-21T19:00:00+00:00", campaign_id)
+
+
+def test_a_stop_before_item_two_ends_the_campaign_usage_stop_without_a_hold() -> None:
+    ids = ("item-1", "item-2", "item-3")
+    meter = meter_of(reading(weekly(50)), reading(weekly(50)), reading(weekly(91)))
+    claude = campaign_harness("claude", ids)
+    state = FakeLaneStateAdapter(identity("lanes"))
+    workflow_ports = campaign_ports([("claude-code", claude)], meter, state, ids)
+
+    outcome = run_campaign(workflow_ports)
+
+    by_id = {entry.item_id: entry for entry in outcome.items}
+    assert by_id["item-1"].disposition is ItemDisposition.ACCEPTED
+    assert by_id["item-2"].disposition is ItemDisposition.PARKED
+    assert by_id["item-2"].lane_signature == LaneSignalKind.USAGE.value
+    assert "item-3" not in by_id
+    assert [item_id for item_id, _actor in workflow_ports.tracker.claims] == ["item-1", "item-2"]
+    assert outcome.stop_reason is CampaignStopReason.USAGE_STOP
+    stopped = events(workflow_ports, "campaign.usage_stop")
+    assert len(stopped) == 1
+    assert stopped[0].payload["resets_at"] == WEEKLY_RESET
+    assert stopped[0].payload["lanes"] == [
+        {"lane": "claude-code", "cooled_until": WEEKLY_RESET, "signature": "usage"}
+    ]
+    assert events(workflow_ports, "campaign.hold_started") == []
+    completed = events(workflow_ports, "campaign.completed")[0].payload
+    assert completed["stop_reason"] == "usage_stop"
+    report = workflow_ports.workspace.reports[-1].content
+    next_section = report.split("## Next\n\n", 1)[1].split("\n", 1)[0]
+    assert "usage_stop" in next_section and WEEKLY_RESET in next_section
+
+
+def test_a_usage_cooling_beside_a_rate_limit_cooling_holds_lanes_exhausted_as_before() -> None:
+    ids = ("item-1",)
+    meter = meter_of(reading(weekly(91)))
+    claude = campaign_harness("claude", ids)
+    codex = campaign_harness("codex", ids, metered_lane=False)
+    state = FakeLaneStateAdapter(identity("lanes"))
+    state.cooled["claude-code"] = usage_cooling("claude-code")
+    state.cooled["codex"] = LaneCooling(
+        "codex", TWO_DAYS_AHEAD, LaneSignalKind.RATE_LIMIT.value, "earlier", OTHER_CAMPAIGN
+    )
+    workflow_ports = campaign_ports([("claude-code", claude), ("codex", codex)], meter, state, ids)
+
+    outcome = run_campaign(workflow_ports, max_items=1)
+
+    assert outcome.stop_reason is CampaignStopReason.HOLD_LIMIT
+    assert [event.payload["condition"] for event in events(workflow_ports, "campaign.hold_started")] == [
+        "lanes_exhausted"
+    ]
+    assert events(workflow_ports, "campaign.usage_stop") == []
+    assert state.active("claude-code") == usage_cooling("claude-code")
+    assert workflow_ports.tracker.claims == []
+
+
+def test_both_lanes_stopped_for_usage_while_an_item_runs_drain_it_and_end_usage_stop() -> None:
+    ids = ("item-1", "item-2", "item-3")
+    second_started = threading.Event()
+    release = threading.Event()
+
+    def on_invoke(request) -> None:
+        if request.seat.value != "builder":
+            return
+        if request.item_id == "item-2":
+            second_started.set()
+            assert release.wait(5.0), "item-2's builder was never released"
+        elif request.item_id == "item-1":
+            assert second_started.wait(5.0), "item-2's builder never started"
+
+    first = campaign_harness("first", ids, on_invoke=on_invoke)
+    second = campaign_harness("second", ids, on_invoke=on_invoke)
+    # Both builders read below the stop; item-1's reviewer then reads both
+    # lanes, one meter, at the stop.
+    meter = meter_of(reading(weekly(50)), reading(weekly(50)), reading(weekly(91)))
+    state = FakeLaneStateAdapter(identity("lanes"))
+    workflow_ports = campaign_ports([("lane-a", first), ("lane-b", second)], meter, state, ids)
+    box: dict[str, object] = {}
+
+    def target() -> None:
+        box["outcome"] = run_campaign(workflow_ports, concurrency=2)
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    deadline = threading.Event()
+    for _ in range(500):
+        if events(workflow_ports, "campaign.draining"):
+            break
+        deadline.wait(0.01)
+    release.set()
+    thread.join(10.0)
+    assert not thread.is_alive()
+
+    outcome = box["outcome"]
+    by_id = {entry.item_id: entry for entry in outcome.items}
+    assert outcome.stop_reason is CampaignStopReason.USAGE_STOP
+    assert by_id["item-1"].disposition is ItemDisposition.PARKED
+    assert by_id["item-1"].lane_signature == LaneSignalKind.USAGE.value
+    # item-2 was running when the stop was found: it ran to its own end and
+    # its later seat was refused for usage, as any seat past the stop is.
+    assert by_id["item-2"].disposition is ItemDisposition.PARKED
+    assert "item-3" not in by_id
+    assert [item_id for item_id, _actor in workflow_ports.tracker.claims] == ["item-1", "item-2"]
+    draining = events(workflow_ports, "campaign.draining")
+    assert [event.payload["stop_reason"] for event in draining] == ["usage_stop"]
+    assert draining[0].payload["running"] == 1
+    stopped = events(workflow_ports, "campaign.usage_stop")
+    assert [entry["lane"] for entry in stopped[0].payload["lanes"]] == ["lane-a", "lane-b"]
+    assert stopped[0].payload["running"] == ["item-2"]
+    assert events(workflow_ports, "campaign.hold_started") == []
+
+
+def test_a_stale_usage_cooling_from_another_campaign_is_cleared_below_this_runs_stop() -> None:
+    ids = ("item-1",)
+    meter = meter_of(reading(weekly(82)))
+    claude = campaign_harness("claude", ids)
+    state = FakeLaneStateAdapter(identity("lanes"))
+    state.cooled["claude-code"] = usage_cooling("claude-code")
+    workflow_ports = campaign_ports([("claude-code", claude)], meter, state, ids)
+
+    outcome = run_campaign(workflow_ports, max_items=1)
+
+    assert [entry.disposition for entry in outcome.items] == [ItemDisposition.ACCEPTED]
+    assert [request.seat.value for request in claude.requests] == ["builder", "reviewer"]
+    assert state.active("claude-code") is None
+    cleared = events(workflow_ports, "lane.usage_cooling_cleared")
+    assert len(cleared) == 1
+    assert cleared[0].payload["lane"] == "claude-code"
+    assert cleared[0].payload["campaign_id"] == OTHER_CAMPAIGN
+    assert cleared[0].payload["cooled_until"] == TWO_DAYS_AHEAD
+    assert cleared[0].payload["percent"] == 82
+    assert events(workflow_ports, "campaign.usage_stop") == []
+
+
+@pytest.mark.parametrize("script", [reading(weekly(91)), failed()], ids=["at_stop", "meter_failed"])
+def test_a_usage_cooling_stays_while_its_reading_is_at_the_stop_or_unread(script) -> None:
+    ids = ("item-1",)
+    claude = campaign_harness("claude", ids)
+    state = FakeLaneStateAdapter(identity("lanes"))
+    state.cooled["claude-code"] = usage_cooling("claude-code")
+    workflow_ports = campaign_ports([("claude-code", claude)], meter_of(script), state, ids)
+
+    outcome = run_campaign(workflow_ports, max_items=1)
+
+    assert state.active("claude-code") == usage_cooling("claude-code")
+    assert events(workflow_ports, "lane.usage_cooling_cleared") == []
+    assert claude.requests == []
+    assert outcome.stop_reason is CampaignStopReason.USAGE_STOP
+    assert events(workflow_ports, "campaign.usage_stop")[0].payload["resets_at"] == TWO_DAYS_AHEAD
+
+
+def test_a_seat_meets_a_stale_usage_cooling_on_its_preferred_lane_and_clears_it() -> None:
+    ids = ("item-1",)
+    meter = meter_of(reading(weekly(82)))
+    claude = campaign_harness("claude", ids)
+    codex = campaign_harness("codex", ids, metered_lane=False)
+    state = FakeLaneStateAdapter(identity("lanes"))
+    state.cooled["claude-code"] = usage_cooling("claude-code")
+    workflow_ports = campaign_ports([("claude-code", claude), ("codex", codex)], meter, state, ids)
+
+    outcome = run_campaign(workflow_ports, max_items=1)
+
+    assert [entry.disposition for entry in outcome.items] == [ItemDisposition.ACCEPTED]
+    assert [request.seat.value for request in claude.requests] == ["builder", "reviewer"]
+    assert codex.requests == []
+    assert state.active("claude-code") is None
+    cleared = events(workflow_ports, "lane.usage_cooling_cleared")
+    assert len(cleared) == 1
+    assert cleared[0].item_id == "item-1"
+    assert cleared[0].payload["campaign_id"] == OTHER_CAMPAIGN
 
 
 # -- model-scoped limits -------------------------------------------------------
@@ -739,3 +1015,294 @@ def test_a_meter_that_stays_unavailable_under_refuse_ends_the_item_without_cooli
     assert waits == [USAGE_RETRY_SECONDS] * USAGE_RETRY_ATTEMPTS
     assert claude.requests == []
     assert state.cools == []
+
+
+# -- a failed reading after the warning level --------------------------------
+
+HOLD_POLICY = UsagePolicy(warn_percent=85, stop_percent=90, five_hour_stop_percent=95)
+RATE_LIMITED = "meter returned error rate_limit_error"
+
+
+def rate_limited() -> UsageReading:
+    return UsageReading.failed(METER, RATE_LIMITED)
+
+
+def hold_ports(
+    harness: FakeHarnessAdapter,
+    meter: FakeUsageMeter,
+    *,
+    policy: UsagePolicy = HOLD_POLICY,
+    lane_state=None,
+    waits: list[float] | None = None,
+    hold_limit: float | None = None,
+) -> WorkflowPorts:
+    workflow_ports = ports(
+        [("claude-code", harness)], meter, policy=policy, lane_state=lane_state, waits=waits
+    )
+    if hold_limit is not None:
+        workflow_ports = replace(workflow_ports, usage_hold_limit_seconds=hold_limit)
+    return workflow_ports
+
+
+def actions(workflow_ports: WorkflowPorts) -> list[str]:
+    return [event.payload["action"] for event in events(workflow_ports, "usage.meter_failed")]
+
+
+def test_a_failed_reading_after_the_warning_level_holds_the_seat_until_a_reading_succeeds() -> None:
+    waits: list[float] = []
+    started_at_reads: list[int] = []
+    meter = meter_of(reading(weekly(86)), rate_limited(), rate_limited(), reading(weekly(87)))
+    claude = metered([builder(), review(ReviewDecision.PASS)])
+    workflow_ports = hold_ports(claude, meter, waits=waits)
+    claude.on_invoke = lambda _request: started_at_reads.append(len(meter.reads))
+
+    outcome = run_item(workflow_ports)
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    # The reviewer starts only after the fourth read, the 87% reading.
+    assert started_at_reads == [1, 4]
+    assert actions(workflow_ports) == ["hold", "hold"]
+    for event in events(workflow_ports, "usage.meter_failed"):
+        assert event.payload["error"] == RATE_LIMITED
+        assert event.payload["last_good"]["percent"] == 86
+        assert event.payload["last_good"]["kind"] == "weekly_all"
+        assert event.payload["last_good"]["fetched_at"] == "2026-10-21T20:00:00+00:00"
+    assert waits == [USAGE_RETRY_SECONDS, USAGE_RETRY_SECONDS]
+    warnings = events(workflow_ports, "usage.warning")
+    assert [(event.payload["seat"], event.payload["percent"]) for event in warnings] == [
+        ("builder", 86)
+    ]
+
+
+def test_a_held_seat_whose_next_good_reading_is_at_the_stop_stops_and_cools_the_lane() -> None:
+    state = FakeLaneStateAdapter(identity("lanes"))
+    meter = meter_of(reading(weekly(86)), rate_limited(), rate_limited(), reading(weekly(91)))
+    claude = metered([builder()])
+    workflow_ports = hold_ports(claude, meter, lane_state=state)
+
+    outcome = run_item(workflow_ports)
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert outcome.lanes_exhausted
+    assert [request.seat.value for request in claude.requests] == ["builder"]
+    assert actions(workflow_ports) == ["hold", "hold"]
+    assert len(events(workflow_ports, "usage.stop")) == 1
+    assert [lane for lane, _signal, _campaign in state.cools] == ["claude-code"]
+    assert state.cools[0][1].reset_at == WEEKLY_RESET
+
+
+def test_a_meter_that_has_only_ever_failed_still_allows_every_seat() -> None:
+    waits: list[float] = []
+    claude = metered([builder(), review(ReviewDecision.PASS)])
+    workflow_ports = hold_ports(claude, meter_of(rate_limited()), waits=waits)
+
+    outcome = run_item(workflow_ports)
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert actions(workflow_ports) == ["allow", "allow"]
+    assert all("last_good" not in event.payload for event in events(workflow_ports, "usage.meter_failed"))
+    assert waits == []
+
+
+def test_a_failed_reading_after_good_readings_below_the_warning_level_still_allows() -> None:
+    waits: list[float] = []
+    claude = metered([builder(), review(ReviewDecision.PASS)])
+    workflow_ports = hold_ports(
+        claude, meter_of(reading(weekly(84)), rate_limited()), waits=waits
+    )
+
+    outcome = run_item(workflow_ports)
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert actions(workflow_ports) == ["allow"]
+    assert [request.seat.value for request in claude.requests] == ["builder", "reviewer"]
+    assert waits == []
+
+
+def test_under_refuse_a_failed_reading_after_the_warning_level_holds_past_the_retries() -> None:
+    waits: list[float] = []
+    state = FakeLaneStateAdapter(identity("lanes"))
+    claude = metered([builder()])
+    workflow_ports = hold_ports(
+        claude,
+        meter_of(reading(weekly(86)), rate_limited()),
+        policy=replace(HOLD_POLICY, on_probe_failure=UsageProbeFailure.REFUSE),
+        lane_state=state,
+        waits=waits,
+    )
+
+    outcome = run_item(workflow_ports)
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert outcome.lane_signature == USAGE_UNAVAILABLE_SIGNATURE
+    held = actions(workflow_ports)
+    assert held[-1] == "stop"
+    assert set(held[:-1]) == {"hold"} and len(held) - 1 > USAGE_RETRY_ATTEMPTS
+    assert len(waits) == len(held) - 1
+    # The fake clock moves 61 s per call, so the default 21600 s hold limit is
+    # reached only after far more reads than the refuse path's retries.
+    assert len(waits) > 100
+    assert [request.seat.value for request in claude.requests] == ["builder"]
+    assert state.cools == []
+
+
+def test_a_hold_on_failed_readings_ends_the_item_at_the_hold_limit_without_cooling() -> None:
+    waits: list[float] = []
+    state = FakeLaneStateAdapter(identity("lanes"))
+    claude = metered([builder()])
+    workflow_ports = hold_ports(
+        claude,
+        meter_of(reading(weekly(86)), rate_limited()),
+        lane_state=state,
+        waits=waits,
+        hold_limit=200.0,
+    )
+
+    outcome = run_item(workflow_ports)
+
+    assert outcome.disposition is ItemDisposition.PARKED
+    assert outcome.lane_signature == USAGE_UNAVAILABLE_SIGNATURE
+    failures = events(workflow_ports, "usage.meter_failed")
+    assert failures[-1].payload["action"] == "stop"
+    assert failures[-1].payload["last_good"]["percent"] == 86
+    assert {event.payload["action"] for event in failures[:-1]} == {"hold"}
+    assert [request.seat.value for request in claude.requests] == ["builder"]
+    assert state.cools == []
+    assert state.active("claude-code") is None
+
+
+def test_a_stop_reading_without_a_reset_counts_as_seen_and_its_failure_holds() -> None:
+    waits: list[float] = []
+    meter = meter_of(reading(weekly(50)), reading(weekly(95, resets_at=None)), reading(weekly(87)))
+    claude = metered([builder(), review(ReviewDecision.PASS)])
+    workflow_ports = hold_ports(claude, meter, waits=waits)
+
+    outcome = run_item(workflow_ports)
+
+    assert outcome.disposition is ItemDisposition.ACCEPTED
+    assert actions(workflow_ports) == ["hold"]
+    assert events(workflow_ports, "usage.meter_failed")[0].payload["last_good"]["percent"] == 95
+    assert waits == [USAGE_RETRY_SECONDS]
+
+
+def test_subscription_campaign_routes_each_real_workflow_seat_and_records_its_lane(tmp_path):
+    from autobuild.adapters.subscription_admission import SubscriptionAdmissionStore
+    from autobuild.application.subscriptions import SubscriptionRouting
+
+    capped = metered([])
+    healthy = metered([builder(), review(ReviewDecision.PASS)])
+    healthy.meter_id = "meter-b"
+    meter = FakeUsageMeter(identity("meters"), readings={
+        METER: [replace(reading(weekly(96)), extra_usage_enabled=False)],
+        "meter-b": [replace(reading(weekly(10)), meter_id="meter-b", extra_usage_enabled=False)],
+    })
+    workflow = ports([("capped", capped), ("healthy", healthy)], meter)
+    allocator = SubscriptionRouting(workflow.lanes, meter, POLICY, workflow.lane_state,
+                                    SubscriptionAdmissionStore(tmp_path, now=lambda: LAUNCH))
+    workflow = replace(workflow, subscription_admission=allocator)
+    assert run_item(workflow).disposition is ItemDisposition.ACCEPTED
+    assert [event.payload["lane"] for event in events(workflow, "item.claimed")] == ["healthy"]
+    assert [event.payload["lane"] for event in events(workflow, "seat.started")] == ["healthy", "healthy"]
+
+
+def test_subscription_holds_before_tracker_claim_when_no_builder_fits(tmp_path):
+    from autobuild.adapters.subscription_admission import SubscriptionAdmissionStore
+    from autobuild.application.subscriptions import SubscriptionRouting
+
+    meter = meter_of(replace(reading(weekly(96)), extra_usage_enabled=False))
+    workflow = ports([("capped", metered([]))], meter)
+    allocator = SubscriptionRouting(workflow.lanes, meter, POLICY, workflow.lane_state,
+                                    SubscriptionAdmissionStore(tmp_path, now=lambda: LAUNCH))
+    result = run_item(replace(workflow, subscription_admission=allocator))
+    assert result.lanes_exhausted
+    assert not events(workflow, "item.claimed")
+    assert not events(workflow, "seat.started")
+    assert events(workflow, "subscription.admission")[-1].payload["recommendation"] is None
+
+
+def test_subscription_reservation_blocks_a_concurrent_claim_until_the_builder_finishes(tmp_path):
+    from autobuild.adapters.subscription_admission import SubscriptionAdmissionStore
+    from autobuild.application.subscriptions import SubscriptionRouting
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def hold_first_builder(request) -> None:
+        if request.seat.value == "builder":
+            started.set()
+            assert release.wait(5.0)
+
+    first = ports([("codex", metered([builder(), review(ReviewDecision.PASS)]))], meter_of(reading(weekly(88))))
+    second = ports([("codex", metered([builder(), review(ReviewDecision.PASS)]))], meter_of(reading(weekly(88))))
+    first.lanes[0].harness.on_invoke = hold_first_builder
+    shared_tracker = FakeTrackerAdapter(identity("tracker"))
+    store = SubscriptionAdmissionStore(tmp_path, now=lambda: LAUNCH)
+    first = replace(
+        first,
+        tracker=shared_tracker,
+        subscription_admission=SubscriptionRouting(first.lanes, first.usage_meter, POLICY, first.lane_state, store),
+    )
+    second = replace(
+        second,
+        tracker=shared_tracker,
+        subscription_admission=SubscriptionRouting(second.lanes, second.usage_meter, POLICY, second.lane_state, store),
+    )
+    first_spec = replace(spec(), item=WorkItem("item-first", "first", "plan", ("passes",)))
+    second_spec = replace(spec(), item=WorkItem("item-second", "second", "plan", ("passes",)))
+    outcomes: dict[str, object] = {}
+
+    thread = threading.Thread(
+        target=lambda: outcomes.setdefault("first", run_item(first, first_spec)), daemon=True
+    )
+    thread.start()
+    assert started.wait(5.0)
+    outcomes["second"] = run_item(second, second_spec)
+    release.set()
+    thread.join(5.0)
+
+    assert not thread.is_alive()
+    assert outcomes["second"].lanes_exhausted
+    assert [item_id for item_id, _actor in shared_tracker.claims] == ["item-first"]
+
+
+def test_subscription_releases_reservation_after_harness_error_and_skips_failed_peer(tmp_path):
+    from autobuild.adapters.subscription_admission import SubscriptionAdmissionStore
+    from autobuild.application.subscriptions import SubscriptionRouting
+
+    a, b = metered([]), metered([])
+    b.meter_id = "meter-b"
+    meter = FakeUsageMeter(identity("meters"), readings={
+        METER: [failed()],
+        "meter-b": [replace(reading(weekly(10)), meter_id="meter-b", extra_usage_enabled=False)],
+    })
+    workflow = ports([("offline", a), ("healthy", b)], meter)
+    store = SubscriptionAdmissionStore(tmp_path, now=lambda: LAUNCH)
+    allocator = SubscriptionRouting(workflow.lanes, meter, POLICY, workflow.lane_state, store)
+    with pytest.raises(RuntimeError, match="seat fault"):
+        with allocator.reserve("builder", 60) as lane:
+            assert lane.name == "healthy"
+            raise RuntimeError("seat fault")
+    import sqlite3
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT lane, released FROM admissions").fetchall() == [("healthy", 1)]
+
+
+def test_subscription_campaign_drains_at_the_actual_global_stop(tmp_path):
+    from dataclasses import replace
+    from autobuild.adapters.subscription_admission import SubscriptionAdmissionStore
+    from autobuild.application.subscriptions import SubscriptionRouting
+
+    meter = meter_of(reading(weekly(50)), reading(weekly(91), session(98)))
+    state = FakeLaneStateAdapter(identity("lanes"))
+    ports_for_campaign = ports([("claude-code", metered([builder()]))], meter, lane_state=state, queue=True)
+    routing = SubscriptionRouting(
+        ports_for_campaign.lanes, meter, POLICY, state, SubscriptionAdmissionStore(tmp_path, now=lambda: LAUNCH)
+    )
+
+    outcome = CampaignRunner(replace(ports_for_campaign, subscription_admission=routing)).run(
+        campaign(), lambda item: spec()
+    )
+
+    assert outcome.stop_reason is CampaignStopReason.USAGE_STOP
+    assert events(ports_for_campaign, "campaign.usage_stop")[0].payload["resets_at"] == WEEKLY_RESET
+    assert events(ports_for_campaign, "campaign.hold_started") == []

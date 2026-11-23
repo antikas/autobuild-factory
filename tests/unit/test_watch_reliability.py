@@ -10,7 +10,7 @@ import pytest
 from autobuild.adapters.local_records import PAUSE_MARKER
 from autobuild.adapters.progress import CompositeProgressAdapter, is_completion_line
 from autobuild.application.progress import render_progress_line
-from autobuild.bootstrap.profile import ConfigurationError, read_run_scratch_root
+from autobuild.bootstrap.profile import ConfigurationError, resolve_scratch_root
 from autobuild.cli import _parser, _watch, main
 from autobuild.domain import RunEvent
 
@@ -261,7 +261,32 @@ def test_a_directory_profile_is_reported_as_not_a_file(
 
 def test_a_missing_explicit_profile_still_does_not_exist(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError, match="does not exist"):
-        read_run_scratch_root(tmp_path, tmp_path / "absent.toml", None)
+        resolve_scratch_root(tmp_path, tmp_path / "absent.toml", None)
+
+
+@pytest.mark.parametrize("profile", [None, "[run\n", "[run]\nscratch_root = 5\nunknown = 1\n"])
+def test_the_scratch_option_needs_no_readable_profile(
+    tmp_path: Path, capsys, monkeypatch, profile: str | None
+) -> None:
+    folder = tmp_path / "settings"
+    folder.mkdir()
+    selected = folder / "campaign.toml"
+    if profile is not None:
+        selected.write_text(profile, encoding="utf-8")
+    run_dir = folder / "scratch" / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    log = run_dir / "progress.log"
+    log.write_text("", encoding="utf-8")
+    elsewhere = tmp_path / "working"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    options = ["--run", "run-1", "--profile", str(selected), "--scratch-root", "scratch"]
+
+    assert main(["pause", *options]) == 0
+    assert (run_dir / PAUSE_MARKER).is_file()
+    log.write_text(_completed() + "\n", encoding="utf-8")
+    assert main(["watch", *options]) == 0
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("command", ["watch", "pause"])
@@ -360,4 +385,24 @@ def test_a_failed_batch_output_reference_is_one_ascii_line() -> None:
 
     assert line.isascii()
     assert "output stdout:caf\\xe9 x;" in line
+    assert is_completion_line(line)
+
+
+def _no_control_character(line: str) -> bool:
+    return not any(ord(character) < 0x20 or ord(character) == 0x7F for character in line)
+
+
+def test_a_failed_batch_error_escapes_every_control_character() -> None:
+    line = _failed_batch_line(batch_error="boom\x1b[31m red\x00\x07\x08\x7f end")
+
+    assert "error boom\\x1b[31m red\\x00\\x07\\x08\\x7f end;" in line
+    assert _no_control_character(line)
+    assert is_completion_line(line)
+
+
+def test_a_failed_batch_output_reference_escapes_every_control_character() -> None:
+    line = _failed_batch_line(batch_stdout_ref="stdout:\x1bx")
+
+    assert "output stdout:\\x1bx;" in line
+    assert _no_control_character(line)
     assert is_completion_line(line)

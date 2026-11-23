@@ -16,6 +16,8 @@ from autobuild.adapters import (
     BacklogTrackerAdapter,
     CommandHookProgressAdapter,
     CompositeProgressAdapter,
+    CompositeUsageMeterAdapter,
+    CodexSubscriptionMeterAdapter,
     FileProgressAdapter,
     FilesystemLaneStateAdapter,
     FilesystemLeaseAdapter,
@@ -37,6 +39,9 @@ from autobuild.adapters.claude_usage import (
     ClaudeUsageMeterAdapter,
     NullUsageMeterAdapter,
 )
+from autobuild.adapters.usage_cache import SOURCE_METER, SharedUsageMeterCache, SourcedReading, next_read_at
+from autobuild.adapters.subscription_admission import SubscriptionAdmissionStore
+from autobuild.application.subscriptions import SubscriptionRouting, portable_report
 from autobuild.application import CampaignRunner, Lane, WorkflowPorts
 from autobuild.bootstrap.builtins import register_first_party_harnesses
 from autobuild.bootstrap.environment import configure_scratch_environment
@@ -57,14 +62,24 @@ from autobuild.domain import (
     PreflightProbe,
     ProbeResult,
     RefillPlan,
+    RepositoryIdentity,
     Seat,
     SeatRequest,
     SurfaceKind,
     ToolPolicy,
+    UsageFailure,
+    UsageProbeFailure,
     UsageReading,
     WorkspaceRef,
 )
-from autobuild.domain.models import BatchValidationPolicy, HostReading, SeatTransport
+from autobuild.domain.models import (
+    BatchValidationPolicy,
+    BriefDefect,
+    DefaultBranchUnknown,
+    HostReading,
+    SeatTransport,
+)
+from autobuild.enforcement.brief_file import read_brief
 from autobuild.enforcement.preflight import UsageLane, run_usage_preflight
 from autobuild.ports.contracts import SeatTransportPort, TrackerProjectionPort
 from autobuild.enforcement import (
@@ -133,6 +148,29 @@ def _require_lane_efforts(lane: LaneProfile, adapter: object) -> None:
             )
 
 
+def _try_again(reading: UsageReading) -> str:
+    if reading.failure is UsageFailure.SIGN_IN_EXPIRED:
+        return "try again once the sign-in is refreshed"
+    moment = next_read_at(reading)
+    return f"try again at {moment}" if moment else "try again once the meter answers"
+
+
+def _unreadable_meter(lane: str, reading: UsageReading) -> str:
+    return f"{lane} ({reading.meter_id}): {reading.error}; {_try_again(reading)}"
+
+
+def _no_lane_error(manifest: list[dict[str, object]]) -> str:
+    """Why no configured lane can run, naming first every meter that could not
+    be read."""
+
+    others = [f"{row['name']}: {row['detail']}" for row in manifest if not row.get("meter_unread")]
+    unread = [str(row["meter_unread"]) for row in manifest if row.get("meter_unread")]
+    if not unread:
+        return "no capable harness lane: " + "; ".join(others)
+    text = "no usage meter could be read: " + " | ".join(unread)
+    return text + (" | no other lane is capable: " + "; ".join(others) if others else "")
+
+
 def _build_lanes(
     settings: RunSettings,
     command: object,
@@ -140,6 +178,7 @@ def _build_lanes(
     lane_state: FilesystemLaneStateAdapter,
     campaign_id: str,
     probe_only: bool = False,
+    read_only: bool = False,
 ):
     """Build one harness per configured lane in preference order.
 
@@ -151,7 +190,9 @@ def _build_lanes(
     active lane for this launch. When no lane is capable the launch fails.
 
     With ``probe_only`` nothing is cooled and no capable lane is not an error:
-    the active lane is then None and the manifest carries each lane's result."""
+    the active lane is then None and the manifest carries each lane's result.
+    With ``read_only`` subscription admission writes neither the lane state nor
+    the admission ledger."""
 
     registry = AdapterRegistry()
     register_first_party_harnesses(registry)
@@ -163,23 +204,33 @@ def _build_lanes(
             "command_port": command,
             "output_root": scratch / "harness" / (lane.name or "lane"),
             "model_map": _lane_models(lane),
+            "subscription_only": settings.subscription_routing,
         }
+        if lane.prepare_argv:
+            config["prepare_argv"] = lane.prepare_argv
         if single and settings.harness_command is not None:
             config["command"] = settings.harness_command
         if lane.key_file is not None:
             config["key_file"] = lane.key_file
         adapter = registry.create(PortKind.HARNESS, lane.name, config)
+        if settings.subscription_routing and hasattr(adapter, "shared_usage_root"):
+            # The lane's sign-in probe reads the provider's meter. Point it at
+            # the host's shared reading, so probes on one scratch root ask once.
+            adapter.shared_usage_root = scratch
+            if hasattr(adapter, "usage_policy"):
+                adapter.usage_policy = settings.usage
         _require_lane_efforts(lane, adapter)
         created.append((lane, adapter))
     lanes: list[tuple[str, object]] = []
     lane_manifest: list[dict[str, object]] = []
     active: tuple[str, object, AdapterIdentity] | None = None
-    diagnostics: list[str] = []
+    identities = {}
     for lane, adapter in created:
         probe = adapter.probe()
         capabilities = getattr(adapter, "capabilities", frozenset())
         missing = _REQUIRED_HARNESS_CAPABILITIES - capabilities
         capable = probe.available and not missing
+        meter_failure = None if probe.available else getattr(adapter, "meter_failure", None)
         version = probe.identity.version if probe.identity is not None else "unavailable"
         detail = "; ".join(probe.diagnostics)
         if not capable:
@@ -188,19 +239,36 @@ def _build_lanes(
                 if missing
                 else "unavailable"
             )
-            diagnostics.append(f"{lane.name}: {detail}")
-            if not probe_only:
+            # A cooling would outlast the meter's own retry time and keep the
+            # lane shut after the meter answers again.
+            if not probe_only and meter_failure is None:
                 lane_state.cool(
                     lane.name, LaneSignal(LaneSignalKind.PROBE, detail=detail), campaign_id
                 )
-        elif active is None:
-            active = (lane.name, adapter, probe.identity)
+        else:
+            identities[lane.name] = probe.identity
+            if active is None:
+                active = (lane.name, adapter, probe.identity)
         lanes.append((lane.name, adapter))
-        lane_manifest.append(
-            {"name": lane.name, "available": bool(capable), "version": version, "detail": detail}
-        )
+        row = {"name": lane.name, "available": bool(capable), "version": version, "detail": detail}
+        if meter_failure is not None:
+            row["meter_unread"] = _unreadable_meter(lane.name, meter_failure)
+        lane_manifest.append(row)
     if active is None and not probe_only:
-        raise RuntimeError("no capable harness lane: " + "; ".join(diagnostics))
+        raise RuntimeError(_no_lane_error(lane_manifest))
+    if settings.subscription_routing and active is not None:
+        available = [(name, adapter) for name, adapter in lanes if name in identities]
+        routing = _subscription_allocator(
+            settings,
+            available,
+            _shared_meter(_usage_meter(settings, command, scratch, available), scratch),
+            lane_state,
+            read_only=read_only,
+        )
+        decision = routing.preview(routing.readings(use_login_reading=True), Seat.BUILDER.value)
+        if decision["recommendation"]:
+            name = decision["recommendation"]["lane"]
+            active = (name, dict(available)[name], identities[name])
     return lanes, active, lane_manifest
 
 
@@ -221,37 +289,169 @@ def _usage_meter(settings: RunSettings, command: object, scratch: Path, lanes_ra
     if settings.usage is None:
         return None
     declared = {getattr(adapter, "meter_id", None) for _name, adapter in lanes_raw}
+    meters = []
     if declared & ClaudeUsageMeterAdapter.meter_ids:
-        return ClaudeUsageMeterAdapter(command, scratch / "usage")
+        meters.append(ClaudeUsageMeterAdapter(command, scratch / "usage"))
+    if declared & CodexSubscriptionMeterAdapter.meter_ids:
+        meters.append(CodexSubscriptionMeterAdapter(command, scratch / "usage"))
+    if meters:
+        return meters[0] if len(meters) == 1 else CompositeUsageMeterAdapter(*meters)
     return NullUsageMeterAdapter()
 
 
+def _shared_meter(meter, scratch: Path):
+    """Wrap a first-party meter in the host's shared reading at the scratch root.
+
+    The null meter and a run without a meter are returned unchanged."""
+
+    if meter is not None and not isinstance(meter, NullUsageMeterAdapter):
+        return SharedUsageMeterCache(meter, scratch)
+    return meter
+
+
+class _RecordedReadings:
+    """A meter that keeps the readings it gave, so a refusal can say when to try
+    again."""
+
+    def __init__(self, meter) -> None:
+        self._meter = meter
+        self.readings: list[UsageReading] = []
+
+    def probe(self) -> ProbeResult:
+        return self._meter.probe()
+
+    def read(self, meter_id: str) -> UsageReading:
+        reading = self._meter.read(meter_id)
+        self.readings.append(reading)
+        return reading
+
+
 def _usage_preflight(
-    settings: RunSettings, lanes_raw, meter, lane_state, campaign_id: str
+    settings: RunSettings,
+    lanes_raw,
+    meter,
+    lane_state,
+    campaign_id: str,
+    *,
+    read_only: bool = False,
 ) -> PreflightProbe | None:
-    """Read every configured lane's meter before any claim; None without ``[usage]``."""
+    """Read every configured lane's meter before any claim; None without ``[usage]``.
+
+    With ``read_only`` subscription admission judges the shared lane state and
+    the admission ledger and writes neither."""
 
     if settings.usage is None or meter is None:
         return None
-    return run_usage_preflight(
-        settings.usage,
-        tuple(
-            UsageLane(name, getattr(adapter, "meter_id", None)) for name, adapter in lanes_raw
-        ),
-        meter=meter,
-        lane_state=lane_state,
-        campaign_id=campaign_id,
-    )
+    if settings.subscription_routing:
+        routing = _subscription_allocator(
+            settings, lanes_raw, meter, lane_state, read_only=read_only
+        )
+        readings = routing.readings()
+        decision = routing.preview(readings, Seat.BUILDER.value)
+        recommended = decision["recommendation"]
+        if recommended is None:
+            unread = " | ".join(
+                _unreadable_meter(name, reading) for name, reading in readings.items() if not reading.ok
+            )
+            if unread and not any(reading.ok for reading in readings.values()):
+                raise PreflightError(f"no usage meter could be read: {unread}")
+            if unread:
+                raise PreflightError(
+                    "no capable subscription has allowance for a builder; "
+                    f"a usage meter could not be read: {unread}"
+                )
+            raise PreflightError("no capable subscription has allowance for a builder")
+        return PreflightProbe("usage", True, f"subscription admission: {recommended['lane']}")
+    recorded = _RecordedReadings(meter)
+    try:
+        return run_usage_preflight(
+            settings.usage,
+            tuple(
+                UsageLane(name, getattr(adapter, "meter_id", None)) for name, adapter in lanes_raw
+            ),
+            meter=recorded,
+            lane_state=lane_state,
+            campaign_id=campaign_id,
+        )
+    except PreflightError as exc:
+        failed = next((reading for reading in recorded.readings if not reading.ok), None)
+        if failed is None or settings.usage.on_probe_failure is not UsageProbeFailure.REFUSE:
+            raise
+        raise PreflightError(f"{exc}; {_try_again(failed)}") from exc
 
 
 def read_usage(
     scratch_root: Path | None = None, meter_id: str = CLAUDE_SUBSCRIPTION_METER
-) -> UsageReading:
-    """One read-only meter reading for the ``autobuild usage`` command."""
+) -> SourcedReading:
+    """One read-only meter reading for the ``autobuild usage`` command, through
+    the host's shared reading, with where it came from."""
 
     scratch = configure_scratch_environment(scratch_root)
-    meter = ClaudeUsageMeterAdapter(_command_adapter(scratch), scratch / "usage")
-    return meter.read(meter_id)
+    meter = SharedUsageMeterCache(
+        ClaudeUsageMeterAdapter(_command_adapter(scratch), scratch / "usage"), scratch
+    )
+    expired = meter.sign_in_failure(meter_id)
+    return SourcedReading(expired, SOURCE_METER) if expired else meter.read_sourced(meter_id)
+
+
+def _subscription_allocator(settings, raw, meter, state, *, read_only: bool = False):
+    models = {lane.name: _lane_models(lane) for lane in settings.lanes}
+    lanes = tuple(_lane(name, adapter, adapter, models[name]) for name, adapter in raw)
+    scratch = configure_scratch_environment(settings.scratch_root)
+    return SubscriptionRouting(
+        lanes,
+        meter,
+        settings.usage,
+        state,
+        SubscriptionAdmissionStore(scratch, read_only=read_only),
+        read_only=read_only,
+    )
+
+
+def subscription_context(settings, *, read_only: bool = False):
+    """Read the official login and capability of each configured provider."""
+    if not settings.subscription_routing or not settings.usage:
+        raise ConfigurationError("profile must enable subscription routing and declare its usage policy")
+    scratch = configure_scratch_environment(settings.scratch_root)
+    command = _command_adapter(scratch)
+    state = FilesystemLaneStateAdapter(settings.lane_state_root or scratch)
+    raw, _, manifest = _build_lanes(
+        settings, command, scratch, state, "subscription-status", True, read_only
+    )
+    capable = {row["name"] for row in manifest if row["available"]}
+    available = [(name, adapter) for name, adapter in raw if name in capable]
+    return _subscription_allocator(
+        settings,
+        available,
+        _shared_meter(_usage_meter(settings, command, scratch, available), scratch),
+        state,
+        read_only=read_only,
+    ), manifest
+
+
+def subscription_status(settings: RunSettings) -> dict[str, object]:
+    routing, manifest = subscription_context(settings, read_only=True)
+    readings = routing.readings(use_login_reading=True)
+    roles = {seat.value: routing.preview(readings, seat.value) for seat in Seat}
+    return portable_report({
+        "schema": "autobuild.subscription-status.v1",
+        "manifest": manifest,
+        **roles[Seat.BUILDER.value],
+        "available": {role: result["recommendation"] for role, result in roles.items()},
+        "roles": roles,
+    })
+
+
+def _bind_initial_lane(settings: RunSettings, active_name: str) -> RunSettings:
+    """Bind launch diagnostics and the initial tracker claim to the selected capability."""
+    if not settings.subscription_routing or not active_name:
+        return settings
+    selected = next(lane for lane in settings.lanes if lane.name == active_name)
+    return replace(
+        settings, harness=active_name, builder_model=selected.builder_model,
+        reviewer_model=selected.reviewer_model, specialist_model=selected.specialist_model,
+        lanes=(selected, *(lane for lane in settings.lanes if lane.name != active_name)),
+    )
 
 
 def _repository_adapters(
@@ -316,12 +516,24 @@ def _runtime(
     delivery_mode: DeliveryMode,
     push_current_branch: bool,
     campaign_id: str,
+    allow_current_branch_default: bool,
     probe_only: bool = False,
 ):
     command = _command_adapter(scratch)
     tracker, workspace = _repository_adapters(
         settings, scratch, delivery_mode, push_current_branch
     )[2:4]
+    # Must stay ahead of _build_lanes: a lane probe can write the lane state,
+    # and a refused launch changes nothing.
+    try:
+        repository = workspace.identify(settings.repository)
+    except DefaultBranchUnknown as exc:
+        if delivery_mode is DeliveryMode.PROTECTED_DEFAULT:
+            raise _default_branch_not_established("origin") from exc
+        raise
+    _require_delivery_shape(delivery_mode, repository, allow_current_branch_default)
+    if delivery_mode is DeliveryMode.PROTECTED_DEFAULT:
+        workspace.bind_launch(repository)
     tracker_surface = LeaseSurface(
         settings.backlog_path.parent
         if isinstance(tracker, BacklogTrackerAdapter)
@@ -344,8 +556,13 @@ def _runtime(
         settings.lane_state_root or scratch, cool_seconds=settings.lane_cool_seconds
     )
     lanes_raw, active, lane_manifest = _build_lanes(
-        settings, command, scratch, lane_state, campaign_id, probe_only
+        settings, command, scratch, lane_state, campaign_id, probe_only, read_only=probe_only
     )
+    if settings.subscription_routing:
+        # Never re-admit a lane which failed the launch capability/auth probe
+        # if a time-based cooling record happens to expire during the run.
+        capable = {entry["name"] for entry in lane_manifest if entry["available"]}
+        lanes_raw = [(name, adapter) for name, adapter in lanes_raw if name in capable]
     if active is None:
         active_name, active_adapter, harness_entry = "", None, ("harness", "none", "unavailable")
     else:
@@ -362,7 +579,6 @@ def _runtime(
     ]
     record_probe = LocalRunRecordAdapter(scratch / "runs")
     manifest.append(_probe("run_record", record_probe))
-    repository = workspace.identify(settings.repository)
     return (
         tracker,
         workspace,
@@ -458,24 +674,44 @@ def _runtime_metadata(
     }
 
 
+class DeliveryShapeError(ConfigurationError):
+    """The checked-out branch does not fit the delivery mode."""
+
+
+def _default_branch_not_established(remote: str) -> DeliveryShapeError:
+    return DeliveryShapeError(
+        f"the default branch of {remote} could not be established: this clone records no "
+        f"remote head and {remote} did not answer with its head; make {remote} reachable, "
+        "or set the remote head in this clone, then launch again"
+    )
+
+
 def _require_delivery_shape(
     delivery_mode: DeliveryMode,
-    repository,
+    repository: RepositoryIdentity,
     allow_current_branch_default: bool,
 ) -> None:
-    if (
-        delivery_mode is DeliveryMode.CURRENT_BRANCH_PR
-        and not repository.current_branch
-    ):
-        raise ConfigurationError(
+    default, current = repository.default_branch, repository.current_branch
+    if delivery_mode is DeliveryMode.PROTECTED_DEFAULT:
+        if not repository.default_branch_established:
+            raise _default_branch_not_established(repository.remote)
+        if current == default:
+            return
+        if current:
+            checkout, delivering = current, f" to deliver to {current}"
+        else:
+            checkout, delivering = f"a detached head at {repository.revision[:12]}", ""
+        raise DeliveryShapeError(
+            f"protected-default delivery must be launched from the default branch {default}; "
+            f"the checkout is on {checkout}; switch to {default}, "
+            f"or pass --delivery-mode current-branch-pr{delivering}"
+        )
+    if not current:
+        raise DeliveryShapeError(
             "current-branch-pr delivery requires a named invoking branch"
         )
-    if (
-        delivery_mode is DeliveryMode.CURRENT_BRANCH_PR
-        and repository.current_branch == repository.default_branch
-        and not allow_current_branch_default
-    ):
-        raise ConfigurationError(
+    if current == default and not allow_current_branch_default:
+        raise DeliveryShapeError(
             "current-branch-pr delivery refuses the detected default branch; "
             "pass --allow-current-branch-default after human approval"
         )
@@ -570,6 +806,9 @@ def _ports(
         lane_state=lane_state,
         usage_meter=usage_meter,
         usage_policy=settings.usage if usage_meter is not None else None,
+        subscription_admission=(SubscriptionRouting(wrapped_lanes, usage_meter, settings.usage, lane_state,
+                                                  SubscriptionAdmissionStore(scratch)) if settings.subscription_routing else None),
+        usage_hold_limit_seconds=settings.hold_limit_seconds,
         item_environment=_item_environment(scratch),
         host=host_resource_adapter(),
     )
@@ -811,20 +1050,6 @@ def campaign_concurrency(settings: RunSettings, tracker, host=None) -> tuple[int
     return items, source, derive_capacity(reading, policy).heavy
 
 
-def _read_brief_text(repository: Path, brief_path: Path) -> str:
-    """Read the brief once, before the claim, so triage can classify the item.
-
-    The brief is committed in the primary checkout at this point. An unreadable
-    brief classifies as a repository item and the preflight brief probe reports
-    the missing file separately."""
-
-    resolved = brief_path if brief_path.is_absolute() else repository / brief_path
-    try:
-        return resolved.read_text(encoding="utf-8")
-    except OSError:
-        return ""
-
-
 def _specification(
     settings: RunSettings,
     delivery_mode: DeliveryMode,
@@ -838,7 +1063,9 @@ def _specification(
 
     def for_item(item) -> ItemExecutionSpec:
         brief_path = Path(item.brief_ref).expanduser()
-        brief_text = _read_brief_text(settings.repository, brief_path)
+        read = read_brief(LocalFilesystemProbe(), settings.repository / brief_path)
+        brief_defect = read if isinstance(read, BriefDefect) else None
+        brief_text = "" if isinstance(read, BriefDefect) else read
         item_class = declared_item_class(brief_text)
         seat_timeout = settings.item_classes.get(item_class, settings.seat_timeout_seconds)
         return ItemExecutionSpec(
@@ -870,6 +1097,7 @@ def _specification(
             push_current_branch=push_current_branch,
             allow_current_branch_default=allow_current_branch_default,
             process=settings.process,
+            brief_defect=brief_defect,
         )
 
     return for_item
@@ -913,34 +1141,70 @@ def _starting_lane_efforts(
     }
 
 
+def _preflight_result(
+    settings: RunSettings,
+    scratch: Path,
+    error: str | None,
+    active_name: str,
+    lanes: list[dict[str, object]],
+    probes: list[PreflightProbe],
+) -> dict[str, Any]:
+    return {
+        "schema": "autobuild.preflight.v1",
+        "version": __version__,
+        "repository": str(settings.repository),
+        "scratch_root": str(scratch),
+        "ok": error is None,
+        "error": error,
+        "active_lane": active_name or None,
+        "lanes": lanes,
+        "preflight": [
+            {"name": probe.name, "passed": probe.passed, "detail": probe.detail}
+            for probe in probes
+        ],
+    }
+
+
 def preflight_report(
-    settings: RunSettings, *, campaign_id: str | None = None
+    settings: RunSettings,
+    *,
+    campaign_id: str | None = None,
+    delivery_mode: DeliveryMode = DeliveryMode.PROTECTED_DEFAULT,
 ) -> dict[str, Any]:
     """Probe every lane and run the launch preflight, claiming nothing.
 
     Lane probes cool nothing. The shared lane state is read for each lane's
     current cooling and never written: a usage stop is assessed against a lane
-    state private to this command."""
+    state private to this command, and subscription admission reads the shared
+    lane state and the admission ledger without changing or creating either.
+
+    A checkout that does not fit ``delivery_mode`` is reported before any lane
+    is probed. The default branch passes in current-branch-pr mode: the option
+    that permits it belongs to the launch."""
 
     scratch = configure_scratch_environment(settings.scratch_root)
     effective_id = campaign_id or datetime.now(UTC).strftime("preflight-%Y%m%dT%H%M%SZ")
-    (
-        tracker,
-        _workspace,
-        harness,
-        command,
-        _knowledge,
-        lease,
-        tracker_surface,
-        _manifest,
-        repository,
-        lanes_raw,
-        lane_state,
-        lane_manifest,
-        active_name,
-    ) = _runtime(
-        settings, scratch, DeliveryMode.PROTECTED_DEFAULT, False, effective_id, True
-    )
+    try:
+        (
+            tracker,
+            _workspace,
+            harness,
+            command,
+            _knowledge,
+            lease,
+            tracker_surface,
+            _manifest,
+            repository,
+            lanes_raw,
+            lane_state,
+            lane_manifest,
+            active_name,
+        ) = _runtime(
+            settings, scratch, delivery_mode, False, effective_id, True, True
+        )
+    except DeliveryShapeError as exc:
+        return _preflight_result(settings, scratch, str(exc), "", [], [])
+    settings = _bind_initial_lane(settings, active_name)
     lanes: list[dict[str, object]] = []
     for entry in lane_manifest:
         cooling = lane_state.active(str(entry["name"]))
@@ -957,7 +1221,9 @@ def preflight_report(
     probes: list[PreflightProbe] = []
     error: str | None = None
     if harness is None:
-        error = "no capable harness lane"
+        error = _no_lane_error(lane_manifest) if any(
+            entry.get("meter_unread") for entry in lane_manifest
+        ) else "no capable harness lane"
     else:
         campaign = CampaignRef(
             effective_id,
@@ -974,29 +1240,23 @@ def preflight_report(
                     tracker_surface, campaign, repository,
                 )
             )
-            meter = _usage_meter(settings, command, scratch, lanes_raw)
+            meter = _shared_meter(_usage_meter(settings, command, scratch, lanes_raw), scratch)
             private_state = FilesystemLaneStateAdapter(
                 scratch / "preflight" / effective_id, cool_seconds=settings.lane_cool_seconds
             )
-            usage_probe = _usage_preflight(settings, lanes_raw, meter, private_state, effective_id)
+            usage_probe = _usage_preflight(
+                settings,
+                lanes_raw,
+                meter,
+                lane_state if settings.subscription_routing else private_state,
+                effective_id,
+                read_only=True,
+            )
             if usage_probe is not None:
                 probes.append(usage_probe)
         except PreflightError as exc:
             error = str(exc)
-    return {
-        "schema": "autobuild.preflight.v1",
-        "version": __version__,
-        "repository": str(settings.repository),
-        "scratch_root": str(scratch),
-        "ok": error is None,
-        "error": error,
-        "active_lane": active_name or None,
-        "lanes": lanes,
-        "preflight": [
-            {"name": probe.name, "passed": probe.passed, "detail": probe.detail}
-            for probe in probes
-        ],
-    }
+    return _preflight_result(settings, scratch, error, active_name, lanes, probes)
 
 
 def run_campaign(
@@ -1038,9 +1298,14 @@ def run_campaign(
         lane_manifest,
         active_name,
     ) = _runtime(
-        settings, scratch, delivery_mode, push_current_branch, effective_campaign_id
+        settings,
+        scratch,
+        delivery_mode,
+        push_current_branch,
+        effective_campaign_id,
+        allow_current_branch_default,
     )
-    _require_delivery_shape(delivery_mode, repository, allow_current_branch_default)
+    settings = _bind_initial_lane(settings, active_name)
     concurrency, concurrency_source, heavy = campaign_concurrency(settings, tracker)
     campaign = CampaignRef(
         effective_campaign_id,
@@ -1062,7 +1327,7 @@ def run_campaign(
         campaign,
         repository,
     )
-    usage_meter = _usage_meter(settings, command, scratch, lanes_raw)
+    usage_meter = _shared_meter(_usage_meter(settings, command, scratch, lanes_raw), scratch)
     usage_probe = _usage_preflight(
         settings, lanes_raw, usage_meter, lane_state, effective_campaign_id
     )

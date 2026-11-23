@@ -37,7 +37,15 @@ from autobuild.domain import (
     SeatUsage,
     review_verdict_rule_error,
 )
-from autobuild.domain.models import SeatLaunch
+from autobuild.adapters.preflight_probes import LocalFilesystemProbe
+from autobuild.domain.models import BriefDefect, SeatLaunch
+from autobuild.enforcement.brief_file import (
+    MAX_BRIEF_BYTES,
+    portable_path,
+    read_brief,
+    seat_brief_name,
+    seat_brief_refusal,
+)
 from autobuild.ports import CommandPort
 
 
@@ -490,18 +498,31 @@ class CliHarnessAdapter:
         return None
 
     def _materialise_evidence(self, request: SeatRequest) -> str:
-        sections = [request.instructions]
-        references = (("Approved brief", str(request.brief_path)),) + tuple(
-            ("Evidence", reference) for reference in request.context_refs
-        )
-        for label, reference in references:
+        brief_path = request.brief_path.expanduser()
+        brief = read_brief(LocalFilesystemProbe(), brief_path)
+        if isinstance(brief, BriefDefect):
+            raise EvidenceError(seat_brief_refusal(brief, seat_brief_name(request)))
+        sections = [request.instructions, f"\nApproved brief: {brief_path}\n\n{brief}"]
+        for reference in request.context_refs:
             path = Path(reference).expanduser()
-            if not path.is_file():
-                continue
-            if path.stat().st_size > 1_048_576:
-                raise EvidenceError(f"seat evidence exceeds 1 MiB: {path}")
-            content = path.read_text(encoding="utf-8", errors="replace")
-            sections.append(f"\n{label}: {path}\n\n{content}")
+            named = portable_path(reference, request.workspace.root)
+            try:
+                if not path.is_file():
+                    continue
+                size = path.stat().st_size
+                content = (
+                    path.read_text(encoding="utf-8", errors="replace")
+                    if size <= MAX_BRIEF_BYTES
+                    else None
+                )
+            except OSError as exc:
+                # The error's own text quotes the path.
+                raise EvidenceError(
+                    f"seat evidence cannot be read ({exc.strerror}): {named}"
+                ) from exc
+            if content is None:
+                raise EvidenceError(f"seat evidence exceeds 1 MiB: {named}")
+            sections.append(f"\nEvidence: {path}\n\n{content}")
         return "\n".join(sections)
 
     def cancel(self, run_ref: str) -> None:

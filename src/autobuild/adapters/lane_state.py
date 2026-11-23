@@ -80,7 +80,7 @@ class FilesystemLaneStateAdapter:
             return None
         return record
 
-    def cool(self, lane: str, signal: LaneSignal, campaign_id: str) -> LaneCooling:
+    def cool(self, lane: str, signal: LaneSignal, campaign_id: str, *, only_if_clear: bool = False) -> LaneCooling:
         moment = self._now()
         cooled_until = self._cooled_until(signal, moment)
         record = LaneCooling(
@@ -92,9 +92,25 @@ class FilesystemLaneStateAdapter:
         )
         with self._locked():
             records = self._read()
+            existing = records.get(lane)
+            if only_if_clear and existing is not None:
+                until = _parse(existing.cooled_until)
+                if until is not None and until > self._now():
+                    return existing
             records[lane] = record
             self._write(records)
         return record
+
+    def clear(self, lane: str, cooling: LaneCooling) -> bool:
+        # A record that changed since the caller read it was written by a later
+        # cooling, which the caller has not judged, so it stays.
+        with self._locked():
+            records = self._read()
+            if records.get(lane) != cooling:
+                return False
+            del records[lane]
+            self._write(records)
+        return True
 
     def snapshot(self) -> tuple[LaneCooling, ...]:
         return tuple(self._read().values())
@@ -158,27 +174,47 @@ class _FileLock:
 
     The lock file carries the acquiring time so a crashed writer's file is broken
     once it is older than the wait timeout, rather than deadlocking a later run.
+    With ``give_up`` the lock raises ``TimeoutError`` once the wait has passed and
+    the lock file is still fresh, instead of waiting on.
     """
 
-    def __init__(self, path: Path, now: Callable[[], datetime]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        now: Callable[[], datetime],
+        timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
+        *,
+        give_up: bool = False,
+    ) -> None:
         self._path = path
         self._now = now
+        self._timeout = float(timeout_seconds)
+        self._give_up = give_up
 
     def __enter__(self) -> "_FileLock":
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        deadline = time.monotonic() + self._timeout
         while True:
             try:
                 fd = os.open(str(self._path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
-                if time.monotonic() >= deadline and self._is_stale():
+                pass
+            except PermissionError:
+                # Windows refuses to create a file whose earlier copy is still
+                # being deleted; that is contention, not a lasting refusal.
+                if os.name != "nt" or time.monotonic() >= deadline:
+                    raise
+            else:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(self._now().isoformat())
+                return self
+            if time.monotonic() >= deadline:
+                if self._is_stale():
                     self._path.unlink(missing_ok=True)
                     continue
-                time.sleep(0.01)
-                continue
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(self._now().isoformat())
-            return self
+                if self._give_up:
+                    raise TimeoutError(f"lock is held: {self._path}")
+            time.sleep(0.01)
 
     def __exit__(self, *_exc: object) -> None:
         self._path.unlink(missing_ok=True)
@@ -190,4 +226,4 @@ class _FileLock:
             return True
         if stamped is None:
             return True
-        return (self._now() - stamped).total_seconds() > _LOCK_TIMEOUT_SECONDS
+        return (self._now() - stamped).total_seconds() > self._timeout

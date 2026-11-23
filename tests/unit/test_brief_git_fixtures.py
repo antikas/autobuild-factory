@@ -6,18 +6,14 @@ with repository-specific identifiers replaced.
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
-
 from autobuild.enforcement import git_staging_lines
 
 # The corrected brief of item A, which delivered.
 EXCERPT_A = (
     "- Reproduced on current main (`1a2b3c4d`) in a scratch worktree: `git apply -3` of "
     "`5e6f7a8b` applies cleanly (`AGENTS.md` needs the three-way merge; every other file "
-    "applies directly), and `pnpm run type-check:e2e` then fails with exactly the two "
-    'TS7016 lines. Adding `"allowJs": true` to `e2e/fixtures/app/tsconfig.json` alone '
+    "applies directly), and `make check` then fails with exactly the two "
+    'TS7016 lines. Adding `"allowJs": true` to `config/check.json` alone '
     "makes it exit 0.\n"
     "- Carry: the first build's work is sound apart from this one setting. The builder "
     "starts from `docs/campaigns/example/carry/item-a-carry.patch` (the `5e6f7a8b` commit; "
@@ -61,7 +57,7 @@ PASSIVE_REMOVALS = (
     "7. The forked tracker, its local re-export and the "
     "`components/legacy/*` duplicates are removed with `git rm` once nothing "
     "imports them, or the work record names the importer that keeps each one [R-3].",
-    "1. `e2e/tests/**`, `e2e/pages/**`, `e2e/fixtures/data.ts` and `playwright.config.ts` "
+    "1. `old/tests/**`, `old/pages/**`, `old/fixtures/data.ts` and `old.config.ts` "
     "are removed with `git rm`, after a search confirms nothing else imports them.",
 )
 
@@ -93,11 +89,10 @@ def test_a_removal_ordered_in_the_present_tense_passive_is_refused() -> None:
         assert refused.invocations == ("git rm",), line
 
 
-def test_every_item_brief_passes_the_reader() -> None:
-    root = Path(__file__).resolve().parents[2]
-    if not (root / "docs" / "items").is_dir():
-        pytest.skip("item briefs are private and absent from the public tree")
-    briefs = sorted((root / "docs" / "items").glob("*.md"))
-    assert root / "docs" / "items" / "brief-git-check-passive-orders.md" in briefs
-    for brief in briefs:
-        assert git_staging_lines(brief.read_text(encoding="utf-8")) == (), brief.name
+def test_the_excerpts_carry_no_other_product_layout() -> None:
+    excerpts = (
+        EXCERPT_A, CARRY_LINE, EXCERPT_B, EXCERPT_C, *PASSIVE_REMOVALS, UNCORRECTED_A_CARRY
+    )
+    for word in ("e2e", "playwright", "pnpm", "tsconfig"):
+        for excerpt in excerpts:
+            assert word not in excerpt.lower(), (word, excerpt)

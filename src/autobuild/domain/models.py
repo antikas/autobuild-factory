@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from autobuild.domain.errors import AutoBuildError
+from autobuild.domain.errors import AdapterError, AutoBuildError
 
 
 class PortKind(str, Enum):
@@ -137,13 +137,18 @@ class CampaignStopReason(str, Enum):
     PAUSED = "paused"
     # The tracker could not list its items at launch, so no launch set exists.
     LAUNCH_SET_UNREADABLE = "launch_set_unreadable"
+    # Every configured lane is cooled for usage; the campaign drains and ends
+    # so it can be launched again after the earliest reset.
+    USAGE_STOP = "usage_stop"
 
 
 class HoldCondition(str, Enum):
     """A condition that blocks all new work, so the campaign holds admissions
     and retries until it clears instead of stopping.
 
-    ``lanes_exhausted``: every lane is cooling. ``tracker_pending``: a tracker
+    ``lanes_exhausted``: every lane is cooling and at least one cooling is not
+    for usage (every lane cooled for usage ends the campaign with
+    ``usage_stop`` instead). ``tracker_pending``: a tracker
     write was appended and not committed on the primary checkout, and its
     recovery has not succeeded yet. ``tracker_unreachable``: the tracker's
     remote does not answer. ``tracker_read_failed``: reading the ready queue
@@ -261,13 +266,28 @@ def _percent(value: float) -> str:
     return f"{value:g}"
 
 
+class UsageFailure(str, Enum):
+    """Why a meter gave no reading, when the cause is known.
+
+    ``rate_limited`` and ``transport`` say nothing about the account, so an
+    earlier reading may still describe it. ``sign_in_expired`` and a failure
+    with no cause never stand aside for an earlier reading."""
+
+    RATE_LIMITED = "rate_limited"
+    TRANSPORT = "transport"
+    SIGN_IN_EXPIRED = "sign_in_expired"
+
+
 @dataclass(frozen=True, slots=True)
 class UsageReading:
     """One read-only reading of a usage meter.
 
     A failed reading carries ``ok=False`` and a short error that names no
     credential; its limits are empty. ``extra_usage_enabled`` is None when the
-    meter does not report the switch."""
+    meter does not report the switch. ``failure`` classifies a failed reading
+    and ``retry_at`` is the offset-aware instant before which a rate-limited
+    meter is not asked again. A usable reading with an ``error`` stands in for
+    the failed read that error describes."""
 
     meter_id: str
     ok: bool
@@ -275,10 +295,37 @@ class UsageReading:
     error: str = ""
     extra_usage_enabled: bool | None = None
     fetched_at: str = ""
+    failure: UsageFailure | None = None
+    retry_at: str | None = None
 
     @classmethod
-    def failed(cls, meter_id: str, error: str, fetched_at: str = "") -> "UsageReading":
-        return cls(meter_id, False, (), error or "meter unavailable", None, fetched_at)
+    def failed(
+        cls,
+        meter_id: str,
+        error: str,
+        fetched_at: str = "",
+        failure: UsageFailure | None = None,
+    ) -> "UsageReading":
+        return cls(meter_id, False, (), error or "meter unavailable", None, fetched_at, failure)
+
+    @classmethod
+    def rate_limited(cls, meter_id: str, retry_at: str, fetched_at: str) -> "UsageReading":
+        return cls(
+            meter_id,
+            False,
+            (),
+            f"{meter_id} meter rate-limited, next read at {retry_at}",
+            None,
+            fetched_at,
+            UsageFailure.RATE_LIMITED,
+            retry_at,
+        )
+
+    @property
+    def unread(self) -> bool:
+        """True when the failure says nothing about the account behind the meter."""
+
+        return not self.ok and self.failure in (UsageFailure.RATE_LIMITED, UsageFailure.TRANSPORT)
 
 
 class UsageProbeFailure(str, Enum):
@@ -567,6 +614,14 @@ class RepositoryIdentity:
     current_branch: str
     remote: str
     revision: str
+    # True when a recorded remote head or the remote's own answer names the
+    # default branch; False when it is only a guess.
+    default_branch_established: bool = False
+
+
+class DefaultBranchUnknown(AdapterError):
+    """Neither the remote nor the checkout gives a default branch, not even a
+    guess."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -667,8 +722,10 @@ class ResumePlan:
     this campaign; above zero the resumed builder continues their partial work
     in the same worktree. ``builder_raises`` and ``builder_context_refs`` carry
     the effort raises and the context references of a builder attempt that
-    timed out, so its continuation is the same attempt; a plan made from a
-    phase marker carries neither."""
+    timed out, so its continuation is the same attempt; ``builder_reports``
+    counts the builder reports already written to that run record, so a
+    continuation's report takes the next number. A plan made from a phase
+    marker carries none of the three."""
 
     marker_state: str
     worktree_root: Path
@@ -677,6 +734,7 @@ class ResumePlan:
     continuations: int = 0
     builder_raises: int = 0
     builder_context_refs: tuple[str, ...] = ()
+    builder_reports: int = 0
 
 
 class SurfaceKind(str, Enum):
@@ -855,6 +913,25 @@ class TestGuard:
             raise ValueError("a test guard needs the strict process mode")
 
 
+class BriefDefectCause(str, Enum):
+    """Why a brief file cannot be used."""
+
+    MISSING = "missing"
+    EMPTY = "empty"
+    TOO_LARGE = "too-large"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True, slots=True)
+class BriefDefect:
+    """A brief file that cannot be used: ``size`` is set for a brief over the
+    limit and ``error`` for one that cannot be read as text."""
+
+    cause: BriefDefectCause
+    size: int = 0
+    error: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class ItemExecutionSpec:
     item: WorkItem
@@ -887,6 +964,9 @@ class ItemExecutionSpec:
     # The profile's ``[process]`` table; in strict mode the builder brief names
     # the covering tests for the item's declared paths.
     process: ProcessPolicy = ProcessPolicy()
+    # Why the brief file cannot be used; an item that carries one is parked
+    # before its claim.
+    brief_defect: BriefDefect | None = None
 
     def seat_effort(self, seat: Seat, lane: str) -> EffortLevel | None:
         """The effort ``seat`` asks for on ``lane``, or None to leave the harness
@@ -967,6 +1047,8 @@ class SeatRequest:
     test_guard: TestGuard | None = None
     # Called by the harness with the seat's launch just before the seat runs.
     on_launch: Callable[[SeatLaunch], None] | None = field(default=None, compare=False)
+    # The brief as the tracker names it, for a refusal's text.
+    brief_ref: str = ""
 
     def current_timeout_seconds(self) -> float:
         return timeout_with_extension(self.timeout_seconds, self.timeout_extension)

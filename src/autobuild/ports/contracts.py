@@ -65,8 +65,9 @@ class TrackerPort(Probeable, Protocol):
         ...
 
     def blocked_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
-        """The id of every item the tracker holds back behind a gate or an
-        unfinished dependency, so a report can name a real block."""
+        """The id of every item the tracker holds back behind a gate, or that
+        is neither finished nor parked and waits on an unfinished dependency,
+        so a report can name a real block."""
         ...
 
     def known_item_ids(self, campaign: CampaignRef) -> frozenset[str]:
@@ -295,11 +296,20 @@ class LaneStatePort(Probeable, Protocol):
     ``active`` returns a lane's cooling only while it is still in force (the
     current time is before ``cooled_until``); ``cool`` records a signal against a
     lane under a file lock so concurrent campaigns see each other's cooling;
-    ``snapshot`` returns every current record for the run manifest."""
+    ``snapshot`` returns every current record for the run manifest; ``clear``
+    removes one lane's record under the same lock when it is still ``cooling``,
+    keeps every other lane's record, and returns True when it removed it."""
 
     def active(self, lane: str) -> LaneCooling | None: ...
-    def cool(self, lane: str, signal: LaneSignal, campaign_id: str) -> LaneCooling: ...
+    def cool(self, lane: str, signal: LaneSignal, campaign_id: str, *, only_if_clear: bool = False) -> LaneCooling: ...
+    def clear(self, lane: str, cooling: LaneCooling) -> bool: ...
     def snapshot(self) -> tuple[LaneCooling, ...]: ...
+
+
+# How long one reading is shared by every reader on a scratch root.
+SHARED_READING_SECONDS = 60.0
+# How long a rate-limited meter that names no retry time is left alone.
+RATE_LIMIT_HOLD_SECONDS = 300.0
 
 
 @runtime_checkable
@@ -312,6 +322,26 @@ class UsageMeterPort(Probeable, Protocol):
     in a reading, its error text or any record the adapter writes."""
 
     def read(self, meter_id: str) -> UsageReading: ...
+
+
+@runtime_checkable
+class SignInStatePort(Protocol):
+    """A meter that can tell an expired sign-in without asking the provider.
+
+    ``sign_in_failure`` returns the failed reading of an expired sign-in, or
+    None when the sign-in is not known to have expired."""
+
+    def sign_in_failure(self, meter_id: str) -> UsageReading | None: ...
+
+
+@runtime_checkable
+class LastGoodReadingPort(Protocol):
+    """A meter that remembers its last good reading beside a failed read.
+
+    ``last_good`` never asks the provider, and whether the reading may stand in
+    for the failed read is the caller's decision."""
+
+    def last_good(self, meter_id: str) -> UsageReading | None: ...
 
 
 @runtime_checkable

@@ -34,6 +34,8 @@ from autobuild.ports import (
     NetworkProbePort,
     UsageMeterPort,
 )
+from autobuild.domain.models import BriefDefect, BriefDefectCause
+from autobuild.enforcement.brief_file import MAX_BRIEF_BYTES, read_brief
 from autobuild.enforcement.brief_git import MAX_QUOTED_LINE, git_staging_lines
 from autobuild.enforcement.triage import declared_item_nature, out_of_fence_paths
 
@@ -106,7 +108,7 @@ class PreflightRequest:
     tracker_surface: LeaseSurface | None = None
     # Environment names the harness removes from every seat child.
     removed_environment: tuple[str, ...] = ()
-    max_brief_bytes: int = 1_048_576
+    max_brief_bytes: int = MAX_BRIEF_BYTES
     max_argv_bytes: int = 8_192
     # The roots the claim-time triage receives. Without a repository root the
     # validator's repository stands in.
@@ -403,20 +405,9 @@ def _briefs(request: PreflightRequest, filesystem: FilesystemProbePort) -> Prefl
     name = "briefs"
     warnings: list[str] = []
     for brief in request.briefs:
-        if not filesystem.is_file(brief.brief_path):
-            raise _fail(name, f"brief for {brief.item_id} is missing: {brief.brief_path}")
-        if filesystem.size(brief.brief_path) > request.max_brief_bytes:
-            raise _fail(
-                name,
-                f"brief for {brief.item_id} exceeds {request.max_brief_bytes} bytes: "
-                f"{brief.brief_path}",
-            )
-        try:
-            text = filesystem.read_text(brief.brief_path)
-        except Exception as exc:
-            raise _fail(
-                name, f"brief for {brief.item_id} cannot be read as text: {exc}"
-            ) from exc
+        text = read_brief(filesystem, brief.brief_path, max_bytes=request.max_brief_bytes)
+        if isinstance(text, BriefDefect):
+            raise _fail(name, _brief_defect_cause(request, brief, text))
         _brief_nature(request, brief, text)
         warning = _brief_git(brief, text)
         if warning is not None:
@@ -435,6 +426,19 @@ def _briefs(request: PreflightRequest, filesystem: FilesystemProbePort) -> Prefl
         f"brief files present and bounded, declared paths inside the fence: {checked}; "
         + "; ".join(warnings),
     )
+
+
+def _brief_defect_cause(
+    request: PreflightRequest, brief: BriefCheck, defect: BriefDefect
+) -> str:
+    subject = f"brief for {brief.item_id}"
+    if defect.cause is BriefDefectCause.MISSING:
+        return f"{subject} is missing: {brief.brief_path}"
+    if defect.cause is BriefDefectCause.EMPTY:
+        return f"{subject} is empty: {brief.brief_path}"
+    if defect.cause is BriefDefectCause.TOO_LARGE:
+        return f"{subject} exceeds {request.max_brief_bytes} bytes: {brief.brief_path}"
+    return f"{subject} cannot be read as text: {defect.error}"
 
 
 def _brief_nature(request: PreflightRequest, brief: BriefCheck, text: str) -> None:

@@ -8,7 +8,7 @@ user-invocable: true
 
 This skill produces the plan that `/autobuild` later executes. It stops before launch unless the owner has already authorised execution.
 
-**Sources this skill points at, never restates:** the sibling AutoBuild skill (`../autobuild/SKILL.md`) for invocation; `../../docs/running-autobuild.md` for briefs, tracker, validator and refill configuration; `../autobuild-coordinated/rules.md` for how a coordinator repairs, releases gates and verifies during a campaign. Read any dispatch rules or agent definitions the environment carries.
+**Sources this skill points at, never restates:** the sibling AutoBuild skill (`../autobuild/SKILL.md`) for invocation; `../../docs/getting-started.md` for the order of the steps to a first campaign, `../../docs/writing-briefs.md` for briefs, `../../docs/trackers.md` for the tracker, `../../docs/reference/profile.md` for validator and refill configuration and `../../docs/running-campaigns.md` for running a campaign; `../autobuild-coordinated/rules.md` for how a coordinator repairs, releases gates and verifies during a campaign. Read any dispatch rules or agent definitions the environment carries.
 
 ## The shape of a plan
 
@@ -48,7 +48,7 @@ The reviewer returns `PASS`, `PASS_WITH_FOLDS` or `FAIL`. A blocker names the ac
 
 ## Phase 4: register and stop
 
-1. Register the next slice in each repository's tracker in dependency order, with briefs as `../../docs/running-autobuild.md` describes. Every brief carries `Item nature` and `## Declared paths`; AutoBuild reads both at claim without a model call.
+1. Register the next slice in each repository's tracker in dependency order, with briefs as `../../docs/writing-briefs.md` describes. Every brief carries `Item nature` and `## Declared paths`; AutoBuild reads both at claim without a model call.
 2. Register each later line as one item, blocked with gate `scope` (or `Blocked` in `BACKLOG.md`), its brief a pointer to its line in the plan.
 3. Owner gates (`pinax block <id> --gate decision`, or `Blocked`) are only for genuine owner decisions and owner acts: a strategic or irreversible choice, a public release, a production deployment, a physical act the agent cannot perform.
 4. `machine` and `cross-repository` items are the coordinator's work, done in the attended setup window or between items. Register them blocked so the application never claims them, because a fenced worktree cannot reach a machine or another repository, and name the coordinator and the evidence in the release clause. They are never questions for the owner.

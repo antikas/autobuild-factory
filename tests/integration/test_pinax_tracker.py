@@ -187,7 +187,14 @@ def test_pinax_accepts_portable_proposal_references(brief_ref: str) -> None:
 
 @pytest.mark.parametrize(
     "brief_ref",
-    ("../private.md", "~/private/brief.md", "/tmp/brief.md", "C:\\briefs\\item.md"),
+    (
+        "../private.md",
+        "~/private/brief.md",
+        "/tmp/brief.md",
+        "C:\\briefs\\item.md",
+        "\\\\server\\briefs\\item.md",
+        "file:///tmp/brief.md",
+    ),
 )
 def test_pinax_rejects_machine_specific_proposal_references(brief_ref: str) -> None:
     with pytest.raises(EvidenceError, match="repository-relative path or durable URI"):
@@ -308,5 +315,16 @@ def test_pinax_blocked_item_ids_names_gated_items_and_unfinished_dependencies(
     pinax(repo, "status", finished_id, "done", *actor)
     freed_id = _add_with_brief(repo, "Its dependency is done")
     pinax(repo, "dep", "add", finished_id, "--blocks", freed_id, *actor)
+    parked_id = _add_with_brief(repo, "Parked, waits on an unfinished item")
+    pinax(repo, "dep", "add", ready_id, "--blocks", parked_id, *actor)
+    pinax(repo, "status", parked_id, "parked", *actor)
+    done_waiting_id = _add_with_brief(repo, "Done, waits on an unfinished item")
+    pinax(repo, "dep", "add", ready_id, "--blocks", done_waiting_id, *actor)
+    pinax(repo, "status", done_waiting_id, "done", *actor)
+    gated_waiting_id = _add_with_brief(repo, "Blocked, waits on an unfinished item")
+    pinax(repo, "dep", "add", ready_id, "--blocks", gated_waiting_id, *actor)
+    pinax(repo, "status", gated_waiting_id, "blocked", *actor)
 
-    assert tracker.blocked_item_ids(campaign) == frozenset({gated_id, waiting_id})
+    assert tracker.blocked_item_ids(campaign) == frozenset(
+        {gated_id, waiting_id, gated_waiting_id}
+    )

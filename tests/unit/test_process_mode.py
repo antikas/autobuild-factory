@@ -6,6 +6,7 @@ names them and a whole-suite run from a builder seat is refused."""
 from __future__ import annotations
 
 import re
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 
@@ -64,6 +65,33 @@ def load(tmp_path: Path, profile: str):
     return load_settings(repository)
 
 
+def documented_toml_blocks() -> list[tuple[str, str]]:
+    root = Path(__file__).parents[2]
+    pages = [
+        root / "README.md",
+        *sorted((root / "docs").glob("*.md")),
+        *sorted((root / "docs" / "reference").rglob("*.md")),
+    ]
+    return [
+        (f"{page.relative_to(root).as_posix()} block {number}", block)
+        for page in pages
+        for number, block in enumerate(
+            re.findall(r"^```toml\n(.*?)\n```$", page.read_text(encoding="utf-8"), re.DOTALL | re.MULTILINE),
+            start=1,
+        )
+    ]
+
+
+def documented_profiles(tmp_path: Path, selected) -> list:
+    """The loaded settings of every documented whole profile whose parsed TOML ``selected`` accepts."""
+
+    return [
+        load(tmp_path, block)
+        for _, block in documented_toml_blocks()
+        if selected(tomllib.loads(block))
+    ]
+
+
 def strict_policy() -> ProcessPolicy:
     return ProcessPolicy(
         ProcessMode.STRICT,
@@ -105,17 +133,17 @@ def test_strict_mode_loads_the_test_map(tmp_path: Path) -> None:
 
 
 def test_the_documented_strict_example_loads(tmp_path: Path) -> None:
-    guide = (Path(__file__).parents[2] / "docs" / "running-autobuild.md").read_text(encoding="utf-8")
-    block = next(
-        block
-        for block in re.findall(r"```toml\n(.*?)\n```", guide, re.DOTALL)
-        if block.startswith("[process]")
+    examples = documented_profiles(
+        tmp_path, lambda profile: profile.get("process", {}).get("mode") == "strict"
     )
 
-    settings = load(tmp_path, BASE + "\n" + block + "\n")
-
-    assert settings.process.strict
-    assert settings.process.test_map[-1].command == ("npm", "test", "--", "web")
+    assert len(examples) == 1
+    assert examples[0].process.strict
+    assert examples[0].process.test_command == ("python", "-m", "pytest", "-q")
+    assert examples[0].process.test_map == (
+        TestCoverage("src/export/*.py", tests=("tests/test_export.py",)),
+        TestCoverage("src/cli.py", command=("python", "-m", "pytest", "-q", "tests/test_cli.py")),
+    )
 
 
 def test_an_unknown_mode_is_refused_with_one_sentence(tmp_path: Path) -> None:

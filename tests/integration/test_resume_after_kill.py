@@ -294,10 +294,10 @@ class _Campaign:
         return self.stderr_log.read_text(encoding="utf-8", errors="replace")[-STDERR_TAIL:]
 
 
-def _wait_for(condition, what: str, campaign: _Campaign | None = None) -> None:
+def _wait_for(campaign: _Campaign, condition, what: str) -> None:
     deadline = time.monotonic() + DEADLINE
     while not condition():
-        if campaign is not None and campaign.process.poll() is not None:
+        if campaign.process.poll() is not None:
             code = campaign.process.returncode
             raise AssertionError(
                 f"campaign exited {code} before {what}; stderr tail:\n{campaign.stderr_tail()}"
@@ -413,12 +413,13 @@ def test_a_killed_campaign_is_resumed_by_the_next_run_and_delivered(
     def body() -> None:
         # --- The first run, killed while the held seat runs. ---
         first = _start_campaign(children, repository, profile, scratch, logs, "first")
-        _wait_for(held.exists, f"the {held_seat} seat to start", first)
+        _wait_for(first, held.exists, f"the {held_seat} seat to start")
         seat_pid = json.loads(held.read_text(encoding="utf-8"))["pid"]
         first.process.kill()
         first.process.wait(timeout=DEADLINE)
         _kill_pid(seat_pid)
-        _wait_for(lambda: _gone(seat_pid), "the orphaned seat to stop")
+        if not _wait_until(lambda: _gone(seat_pid), DEADLINE):
+            raise AssertionError("timed out waiting for the orphaned seat to stop")
 
         if os.name != "nt":
             assert first.process.returncode == -signal.SIGKILL
@@ -669,8 +670,29 @@ def test_wait_for_an_early_exit_names_the_campaign_stderr(tmp_path: Path) -> Non
         process.wait(timeout=CHILD_EXIT_WAIT)
         campaign = _Campaign(process, log)
         with pytest.raises(AssertionError) as raised:
-            _wait_for(lambda: False, "the marker", campaign)
+            _wait_for(campaign, lambda: False, "the marker")
         assert "exited 3" in str(raised.value)
         assert "marker-early-death" in str(raised.value)
     finally:
         _stop(process)
+
+
+def test_wait_for_names_the_stderr_of_a_campaign_started_and_exiting_early(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    missing = tmp_path / "missing-repository"
+    children = _Children()
+    try:
+        campaign = _start_campaign(
+            children, missing, tmp_path / "absent.toml", tmp_path / "scratch", logs, "early"
+        )
+        with pytest.raises(AssertionError) as raised:
+            _wait_for(campaign, lambda: False, "the marker")
+        message = str(raised.value)
+        assert "exited 2" in message
+        assert "AutoBuild failed before completion" in message
+        assert missing.name in message
+    finally:
+        assert children.kill_all() == []

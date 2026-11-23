@@ -3,6 +3,7 @@
 from autobuild.adapters.claude_harness import ClaudeCodeHarnessAdapter
 from autobuild.adapters.backlog_tracker import BacklogTrackerAdapter
 from autobuild.adapters.codex_harness import CodexHarnessAdapter
+from autobuild.adapters.codex_subscription import CodexSubscriptionMeterAdapter, CompositeUsageMeterAdapter
 from autobuild.adapters.copilot_harness import CopilotCliHarnessAdapter
 from autobuild.adapters.git_workspace import GitWorkspaceAdapter
 from autobuild.adapters.koine_knowledge import KoineKnowledgeAdapter
@@ -34,6 +35,8 @@ __all__ = [
     "GitWorkspaceAdapter",
     "ClaudeCodeHarnessAdapter",
     "CodexHarnessAdapter",
+    "CodexSubscriptionMeterAdapter",
+    "CompositeUsageMeterAdapter",
     "CopilotCliHarnessAdapter",
     "KoineKnowledgeAdapter",
     "LocalFilesystemProbe",
